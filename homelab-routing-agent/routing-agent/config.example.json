@@ -1,0 +1,30 @@
+{
+  "policy": {
+    "priority_order": ["availability", "cost", "privacy", "speed", "useful_heat"],
+    "local_energy_cost_per_kwh": 0.14,
+    "cloud_cost_per_request": 0.03,
+    "heating_season": false,
+    "outdoor_temperature_f": 70,
+    "max_local_temperature_c": 78
+  },
+  "compute_profiles": [
+    {
+      "name": "k3s-gpu-worker",
+      "location": "local",
+      "available": true,
+      "capabilities": ["light", "medium"],
+      "power_watts": 170,
+      "temperature_c": 61,
+      "estimated_latency_seconds": 15
+    },
+    {
+      "name": "openrouter",
+      "location": "cloud",
+      "available": true,
+      "capabilities": ["light", "medium", "heavy"],
+      "power_watts": 0,
+      "temperature_c": 0,
+      "estimated_latency_seconds": 3
+    }
+  ]
+}

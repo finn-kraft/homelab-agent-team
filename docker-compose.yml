@@ -1,0 +1,17 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: coder
+      POSTGRES_PASSWORD: coder
+      POSTGRES_DB: coder
+    ports: ["5432:5432"]
+    volumes: ["coder-postgres:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coder"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+volumes:
+  coder-postgres:
+
