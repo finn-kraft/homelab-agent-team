@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -85,15 +86,29 @@ class Store:
             if cursor.rowcount != 1:
                 raise RuntimeError("step lease is no longer owned by this worker")
 
-    def record_command(self, step_id: int, result: CommandResult) -> None:
+    def record_command(self, step_id: int, result: CommandResult, attempt: int | None = None) -> None:
         with self.connect() as connection:
             connection.execute(
                 """INSERT INTO command_runs
-                (step_id, argv, stdout, stderr, exit_code, duration_seconds, timed_out)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)""",
-                (step_id, json.dumps(result.argv), result.stdout, result.stderr,
-                 result.exit_code, result.duration_seconds, result.timed_out),
+                (step_id, argv, stdout, stderr, exit_code, duration_seconds, timed_out, source, attempt)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,'coder-agent',%s)""",
+                (step_id, json.dumps(result.argv), self._redact_command_output(result.stdout),
+                 self._redact_command_output(result.stderr),
+                 result.exit_code, result.duration_seconds, result.timed_out, attempt),
             )
+
+    @staticmethod
+    def _redact_command_output(value: str) -> str:
+        """Keep audit evidence useful without persisting credentials verbatim."""
+        patterns = (
+            r"(?i)(?:api[_-]?key|token|password|secret)\s*[=:]\s*[^\s,]+",
+            r"\bpostgres(?:ql)?(?:\+[A-Za-z0-9_-]+)?://[^\s]+",
+            r"\bsk-[A-Za-z0-9_-]{16,}\b",
+            r"\bgh[pousr]_[A-Za-z0-9]{20,}\b",
+        )
+        for pattern in patterns:
+            value = re.sub(pattern, "[REDACTED]", value)
+        return value[:100_000]
 
     def event(self, task: Task, kind: str, payload: dict[str, Any]) -> None:
         with self.connect() as connection:

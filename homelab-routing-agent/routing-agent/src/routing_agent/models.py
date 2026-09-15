@@ -44,6 +44,13 @@ class RouterPolicy:
     heating_season: bool = False
     outdoor_temperature_f: float = 70
     max_local_temperature_c: float = 78
+    # Internal development-agent inference uses a different decision from the
+    # end-user/domain route above.  Keep it explicit so a faster cloud model
+    # cannot silently become the normal default.
+    inference_local_model: str = "llama3.2:latest"
+    inference_cloud_model: str = "openrouter/auto"
+    inference_escalation_attempt: int = 4
+    allow_cloud_inference: bool = True
 
 
 @dataclass
@@ -59,4 +66,26 @@ class RouteDecision:
 
     def to_dict(self) -> dict:
         """Return a JSON-ready representation."""
+        return asdict(self)
+
+
+@dataclass
+class InferenceRouteDecision:
+    """A policy decision for an internal agent's LLM invocation.
+
+    This deliberately does not select a domain agent.  The caller already is
+    the Planner, Coder, or Reviewer; this object only decides which configured
+    inference backend it may use.
+    """
+
+    execution_target: str
+    provider: Literal["ollama", "openrouter"]
+    model: str
+    location: Location
+    reason: str
+    compute_profile: str
+    escalation_permitted: bool
+
+    def to_dict(self) -> dict:
+        """Return the stable JSON contract served by ``/route/inference``."""
         return asdict(self)

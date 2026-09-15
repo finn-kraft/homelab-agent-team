@@ -8,7 +8,7 @@ import sys
 
 from .agent import CoderAgent
 from .db import Store
-from .llm import OllamaBackend, OpenRouterBackend, Router
+from .llm import InferenceRouter, OllamaBackend, OpenRouterBackend
 from .worker import Worker
 
 
@@ -22,8 +22,24 @@ def build_agent() -> CoderAgent:
         cloud = OpenRouterBackend("https://openrouter.ai/api/v1",
                                   os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4"),
                                   os.environ["OPENROUTER_API_KEY"])
-    return CoderAgent(Store(database_url), Router(local, cloud),
-                      os.getenv("CODER_WORKER_ID", "coder-1"), roots)
+    return CoderAgent(
+        Store(database_url),
+        InferenceRouter(
+            local, cloud,
+            router_url=os.getenv("ROUTER_URL", "http://127.0.0.1:8090"),
+            caller_agent="coder-agent",
+            task_type="code_implementation",
+            escalate_after=int(os.getenv(
+                "CODER_ESCALATE_AFTER", os.getenv("INFERENCE_ESCALATE_AFTER", "4")
+            )),
+            timeout=float(os.getenv("ROUTER_TIMEOUT_SECONDS", "3")),
+            privacy_sensitive=os.getenv("INFERENCE_PRIVACY_SENSITIVE", "false").lower()
+            in {"1", "true", "yes", "on"},
+        ),
+        os.getenv("CODER_WORKER_ID", "coder-1"), roots,
+        max_turns=int(os.getenv("CODER_MAX_TURNS", "30")),
+        max_attempts=int(os.getenv("MAX_CODER_ATTEMPTS", "5")),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -55,4 +71,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

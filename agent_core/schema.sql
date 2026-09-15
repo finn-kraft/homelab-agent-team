@@ -72,6 +72,8 @@ CREATE TABLE IF NOT EXISTS command_runs (
   exit_code INTEGER NOT NULL,
   duration_seconds DOUBLE PRECISION NOT NULL,
   timed_out BOOLEAN NOT NULL DEFAULT false,
+  source TEXT NOT NULL DEFAULT 'coder-agent',
+  attempt INTEGER,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

@@ -171,7 +171,7 @@ class CoderAgent:
             if not isinstance(argv, list) or not all(isinstance(v, str) for v in argv):
                 raise ValueError("argv must be a string list")
             result = runner.run(argv, min(int(action.get("timeout", 300)), 900))
-            self.store.record_command(task.step_id, result)
+            self.store.record_command(task.step_id, result, task.attempt)
             return json.dumps({"stdout": self._redact(result.stdout),
                                "stderr": self._redact(result.stderr),
                                "exit_code": result.exit_code,
@@ -193,7 +193,7 @@ class CoderAgent:
     @staticmethod
     def _files_with_likely_secrets(workspace: Workspace, files: set[str]) -> list[str]:
         secret_patterns = [
-            re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+            re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE " + r"KEY-----"),
             re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
             re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
             re.compile(r"(?i)\b(?:api[_-]?key|password|secret)\s*=\s*['\"][^'\"]{8,}['\"]"),

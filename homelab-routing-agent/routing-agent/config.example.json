@@ -5,7 +5,11 @@
     "cloud_cost_per_request": 0.03,
     "heating_season": false,
     "outdoor_temperature_f": 70,
-    "max_local_temperature_c": 78
+    "max_local_temperature_c": 78,
+    "inference_local_model": "llama3.2:latest",
+    "inference_cloud_model": "openrouter/auto",
+    "inference_escalation_attempt": 4,
+    "allow_cloud_inference": true
   },
   "compute_profiles": [
     {

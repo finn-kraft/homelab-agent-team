@@ -9,12 +9,15 @@ class ReviewerAgent:
         self.store,self.router,self.collector,self.worker_id=store,router,collector,worker_id
         self.lease_seconds,self.max_attempts,self.large_diff_escalates=lease_seconds,max_attempts,large_diff_escalates
 
-    def review_once(self):
-        item=self.store.claim(self.worker_id,self.lease_seconds)
+    def review_once(self, step_id=None):
+        """Review one item, optionally the exact step claimed by the coordinator."""
+        item=self.store.claim(self.worker_id,self.lease_seconds,step_id)
         if not item:return None
         files=list(item.get('files_changed') or [])
         evidence=self.collector.collect(item['repository'],item['starting_commit'],files,[])
-        commands=self.store.commands(item['id'])
+        # Only evidence from this Coder revision is relevant.  A prior failed
+        # verification must not permanently poison a corrected same-step retry.
+        commands=self.store.commands(item['id'],item['attempt_count'])
         failed=not commands or any(c['exit_code']!=0 for c in commands)
         if evidence['secret_hits'] or failed or evidence['checks']['diff_check']['exit_code']!=0:
             reason='secret detected' if evidence['secret_hits'] else 'deterministic verification failed'

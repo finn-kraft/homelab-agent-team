@@ -1,10 +1,12 @@
 """Shared contracts and infrastructure for the Homelab agent team."""
 
-from .models import (AgentEvent, ImplementationResult, Job, JobStatus,
-                     PlannerDecision, ReviewFeedback, ReviewIssue, ReviewRequest,
-                     Step, StepStatus, TaskContract)
+from .models import (AgentEvent, CheckpointResult, ImplementationResult, Job,
+                     JobStatus, ModelRoute, PlannerDecision, ReviewFeedback,
+                     ReviewIssue, ReviewRequest, Step, StepStatus, TaskContract,
+                     VerificationResult, WorkerLease)
 
 __all__ = [
-    "AgentEvent", "ImplementationResult", "Job", "JobStatus", "PlannerDecision",
-    "ReviewFeedback", "ReviewIssue", "ReviewRequest", "Step", "StepStatus", "TaskContract",
+    "AgentEvent", "CheckpointResult", "ImplementationResult", "Job", "JobStatus",
+    "ModelRoute", "PlannerDecision", "ReviewFeedback", "ReviewIssue", "ReviewRequest",
+    "Step", "StepStatus", "TaskContract", "VerificationResult", "WorkerLease",
 ]

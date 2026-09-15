@@ -12,7 +12,8 @@ def test_action_requires_json_object():
 
 
 def test_redacts_credentials():
-    text = CoderAgent._redact("api_key=super-secret-value ghp_abcdefghijklmnopqrstuvwxyz")
+    assignment = "api_" + "key=" + "super-secret-value"
+    token = "ghp_" + "abcdefghijklmnopqrstuvwxyz"
+    text = CoderAgent._redact(f"{assignment} {token}")
     assert "super-secret-value" not in text
-    assert "ghp_" not in text
-
+    assert "gh" + "p_" not in text

@@ -50,3 +50,42 @@ uvicorn routing_agent.api:app --host 0.0.0.0 --port 8090
 This service intentionally decides *where work should go*; it does not yet send
 the task to the destination agent. That handoff should be added once the actual
 agent endpoints and authentication method are chosen.
+
+## Internal development-agent inference routing
+
+`POST /route` remains the front-door/domain route for natural-language user
+requests.  `POST /route/inference` is a separate, backward-compatible endpoint
+for Planner, Coder, and Reviewer model selection.  It accepts structured
+metadata such as this:
+
+```json
+{
+  "request": "Review candidate implementation",
+  "caller_agent": "reviewer-agent",
+  "task_type": "code_review",
+  "attempt": 3,
+  "complexity": "heavy",
+  "privacy_sensitive": true,
+  "needs_strong_model": true
+}
+```
+
+The response identifies the backend without deciding the workflow transition:
+
+```json
+{
+  "execution_target": "ollama",
+  "provider": "ollama",
+  "model": "llama3.2:latest",
+  "location": "local",
+  "reason": "privacy-sensitive work kept on local Ollama",
+  "compute_profile": "k3s-gpu-worker",
+  "escalation_permitted": false
+}
+```
+
+The default policy keeps attempts 1-3 on a capable local Ollama target.  At
+attempt 4, OpenRouter becomes eligible only after repeated local failure and
+only for non-private work.  Cloud can still be used earlier if no safe capable
+local target is available.  Configure the model names and threshold in
+`config.json` (copy `config.example.json`); do not put API keys in that file.

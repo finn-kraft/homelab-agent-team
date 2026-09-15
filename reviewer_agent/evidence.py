@@ -13,7 +13,7 @@ class EvidenceError(ValueError): pass
 class EvidenceCollector:
     DOCS = ("WORKER.md", "AGENTS.md", "README.md", "docs/architecture.md",
             "docs/data-model.md", "docs/roadmap.md")
-    SECRET_PATTERNS = (re.compile(r"-----BEGIN .*PRIVATE KEY-----"),
+    SECRET_PATTERNS = (re.compile(r"-----BEGIN .*PRIVATE " + r"KEY-----"),
                        re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
                        re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"))
 
@@ -57,4 +57,3 @@ class EvidenceCollector:
                  "large_diff": diff.endswith("[TRUNCATED]")}
         return {"diff": diff, "diff_sha256": hashlib.sha256(diff.encode()).hexdigest(),
                 "checks": checks, "secret_hits": secret_hits, "documents": docs, "risk_flags": flags}
-

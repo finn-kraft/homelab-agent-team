@@ -11,6 +11,8 @@ class JobStatus(StrEnum):
     PLANNING = "planning"
     RUNNING = "running"
     REVIEWING = "reviewing"
+    VERIFYING = "verifying"
+    CHECKPOINTING = "checkpointing"
     BLOCKED = "blocked"
     NEEDS_HUMAN = "needs_human"
     PAUSED = "paused"
@@ -24,6 +26,7 @@ class StepStatus(StrEnum):
     RUNNING = "running"
     REVIEW = "review"
     VERIFICATION = "verification"
+    CHECKPOINT = "checkpoint"
     CHANGES_REQUESTED = "changes_requested"
     COMPLETE = "complete"
     BLOCKED = "blocked"
@@ -115,6 +118,60 @@ class ImplementationResult:
     files_changed: list[str]
     verification: list[dict[str, Any]]
     commit_sha: str | None = None
+
+
+@dataclass(slots=True)
+class VerificationResult:
+    """Result of the deterministic post-review verification gate."""
+
+    step_id: int
+    passed: bool
+    commands: list[dict[str, Any]] = field(default_factory=list)
+    summary: str = ""
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class CheckpointResult:
+    """Result of the controlled Git checkpoint operation."""
+
+    step_id: int
+    created: bool
+    files: list[str] = field(default_factory=list)
+    commit_sha: str | None = None
+    message: str = ""
+    error: str | None = None
+
+
+@dataclass(slots=True)
+class WorkerLease:
+    """Durable ownership record used to prevent competing workers."""
+
+    resource: str
+    worker_id: str
+    expires_at: datetime
+    job_id: int | None = None
+    step_id: int | None = None
+
+
+@dataclass(slots=True)
+class ModelRoute:
+    """Auditable inference-routing decision, independent of workflow state."""
+
+    caller_agent: str
+    provider: str
+    model: str
+    location: str
+    reason: str
+    attempt: int
+    task_type: str | None = None
+    fallback: bool = False
+    privacy_sensitive: bool = False
+    latency_seconds: float | None = None
+    usage: dict[str, Any] | None = None
+    estimated_cloud_cost: float | None = None
+    timestamp: datetime | None = None
 
 
 @dataclass(slots=True)

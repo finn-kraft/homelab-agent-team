@@ -6,7 +6,7 @@ import logging
 import os
 import sys
 
-from agent_core.llm import OllamaBackend, OpenRouterBackend, Router
+from agent_core.llm import InferenceRouter, OllamaBackend, OpenRouterBackend
 from .inspector import ReadOnlyRepositoryInspector
 from .planner import PlannerAgent
 from .store import PlannerStore
@@ -25,13 +25,25 @@ def build_planner() -> PlannerAgent:
                                   os.getenv("OPENROUTER_PLANNER_MODEL",
                                             "anthropic/claude-sonnet-4"),
                                   os.environ["OPENROUTER_API_KEY"])
+    escalation_attempt = int(os.getenv(
+        "PLANNER_ESCALATE_AFTER", os.getenv("INFERENCE_ESCALATE_AFTER", "4")
+    ))
     return PlannerAgent(
-        store, Router(local, cloud, int(os.getenv("PLANNER_ESCALATE_AFTER", "3"))),
+        store, InferenceRouter(
+            local, cloud,
+            router_url=os.getenv("ROUTER_URL", "http://127.0.0.1:8090"),
+            caller_agent="planner-agent",
+            task_type="planning",
+            escalate_after=escalation_attempt,
+            timeout=float(os.getenv("ROUTER_TIMEOUT_SECONDS", "3")),
+            privacy_sensitive=os.getenv("INFERENCE_PRIVACY_SENSITIVE", "false").lower()
+            in {"1", "true", "yes", "on"},
+        ),
         ReadOnlyRepositoryInspector(roots),
         os.getenv("PLANNER_WORKER_ID", "planner-1"),
         int(os.getenv("PLANNER_LEASE_SECONDS", "300")),
         int(os.getenv("PLANNER_DECISION_RETRIES", "2")),
-        int(os.getenv("PLANNER_ESCALATE_AFTER", "3")),
+        escalation_attempt,
     )
 
 
@@ -76,4 +88,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -1,139 +1,264 @@
-# coder-agent
+# Homelab Agent Team
 
-`coder-agent` is a persistent implementation worker designed to participate in a
-planner → coder → reviewer → test loop on repositories hosted on your own machine.
-It consumes structured steps from PostgreSQL, works only inside explicitly allowed
-Git repositories, records every model action and command result, and hands a diff to
-an independent reviewer. It does **not** mark its own work complete or silently push.
+`homelab-agent-team` is a persistent local software-development team. It is
+designed for a durable goal such as:
 
-## What this MVP includes
+> Continuously improve Align according to `docs/roadmap.md`.
 
-- Atomic PostgreSQL job claiming with worker leases and crash recovery
-- Persistent attempts, events, command output, model identity, diffs, and review state
-- Repository allow-roots plus `..` and symlink-escape protection
-- A command allowlist, no shell interpretation, timeouts, and captured exit status
-- Protection for pre-existing human changes
-- Ollama by default, with optional OpenRouter escalation on later attempts
-- Structured JSON actions rather than free-form tool execution
-- A successful-command gate and likely-secret scan before review
-- `WORKER.md`/`AGENTS.md` repository instructions loaded for every step
-- Retry progression to `needs_human` instead of an endless loop
+PostgreSQL remembers work, Git preserves accepted progress, and
+`agent-orchestrator run` keeps the team moving without a human invoking each
+specialist command between steps.
 
-Branch creation, pushing, PR creation, human approvals, planning, and independent
-review are deliberately separate services. This keeps the coder's authority narrow.
+## Responsibilities
 
-## Quick start
+| Component | Owns | Does not own |
+| --- | --- | --- |
+| Planner | What safe, concrete step happens next; semantic goal completion | Editing, committing, scheduling |
+| Coder | Implementing one assigned step and recording commands/diff | Approval, commit, goal completion |
+| Reviewer | Independent acceptance-criteria review | Silent fixes, merge, goal completion |
+| Orchestrator | Deterministic next-state selection, leases, final verification, checkpoint hand-off | LLM planning or code reasoning |
+| Routing Agent | Model/compute policy | Workflow state transitions |
+| PostgreSQL | Durable jobs, steps, leases, events, reviews, commands, checkpoints | Source-code history |
+| Git | Reviewer-approved local checkpoints | Automatic merge to `main` or deployment |
 
-Requirements: Python 3.11+, Git, Docker (for the included PostgreSQL setup), and
-Ollama or an OpenRouter key.
+The Orchestrator is intentionally not another reasoning agent. Its normal
+transition is deterministic:
+
+```text
+Planner → queued step → Coder → Reviewer
+                               ├─ changes requested → same Coder step
+                               └─ approved → final verification → checkpoint
+                                                        ↓
+                                                     Planner again
+```
+
+One step completing never completes the high-level job by itself. After a
+checkpoint, the job goes back to the Planner, which can choose the next
+roadmap item or mark the overall goal complete with evidence.
+
+## What is implemented
+
+- A foreground `agent-orchestrator run` service and bounded
+  `agent-orchestrator once` command.
+- Reuse of the existing Planner, Coder, Reviewer, PostgreSQL `jobs`, `steps`,
+  `events`, `reviews`, `review_issues`, and `command_runs` contracts.
+- Additive PostgreSQL migration for repository locks, verification runs,
+  checkpoint recovery markers, model-routing audit records, and orchestration
+  leases. No second orchestration database is created.
+- Same-step revision cycles: a reviewer or verifier rejection returns the
+  existing `step_id` to Coder rather than creating a duplicate Planner step.
+- Final deterministic verification after reviewer approval and before a
+  commit. It runs `git diff --check`, scans candidate files for likely
+  secrets, and runs only explicit allowlisted project verification commands.
+- Controlled checkpoints: protected-branch refusal, exact reviewed file list,
+  preservation of pre-existing human changes, no `git add .`, no force push,
+  idempotent marker recovery, and persisted commit SHA.
+- Ollama-first routing via the separate Routing Agent's new
+  `POST /route/inference` API, with a safe local fallback if that service is
+  down. OpenRouter is a configured backup, normally eligible only after
+  repeated local failures (default fourth attempt).
+- Pause, resume, cancel, inspection, events, structured logs, worker leases,
+  and safe recovery of expired verification/checkpoint leases.
+
+The full live Align integration and overnight soak test still require the
+actual `/home/finn/work/align` checkout and PostgreSQL service. They are
+operational validation steps, not silently claimed by this source package.
+
+## Safety boundaries
+
+- The dedicated worker branch is required. `main` and `master` are protected
+  by default and never receive autonomous commits.
+- The Coder command policy rejects `git add`, `git commit`, `git push`, branch
+  changes, history rewrites, and destructive Git cleanup. Checkpointing has
+  separate narrow authority after review and verification.
+- The checkpoint stages only the reviewer-approved files and refuses unknown,
+  staged, or pre-existing human changes.
+- No automatic merge, deployment, force push, or destructive production data
+  operation is included.
+- `needs_human` is used for consequential ambiguity, credentials, branch
+  mismatch, destructive financial schema/data work, and unresolved recovery.
+  `blocked` is used for technical/environment failures.
+- Secrets stay in environment/secret management. Command environments and
+  persisted output redact or omit common database, cloud, and token values.
+
+## Install
+
+Requirements: Python 3.11+, Git, PostgreSQL 15+, a local Ollama service, and
+the existing Homelab Routing Agent if centralized model policy is desired.
 
 ```bash
-docker compose up -d
+cd /home/finn/homelab-ai/dev-team
 python -m venv .venv
 . .venv/bin/activate
 pip install -e .
 cp .env.example .env
+chmod 600 .env
 ```
 
-Export the values from `.env`, then initialize the database:
+Edit `.env` through your normal secret-management process. It must contain a
+restricted PostgreSQL application URL, repository allow-roots, and worker
+identities. Do not use a database-owner account or commit `.env`.
+
+Apply the **additive** agent-team schema migration once with a migration-capable
+database role:
 
 ```bash
-coder-agent init-db
+set -a
+. ./.env
+set +a
+agent-orchestrator init-db
 ```
 
-Create a job and a concrete implementation step. The repository must already be on
-the requested dedicated worker branch; branch switching is intentionally outside the
-model's authority.
+The running service's role needs only the grants it actually uses on the
+agent-team workflow tables. A migration role may have broader DDL authority;
+it should not be the runtime identity.
 
-```sql
-INSERT INTO jobs (goal, repository, branch, priority)
-VALUES ('Add a health endpoint', '/srv/repos/my-project',
-        'worker/health-endpoint', 10)
-RETURNING id;
+## Create the Align job
 
-INSERT INTO steps (
-  job_id, sequence, repository, branch, title, objective, rationale,
-  acceptance_criteria, constraints
-) VALUES (
-  1,
-  1,
-  '/srv/repos/my-project',
-  'worker/health-endpoint',
-  'Implement the health endpoint',
-  'Implement the HTTP health endpoint',
-  'Provide a bounded, testable service entry point',
-  '["GET /health returns 200", "existing tests pass"]',
-  '["Do not change authentication behavior", "Do not hard-code credentials"]'
-);
-```
-
-Run one claim for easy inspection, or start the long-running worker:
+Before creating it, make sure the real checkout already exists and is on the
+dedicated branch. The agents refuse to switch branches themselves.
 
 ```bash
-coder-agent run-once --json
-coder-agent run
+cd /home/finn/work/align
+git switch agents/autonomous-align
+git config user.name "Align Autonomous Agent"
+git config user.email "agent@homelab.local"
+
+cd /home/finn/homelab-ai/dev-team
+set -a; . ./.env; set +a
+agent-orchestrator create-job \
+  "Continuously improve Align according to docs/roadmap.md." \
+  --repository /home/finn/work/align \
+  --branch agents/autonomous-align \
+  --priority 10
 ```
 
-When implementation and verification succeed, the step becomes `review`. A reviewer
-should inspect the actual diff and update the step to either:
+Planner receives the repository's `AGENTS.md`, `WORKER.md` when present, and
+`docs/roadmap.md` as read-only authoritative context. It may update the
+roadmap only when materially implemented work changes a status; planning alone
+does not count as completion.
 
-```sql
-UPDATE steps
-SET status = 'changes_requested',
-    reviewer_feedback = '{
-      "verdict":"changes_requested",
-      "issues":[{
-        "severity":"high",
-        "file":"src/api.py",
-        "problem":"invalid input is accepted",
-        "requested_change":"return 400 for malformed input"
-      }]
-    }'
-WHERE id = 1;
+## Run and operate it
+
+For a transparent single transition:
+
+```bash
+agent-orchestrator once
+agent-orchestrator status
+agent-orchestrator inspect JOB_ID
 ```
 
-or, after tests and review, create a small commit from the explicit `files_changed`
-list and set the step to `complete` with its SHA. That final checkpoint belongs to an
-orchestrator or reviewer with separately approved Git authority.
+For persistent autonomous operation:
+
+```bash
+agent-orchestrator run
+```
+
+`run` remains in the foreground, writes structured stdout/stderr logs, sleeps
+when idle (default ten seconds), and handles `SIGTERM` at a safe boundary. Do
+not simultaneously run `planner-agent run`, `coder-agent run`, or
+`reviewer-agent run` against the same jobs; those legacy independent workers
+can bypass coordinator timing.
+
+Controls act on durable state:
+
+```bash
+agent-orchestrator pause JOB_ID
+agent-orchestrator resume JOB_ID
+agent-orchestrator cancel JOB_ID
+```
+
+A paused or cancelled job is not newly claimed. Resuming reloads PostgreSQL
+and Git evidence; no in-memory decision is trusted after a restart.
+
+## Verification and checkpoints
+
+After a reviewer approves a step, the Orchestrator runs:
+
+1. `git diff --check` limited to the approved paths;
+2. a local candidate secret scan; and
+3. only explicit, allowlisted commands from `ORCHESTRATOR_VERIFICATION_COMMANDS`
+   or backtick-delimited commands under `## Verification` in the repository's
+   `WORKER.md` / `AGENTS.md`.
+
+It never extracts arbitrary shell code from instructions or model output. A
+failed check records bounded redacted evidence and returns the *same* step to
+Coder. No commit occurs.
+
+On success, checkpointing verifies the expected worker branch, refuses
+protected branches, requires a clean index, validates the exact approved file
+set, checks for secrets again, stages only those paths, and makes a local
+commit with a persistent `Autonomous-Step` marker. If the service crashes
+after `git commit` but before PostgreSQL updates, it finds that marker rather
+than committing twice. `AUTO_PUSH=false` is the safe default; never enable it
+until the branch/push policy is independently reviewed.
+
+## Inference routing
+
+The specialist agents call the Routing Agent for model policy, not workflow
+policy:
+
+```text
+POST http://127.0.0.1:8090/route/inference
+```
+
+The request carries caller, task type, attempt, complexity, and privacy data.
+The response records provider, model, location, and rationale. If the Routing
+Agent is unavailable, the agent continues with configured local Ollama. If
+Ollama itself is unavailable, configured OpenRouter may be used as an
+availability fallback; normal escalation remains configurable and local-first.
+Model-route audit rows include caller, provider, model, reason, attempt,
+latency, usage, fallback, and optional estimated cloud cost.
+
+## Systemd
+
+Copy and adapt [`deploy/agent-orchestrator.service.example`](deploy/agent-orchestrator.service.example), then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now agent-orchestrator
+sudo journalctl -u agent-orchestrator -f
+```
+
+The service intentionally has no interactive prompts and works as a foreground
+process, so it is also suitable for a future Kubernetes Deployment. Durable
+state is PostgreSQL plus Git; memory is disposable.
 
 ## Configuration
 
-| Variable | Purpose |
-|---|---|
-| `DATABASE_URL` | PostgreSQL connection string |
-| `CODER_WORKSPACES` | Allowed repository roots, separated by the OS path separator |
-| `CODER_WORKER_ID` | Stable identity used for leases and events |
-| `CODER_MODEL` | Ollama coding model |
-| `OLLAMA_URL` | Ollama server URL |
-| `OPENROUTER_API_KEY` | Enables optional cloud escalation; never stored in job data |
-| `OPENROUTER_MODEL` | Cloud model selected after repeated attempts |
+See [`.env.example`](.env.example). The principal values are:
 
-The agent strips common credentials from subprocess environments and redacts likely
-credentials from recorded output. For production, inject secrets through your secret
-manager and isolate the worker further with a dedicated OS user or container.
+| Variable | Meaning |
+| --- | --- |
+| `DATABASE_URL` | Restricted PostgreSQL runtime connection |
+| `ORCHESTRATOR_WORKER_ID` | Stable coordinator identity recorded in leases/events |
+| `ORCHESTRATOR_POLL_SECONDS` | Idle sleep interval (default `10`) |
+| `ORCHESTRATOR_LEASE_SECONDS` | Work-claim lease duration |
+| `ROUTER_URL` | Homelab Routing Agent endpoint, default `http://127.0.0.1:8090` |
+| `OLLAMA_URL` | Local Ollama endpoint |
+| `OPENROUTER_API_KEY` | Optional backup only; never commit it |
+| `INFERENCE_ESCALATE_AFTER` | First normal cloud-eligible attempt (default `4`) |
+| `PROTECTED_BRANCHES` | Comma-separated autonomous-commit deny list |
+| `AUTO_COMMIT` | Enables reviewer-approved local checkpoints |
+| `AUTO_PUSH` | Off by default; no force/history rewrite is ever permitted |
 
-## State transitions
+## Tests
 
-```text
-queued ──claim──> running ──implementation+verification──> review
-                    │                                      │
-                    ├──recoverable failure──> failed        ├──approved──> complete
-                    ├──genuine blocker─────> blocked       └──feedback──> changes_requested
-                    └──retry ceiling───────> needs_human                    │
-                                                                            └──claim──> running
+Run deterministic tests without a live LLM or production database:
+
+```bash
+pip install -e ".[test]"
+pytest -q
 ```
 
-Only `queued` and `changes_requested` are automatically claimable. Pausing the job
-prevents new claims. Expired running leases are visible for an orchestrator to recover;
-they are not concurrently reclaimed while still marked running.
+The tests mock specialist agents/routing decisions and use temporary Git
+repositories for checkpoint safety. Before enabling an unattended job, run a
+bounded real integration against `/home/finn/work/align` on
+`agents/autonomous-align` and prove at least two consecutive roadmap steps:
 
-## Production hardening still recommended
+```text
+Planner → Coder → Reviewer → verification → checkpoint → Planner → second step
+```
 
-- Run each worker in its own Git worktree to eliminate checkout contention.
-- Add an approval service for branch creation, pushes, deletes, and migrations.
-- Add a separate reviewer worker and an orchestrator that commits only approved diffs.
-- Replace regex-only secret detection with a dedicated scanner such as Gitleaks.
-- Apply container-level network, CPU, memory, and filesystem restrictions.
-- Add repository locks keyed by canonical checkout path if checkouts are shared.
-
-Run the local safety tests with `pytest -q`.
+Never run that integration on `main`, and stop on `needs_human` rather than
+trying to automate a missing decision or production-data approval.

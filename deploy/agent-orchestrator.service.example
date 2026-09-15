@@ -1,0 +1,19 @@
+[Unit]
+Description=Homelab Agent Team Orchestrator
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=finn
+WorkingDirectory=/home/finn/homelab-ai/dev-team
+EnvironmentFile=/home/finn/homelab-ai/dev-team/.env
+ExecStart=/home/finn/homelab-ai/dev-team/.venv/bin/agent-orchestrator run
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=900
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

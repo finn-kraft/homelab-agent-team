@@ -21,7 +21,10 @@ class CommandPolicy:
     })
     denied_subcommands: set[tuple[str, str]] = field(default_factory=lambda: {
         ("git", "push"), ("git", "reset"), ("git", "clean"),
-        ("git", "rebase"), ("git", "checkout"),
+        ("git", "rebase"), ("git", "checkout"), ("git", "switch"),
+        # Staging and committing belong only to the deterministic checkpoint
+        # service, after independent review and final verification.
+        ("git", "add"), ("git", "commit"), ("git", "merge"),
     })
 
     def validate(self, argv: list[str]) -> None:
@@ -41,7 +44,8 @@ class CommandRunner:
     def run(self, argv: list[str], timeout: int = 300) -> CommandResult:
         self.policy.validate(argv)
         env = {k: v for k, v in os.environ.items() if k not in {
-            "OPENROUTER_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "AWS_SECRET_ACCESS_KEY"
+            "DATABASE_URL", "ALIGN_DATABASE_URL", "OPENROUTER_API_KEY", "GITHUB_TOKEN",
+            "GH_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "PGPASSWORD",
         }}
         started = time.monotonic()
         try:
@@ -54,4 +58,3 @@ class CommandRunner:
         except subprocess.TimeoutExpired as exc:
             return CommandResult(argv, exc.stdout or "", exc.stderr or "", 124,
                                  time.monotonic() - started, True)
-

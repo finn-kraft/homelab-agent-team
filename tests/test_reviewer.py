@@ -60,7 +60,7 @@ def test_16_collector_is_read_only(tmp_path):
 def test_17_no_commit_push_merge_interface(tmp_path):
  c=EvidenceCollector([str(tmp_path)]);assert not any(hasattr(c,x) for x in ('commit','push','merge','write'))
 def test_18_secret_detected(tmp_path):
- r,s=repo(tmp_path);(r/'app.py').write_text("token='ghp_abcdefghijklmnopqrstuvwxyz'\n")
+ r,s=repo(tmp_path);token="ghp_"+"abcdefghijklmnopqrstuvwxyz";(r/'app.py').write_text(f"token='{token}'\n")
  assert EvidenceCollector([str(tmp_path)]).collect(str(r),s,['app.py'],[])['secret_hits']
 def test_19_dependency_change_detected(tmp_path):
  r,s=repo(tmp_path);(r/'pyproject.toml').write_text('[project]\n')

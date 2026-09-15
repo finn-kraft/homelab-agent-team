@@ -11,16 +11,17 @@ class ReviewerStore:
         from psycopg.rows import dict_row
         with psycopg.connect(self.database_url,row_factory=dict_row) as c: yield c
 
-    def claim(self, worker_id, lease_seconds):
+    def claim(self, worker_id, lease_seconds, step_id=None):
         with self.connect() as c:
             row=c.execute("""WITH candidate AS (SELECT s.id FROM steps s JOIN jobs j ON j.id=s.job_id
             WHERE s.status='review' AND j.status NOT IN ('paused','cancelled') AND
+            (%s::BIGINT IS NULL OR s.id=%s) AND
             (s.review_lease_expires_at IS NULL OR s.review_lease_expires_at<now())
             ORDER BY s.id FOR UPDATE OF s SKIP LOCKED LIMIT 1), claimed AS (
             UPDATE steps s SET reviewer_worker_id=%s,review_lease_expires_at=now()+(%s*interval '1 second')
             FROM candidate WHERE s.id=candidate.id RETURNING s.*)
             SELECT claimed.*,j.goal,j.status AS job_status FROM claimed JOIN jobs j ON j.id=claimed.job_id""",
-            (worker_id,lease_seconds)).fetchone()
+            (step_id,step_id,worker_id,lease_seconds)).fetchone()
             if not row:return None
             attempt=c.execute("SELECT COALESCE(MAX(review_attempt),0)+1 n FROM reviews WHERE step_id=%s",(row['id'],)).fetchone()['n']
             review=c.execute("""INSERT INTO reviews(job_id,step_id,review_attempt,reviewer_worker_id,lease_expires_at)
@@ -34,8 +35,14 @@ class ReviewerStore:
         with self.connect() as c:return c.execute("""UPDATE reviews SET lease_expires_at=now()+(%s*interval '1 second')
         WHERE id=%s AND reviewer_worker_id=%s AND completed_at IS NULL""",(lease_seconds,review_id,worker_id)).rowcount==1
 
-    def commands(self,step_id):
-        with self.connect() as c:return list(c.execute("SELECT * FROM command_runs WHERE step_id=%s ORDER BY id",(step_id,)).fetchall())
+    def commands(self,step_id,attempt=None):
+        with self.connect() as c:
+            if attempt is None:
+                return list(c.execute("""SELECT * FROM command_runs
+                WHERE step_id=%s AND source='coder-agent' ORDER BY id""",(step_id,)).fetchall())
+            return list(c.execute("""SELECT * FROM command_runs
+            WHERE step_id=%s AND source='coder-agent' AND attempt=%s ORDER BY id""",
+            (step_id,attempt)).fetchall())
 
     def prior_issues(self,step_id):
         with self.connect() as c:return list(c.execute("SELECT * FROM review_issues WHERE step_id=%s ORDER BY id",(step_id,)).fetchall())
@@ -76,4 +83,3 @@ class ReviewerStore:
         with self.connect() as c:return list(c.execute("SELECT * FROM review_issues WHERE step_id=%s ORDER BY id",(id,)).fetchall())
     @staticmethod
     def _event(c,job,step,event,payload):c.execute("INSERT INTO events(job_id,step_id,agent,event_type,structured_payload) VALUES(%s,%s,'reviewer-agent',%s,%s)",(job,step,event,json.dumps(payload)))
-

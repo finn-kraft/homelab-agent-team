@@ -12,15 +12,19 @@ from .prompt import SYSTEM_PROMPT
 class PlannerAgent:
     def __init__(self, store, router, inspector: ReadOnlyRepositoryInspector,
                  worker_id: str, lease_seconds: int = 300, decision_retries: int = 2,
-                 escalation_attempt: int = 3):
+                 escalation_attempt: int = 4):
         self.store, self.router, self.inspector = store, router, inspector
         self.worker_id, self.lease_seconds = worker_id, lease_seconds
         self.decision_retries, self.escalation_attempt = decision_retries, escalation_attempt
+        # Observability only: the deterministic Orchestrator uses this after a
+        # bounded call to persist model-routing metadata without scraping logs.
+        self.last_job_id: int | None = None
 
     def plan_once(self) -> PlannerDecision | None:
         job = self.store.claim_job(self.worker_id, self.lease_seconds)
         if not job:
             return None
+        self.last_job_id = job.id
         try:
             job, steps, events = self.store.context(job.id)
             repository = self.inspector.inspect(job.repository, job.branch)
@@ -86,4 +90,3 @@ class PlannerAgent:
     @staticmethod
     def _serializable(job) -> dict[str, Any]:
         return {name: getattr(job, name) for name in job.__slots__}
-
