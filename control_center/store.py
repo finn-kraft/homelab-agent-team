@@ -119,13 +119,47 @@ class ControlStore:
     def action(self, job_id, action): self.workflow.control(job_id, action)
     def answer(self, job_id, answer):
         answer = str(answer).strip()
-        if not answer or len(answer) > 12_000: raise ValueError("answer must be 1-12000 characters")
+        if not answer or len(answer) > 12_000:
+            raise ValueError("answer must be 1-12000 characters")
+
         with self.workflow.connect() as connection:
-            job = connection.execute("SELECT * FROM jobs WHERE id=%s FOR UPDATE", (job_id,)).fetchone()
-            if not job: raise KeyError(job_id)
-            if job["status"] != "needs_human": raise ValueError("job is not waiting for human input")
-            connection.execute("""UPDATE jobs SET status='running',human_notes=concat_ws(E'\n',human_notes,%s),
-            planner_worker_id=NULL,planner_lease_expires_at=NULL,updated_at=now() WHERE id=%s""", (answer,job_id))
-            connection.execute("UPDATE steps SET status='changes_requested',blocker=NULL,updated_at=now() WHERE job_id=%s AND status='needs_human'", (job_id,))
-            self.workflow._event(connection, job_id, job.get("current_step"), "human_response_received",
-                                 {"answer":answer}, agent="control-center")
+            job = connection.execute(
+                "SELECT * FROM jobs WHERE id=%s FOR UPDATE",
+                (job_id,),
+            ).fetchone()
+
+            if not job:
+                raise KeyError(job_id)
+
+            if job["status"] != "needs_human":
+                raise ValueError("job is not waiting for human input")
+
+            connection.execute(
+                """UPDATE jobs
+                   SET status='running',
+                       human_notes=concat_ws(E'\\n', human_notes, %s::text),
+                       planner_worker_id=NULL,
+                       planner_lease_expires_at=NULL,
+                       updated_at=now()
+                   WHERE id=%s""",
+                (answer, job_id),
+            )
+
+            connection.execute(
+                """UPDATE steps
+                   SET status='changes_requested',
+                       blocker=NULL,
+                       updated_at=now()
+                   WHERE job_id=%s
+                     AND status='needs_human'""",
+                (job_id,),
+            )
+
+            self.workflow._event(
+                connection,
+                job_id,
+                job.get("current_step"),
+                "human_response_received",
+                {"answer": answer},
+                agent="control-center",
+            )

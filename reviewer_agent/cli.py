@@ -1,37 +1,211 @@
 from __future__ import annotations
-import argparse,json,os,sys
+
+import argparse
+import json
+import os
+import sys
 from dataclasses import asdict
-from agent_core.llm import InferenceRouter,OllamaBackend,OpenRouterBackend
+
+from agent_core.llm import (
+    InferenceRouter,
+    OllamaBackend,
+    OpenRouterBackend,
+)
 from planner_agent.store import PlannerStore
+
 from .evidence import EvidenceCollector
 from .reviewer import ReviewerAgent
 from .store import ReviewerStore
 from .worker import ReviewerWorker
 
-def build():
-    store=ReviewerStore(os.environ['DATABASE_URL']);roots=os.environ['REVIEWER_ALLOWED_REPOSITORIES'].split(os.pathsep)
-    local=OllamaBackend(os.getenv('OLLAMA_URL','http://localhost:11434'),os.getenv('REVIEWER_MODEL','qwen2.5-coder:14b'))
-    cloud=OpenRouterBackend('https://openrouter.ai/api/v1',os.getenv('OPENROUTER_REVIEWER_MODEL','anthropic/claude-sonnet-4'),os.environ['OPENROUTER_API_KEY']) if os.getenv('OPENROUTER_API_KEY') else None
-    return ReviewerAgent(store,InferenceRouter(local,cloud,
-                         router_url=os.getenv('ROUTER_URL','http://127.0.0.1:8090'),
-                         caller_agent='reviewer-agent',task_type='code_review',
-                         escalate_after=int(os.getenv('REVIEWER_ESCALATE_AFTER',os.getenv('INFERENCE_ESCALATE_AFTER','4'))),
-                         timeout=float(os.getenv('ROUTER_TIMEOUT_SECONDS','3')),
-                         privacy_sensitive=os.getenv('INFERENCE_PRIVACY_SENSITIVE','false').lower() in {'1','true','yes','on'}),EvidenceCollector(roots,int(os.getenv('REVIEWER_MAX_DIFF_BYTES','300000'))),
-                         os.getenv('REVIEWER_WORKER_ID','reviewer-1'),int(os.getenv('REVIEWER_LEASE_SECONDS','300')),
-                         int(os.getenv('REVIEWER_MAX_ATTEMPTS',os.getenv('MAX_REVIEW_ATTEMPTS','5'))))
-def main(argv=None):
-    p=argparse.ArgumentParser(prog='reviewer-agent');s=p.add_subparsers(dest='command',required=True)
-    for x in ('init-db','run','once'):s.add_parser(x)
-    for x in ('inspect','inspect-step','issues'):
-        q=s.add_parser(x);q.add_argument('id',type=int)
-    a=p.parse_args(argv);reviewer=build()
-    if a.command=='init-db':PlannerStore(os.environ['DATABASE_URL']).migrate()
-    elif a.command=='run':ReviewerWorker(reviewer).run_forever()
-    elif a.command=='once':
-        d=reviewer.review_once();print(json.dumps(asdict(d) if d else {'verdict':'idle'},default=str))
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1"
+
+
+def build() -> ReviewerAgent:
+    store = ReviewerStore(
+        os.environ["DATABASE_URL"]
+    )
+
+    roots = [
+        value
+        for value in os.environ[
+            "REVIEWER_ALLOWED_REPOSITORIES"
+        ].split(os.pathsep)
+        if value
+    ]
+
+    local = OllamaBackend(
+        os.getenv(
+            "OLLAMA_URL",
+            "http://localhost:11434",
+        ),
+        os.getenv(
+            "REVIEWER_MODEL",
+            "qwen2.5-coder:14b",
+        ),
+    )
+
+    standard_cloud = None
+    premium_cloud = None
+
+    api_key = os.getenv("OPENROUTER_API_KEY")
+
+    if api_key:
+        standard_cloud = OpenRouterBackend(
+            OPENROUTER_URL,
+            os.getenv(
+                "OPENROUTER_REVIEWER_STANDARD_MODEL",
+                "qwen/qwen3-coder-next",
+            ),
+            api_key,
+        )
+
+        premium_cloud = OpenRouterBackend(
+            OPENROUTER_URL,
+            os.getenv(
+                "OPENROUTER_REVIEWER_PREMIUM_MODEL",
+                "anthropic/claude-sonnet-4.6",
+            ),
+            api_key,
+        )
+
+    local_attempts = int(
+        os.getenv("INFERENCE_LOCAL_ATTEMPTS", "5")
+    )
+
+    escalation_attempt = local_attempts + 1
+
+    router = InferenceRouter(
+        local,
+        standard_cloud,
+        premium_cloud,
+        router_url=os.getenv(
+            "ROUTER_URL",
+            "http://127.0.0.1:8090",
+        ),
+        caller_agent="reviewer-agent",
+        task_type="code_review",
+        escalate_after=escalation_attempt,
+        timeout=float(
+            os.getenv(
+                "ROUTER_TIMEOUT_SECONDS",
+                "3",
+            )
+        ),
+        privacy_sensitive=os.getenv(
+            "INFERENCE_PRIVACY_SENSITIVE",
+            "false",
+        ).lower()
+        in {"1", "true", "yes", "on"},
+    )
+
+    return ReviewerAgent(
+        store,
+        router,
+        EvidenceCollector(
+            roots,
+            int(
+                os.getenv(
+                    "REVIEWER_MAX_DIFF_BYTES",
+                    "300000",
+                )
+            ),
+        ),
+        os.getenv(
+            "REVIEWER_WORKER_ID",
+            "reviewer-1",
+        ),
+        int(
+            os.getenv(
+                "REVIEWER_LEASE_SECONDS",
+                "300",
+            )
+        ),
+        int(
+            os.getenv(
+                "REVIEWER_MAX_ATTEMPTS",
+                os.getenv(
+                    "MAX_REVIEW_ATTEMPTS",
+                    "5",
+                ),
+            )
+        ),
+    )
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="reviewer-agent"
+    )
+
+    sub = parser.add_subparsers(
+        dest="command",
+        required=True,
+    )
+
+    for command in (
+        "init-db",
+        "run",
+        "once",
+    ):
+        sub.add_parser(command)
+
+    for command in (
+        "inspect",
+        "inspect-step",
+        "issues",
+    ):
+        item = sub.add_parser(command)
+        item.add_argument(
+            "id",
+            type=int,
+        )
+
+    args = parser.parse_args(argv)
+    reviewer = build()
+
+    if args.command == "init-db":
+        PlannerStore(
+            os.environ["DATABASE_URL"]
+        ).migrate()
+
+    elif args.command == "run":
+        ReviewerWorker(
+            reviewer
+        ).run_forever()
+
+    elif args.command == "once":
+        decision = reviewer.review_once()
+
+        print(
+            json.dumps(
+                (
+                    asdict(decision)
+                    if decision
+                    else {"verdict": "idle"}
+                ),
+                default=str,
+            )
+        )
+
     else:
-        fn={'inspect':reviewer.store.inspect_review,'inspect-step':reviewer.store.inspect_step,'issues':reviewer.store.issues}[a.command]
-        print(json.dumps(fn(a.id),default=str,indent=2))
+        function = {
+            "inspect": reviewer.store.inspect_review,
+            "inspect-step": reviewer.store.inspect_step,
+            "issues": reviewer.store.issues,
+        }[args.command]
+
+        print(
+            json.dumps(
+                function(args.id),
+                default=str,
+                indent=2,
+            )
+        )
+
     return 0
-if __name__=='__main__':sys.exit(main())
+
+
+if __name__ == "__main__":
+    sys.exit(main())

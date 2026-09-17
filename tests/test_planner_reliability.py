@@ -47,11 +47,19 @@ def test_backend_outage_remains_recoverable():
     PlannerAgent(store,router,Inspector(),'planner',decision_retries=1).plan_once()
     assert store.deferred=='inference_unavailable'
 
-def test_inappropriate_needs_human_is_rejected_but_hard_gate_is_valid():
-    with pytest.raises(InvalidDecision):
-        parse_decision(json.dumps({'decision':'needs_human','job_status':'needs_human','reasoning_summary':'unsure','human_question':'Which file should I inspect?'}))
-    value=parse_decision(json.dumps({'decision':'needs_human','job_status':'needs_human','reasoning_summary':'Production migration is irreversible','human_question':'Approve destructive production migration?'}))
-    assert value.decision=='needs_human'
+def test_needs_human_is_always_rejected_by_planner():
+    for question in (
+        "Which file should I inspect?",
+        "Approve destructive production migration?",
+    ):
+        with pytest.raises(InvalidDecision):
+            parse_decision(json.dumps({
+                "decision": "needs_human",
+                "job_status": "needs_human",
+                "reasoning_summary": "Human intervention requested.",
+                "human_question": question,
+            }))
+
 
 def test_routine_blocked_decision_is_rejected_without_technical_evidence():
     value = valid_step()

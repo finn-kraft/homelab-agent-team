@@ -19,33 +19,18 @@ def build_planner() -> PlannerAgent:
              if value]
     local = OllamaBackend(os.getenv("OLLAMA_URL", "http://localhost:11434"),
                           os.getenv("PLANNER_MODEL", "qwen2.5-coder:14b"))
-    standard_cloud = None
-    premium_cloud = None
-    api_key = os.getenv("OPENROUTER_API_KEY")
-
-    if api_key:
-        standard_cloud = OpenRouterBackend(
-            "https://openrouter.ai/api/v1",
-            os.getenv(
-                "OPENROUTER_PLANNER_STANDARD_MODEL",
-                "qwen/qwen3-coder-flash",
-            ),
-            api_key,
-        )
-        premium_cloud = OpenRouterBackend(
-            "https://openrouter.ai/api/v1",
-            os.getenv(
-                "OPENROUTER_PLANNER_PREMIUM_MODEL",
-                "anthropic/claude-sonnet-4.6",
-            ),
-            api_key,
-        )
+    cloud = None
+    if os.getenv("OPENROUTER_API_KEY"):
+        cloud = OpenRouterBackend("https://openrouter.ai/api/v1",
+                                  os.getenv("OPENROUTER_PLANNER_MODEL",
+                                            "anthropic/claude-sonnet-4"),
+                                  os.environ["OPENROUTER_API_KEY"])
     escalation_attempt = int(os.getenv(
         "PLANNER_ESCALATE_AFTER", os.getenv("INFERENCE_ESCALATE_AFTER", "4")
     ))
     return PlannerAgent(
         store, InferenceRouter(
-            local, standard_cloud, premium_cloud,
+            local, cloud,
             router_url=os.getenv("ROUTER_URL", "http://127.0.0.1:8090"),
             caller_agent="planner-agent",
             task_type="planning",

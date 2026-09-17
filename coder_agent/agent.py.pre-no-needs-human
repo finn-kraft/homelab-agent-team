@@ -56,17 +56,10 @@ class CoderAgent:
 
     def run_task(self, task: Task) -> AgentResult:
         if task.attempt > self.max_attempts:
-            result = AgentResult(
-                Status.FAILED,
-                "retry limit reached; return step for replanning",
-                blocker="maximum coder attempts exceeded",
-            )
-            self.store.update_step(
-                task.step_id,
-                self.worker_id,
-                result.status,
-                blocker=result.blocker,
-            )
+            result = AgentResult(Status.NEEDS_HUMAN, "retry limit reached",
+                                 blocker="maximum attempts exceeded")
+            self.store.update_step(task.step_id, self.worker_id, result.status,
+                                   blocker=result.blocker)
             return result
         try:
             workspace = Workspace(task.repository, self.allowed_roots)
@@ -157,18 +150,9 @@ class CoderAgent:
                                  {"role": "user", "content": observation}])
             raise RuntimeError("maximum agent turns exceeded")
         except (BackendError, WorkspaceViolation, CommandRejected, RuntimeError, ValueError) as exc:
-            status = Status.FAILED
-            self.store.update_step(
-                task.step_id,
-                self.worker_id,
-                status,
-                blocker=str(exc),
-            )
-            return AgentResult(
-                status,
-                "task did not reach review; return step for autonomous recovery",
-                blocker=str(exc),
-            )
+            status = Status.NEEDS_HUMAN if task.attempt >= self.max_attempts else Status.FAILED
+            self.store.update_step(task.step_id, self.worker_id, status, blocker=str(exc))
+            return AgentResult(status, "task did not reach review", blocker=str(exc))
 
     def _execute(self, action: dict[str, Any], workspace: Workspace,
                  runner: CommandRunner, git: GitRepository, task: Task,

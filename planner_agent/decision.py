@@ -8,7 +8,7 @@ from agent_core.models import PlannerDecision
 
 
 VALID_DECISIONS = {"create_step", "retry_step", "replace_step", "wait_for_review",
-                   "needs_human", "blocked", "complete"}
+                   "blocked", "complete"}
 FORBIDDEN_INSTRUCTIONS = (
     "force push", "force-push", "git reset --hard", "bypass review",
     "ignore failing tests", "disable security", "push to main", "push to master",

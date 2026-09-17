@@ -116,8 +116,8 @@ class ReviewerAgent:
 
         elif item["review_attempt"] > self.max_attempts:
             payload = {
-                "verdict": "needs_human",
-                "summary": "Review loop limit reached",
+                "verdict": "blocked",
+                "summary": "Review loop exhausted; return for autonomous replanning",
                 "blocking_issues": [],
                 "non_blocking_suggestions": [],
                 "acceptance_criteria": [
@@ -131,10 +131,6 @@ class ReviewerAgent:
                 "risk": "high",
                 "confidence": "high",
                 "recommended_next_state": "blocked",
-                "human_question": (
-                    "The Coder/Reviewer loop reached its configured limit. "
-                    "Should this step be re-scoped, waived, or stopped?"
-                ),
             }
 
             decision = parse_review(
