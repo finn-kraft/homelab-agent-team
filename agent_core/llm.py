@@ -29,8 +29,11 @@ class HTTPBackend:
                  timeout: int = 120, retries: int = 2):
         self.base_url, self.model, self.api_key = base_url.rstrip("/"), model, api_key
         self.timeout, self.retries = timeout, retries
+        self._circuit_open_until = 0.0
 
     def _post(self, url: str, payload: dict) -> tuple[dict, float]:
+        if self._circuit_open_until > time.time():
+            raise BackendError("backend circuit open; retry window has not elapsed")
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -41,6 +44,13 @@ class HTTPBackend:
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     return json.load(response), time.monotonic() - started
+            except urllib.error.HTTPError as exc:
+                last = exc
+                if exc.code in {401, 402, 403} and self.api_key:
+                    self._circuit_open_until = time.time() + 900
+                    raise BackendError(f"paid backend circuit opened after HTTP {exc.code}") from exc
+                if attempt < self.retries:
+                    time.sleep(2 ** attempt)
             except (urllib.error.URLError, TimeoutError) as exc:
                 last = exc
                 if attempt < self.retries:
