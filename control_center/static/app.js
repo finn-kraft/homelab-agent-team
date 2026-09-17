@@ -1,5 +1,5 @@
 const state = {
-  token: '', overview: null, projects: [], events: [], view: 'dashboard',
+  csrfToken: '', overview: null, projects: [], events: [], view: 'dashboard',
   jobId: null, streamGeneration: 0, eventFilter: '', eventSearch: {},
 };
 
@@ -32,9 +32,11 @@ function icon(name) {
 }
 
 async function api(path, options = {}) {
-  const headers = {...(options.headers || {}), Authorization: `Bearer ${state.token}`};
+  const headers = {...(options.headers || {})};
+  const method = String(options.method || 'GET').toUpperCase();
+  if (method !== 'GET') headers['X-CSRF-Token'] = state.csrfToken;
   if (options.body) headers['Content-Type'] = 'application/json';
-  const response = await fetch(path, {...options, headers});
+  const response = await fetch(path, {...options, headers, credentials: 'same-origin'});
   if (!response.ok) {
     let message = `Request failed (${response.status})`;
     try { message = (await response.json()).error || message; } catch (_) { /* no JSON body */ }
@@ -50,6 +52,13 @@ function age(value) {
   if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
   if (seconds < 86400) return `${Math.round(seconds / 3600)}h ago`;
   return `${Math.round(seconds / 86400)}d ago`;
+}
+
+function bytes(value) {
+  const amount = Number(value || 0);
+  if (!amount) return '';
+  if (amount > 1024 ** 3) return `${(amount / 1024 ** 3).toFixed(1)} GiB`;
+  return `${Math.round(amount / 1024 ** 2)} MiB`;
 }
 
 function statusClass(value) {
@@ -91,7 +100,7 @@ function projectFor(repository) {
 }
 
 function showView(name) {
-  if (!state.token) return;
+  if (!state.csrfToken) return;
   state.view = name;
   document.querySelectorAll('.view').forEach(node => { node.hidden = true; });
   $(`#${name}View`).hidden = false;
@@ -117,15 +126,18 @@ function showView(name) {
 
 async function connect() {
   const button = $('#connect');
-  state.token = $('#token').value.trim();
+  const password = $('#password').value;
   $('#loginError').textContent = '';
-  if (!state.token) {
-    $('#loginError').textContent = 'Enter your Control Center token.';
+  if (!password) {
+    $('#loginError').textContent = 'Enter your Control Center password.';
     return;
   }
   setBusy(button, true, 'Connecting…');
   try {
+    const login = await api('/api/login', {method: 'POST', body: JSON.stringify({password})});
+    state.csrfToken = login.csrf_token;
     [state.overview, state.projects] = await Promise.all([api('/api/overview'), api('/api/projects')]);
+    $('#password').value = '';
     document.body.classList.add('connected');
     $('#login').hidden = true;
     $('#app').hidden = false;
@@ -133,32 +145,33 @@ async function connect() {
     showView('dashboard');
     stream(++state.streamGeneration);
   } catch (error) {
-    state.token = '';
-    $('#loginError').textContent = 'Could not connect. Check the token and server status.';
+    state.csrfToken = '';
+    $('#loginError').textContent = 'Could not sign in. Check the password and server status.';
     setConnection('offline', 'Disconnected');
   } finally {
     setBusy(button, false);
   }
 }
 
-function disconnect() {
+async function disconnect() {
   state.streamGeneration += 1;
-  state.token = '';
+  try { await api('/api/logout', {method: 'POST', body: '{}'}); } catch (_) { /* session may already be expired */ }
+  state.csrfToken = '';
   state.overview = null;
   state.projects = [];
   state.events = [];
   document.body.classList.remove('connected');
   $('#app').hidden = true;
   $('#login').hidden = false;
-  $('#token').value = '';
+  $('#password').value = '';
   setConnection('offline', 'Disconnected');
-  toast('Disconnected', 'The token was cleared from this tab.');
+  toast('Disconnected', 'Your session was cleared from this tab.');
 }
 
 async function stream(generation) {
-  if (!state.token || generation !== state.streamGeneration) return;
+  if (!state.csrfToken || generation !== state.streamGeneration) return;
   try {
-    const response = await fetch('/api/stream', {headers: {Authorization: `Bearer ${state.token}`}});
+    const response = await fetch('/api/stream', {credentials: 'same-origin'});
     if (!response.ok) throw new Error('stream unavailable');
     setConnection('online', 'Live');
     const reader = response.body.getReader();
@@ -220,6 +233,7 @@ function renderDashboard() {
   const loaded = ollama.loaded_model || {};
   const model = loaded.name || loaded.model || 'No model loaded';
   const context = loaded.context_length || gpu.context_length;
+  const modelVram = loaded.size_vram || ollama.size_vram;
   const services = [orchestrator?.online, true, ollama.status === 'online', router.status === 'online'];
   const healthyServices = services.filter(Boolean).length;
   const cloudSpend = Number(overview.inference?.estimated_cloud_spend || 0);
@@ -242,7 +256,7 @@ function renderDashboard() {
     <div class="grid">
       ${serviceCard('Orchestrator', Boolean(orchestrator?.online), orchestrator?.current_action || 'No recent heartbeat', 'route')}
       ${serviceCard('PostgreSQL', true, 'Durable workflow connected', 'database')}
-      ${serviceCard('Ollama', ollama.status === 'online', `${model}${context ? ` · ${context} context` : ''}`, 'brain')}
+      ${serviceCard('Ollama', ollama.status === 'online', `${model}${context ? ` · ${context} context` : ''}${modelVram ? ` · ${bytes(modelVram)} VRAM` : ''}`, 'brain')}
       ${serviceCard('Routing agent', router.status === 'online', router.service || router.status || 'Not configured', 'route')}
     </div>
     <div class="section-head"><div class="section-title"><h2>Compute</h2><small>Local inference capacity and routing</small></div></div>
@@ -429,7 +443,7 @@ function populateProjects(selected) {
 }
 
 function newJob(projectId = '') {
-  if (!state.token) return;
+  if (!state.csrfToken) return;
   populateProjects(projectId);
   $('#jobDialog').showModal();
   setTimeout(() => $('#goal').focus(), 50);
@@ -470,7 +484,7 @@ document.addEventListener('click', event => {
 
 $('#connect').addEventListener('click', connect);
 $('#disconnect').addEventListener('click', disconnect);
-$('#token').addEventListener('keydown', event => { if (event.key === 'Enter') connect(); });
+$('#password').addEventListener('keydown', event => { if (event.key === 'Enter') connect(); });
 $('#newJobButton').addEventListener('click', () => newJob());
 $('#jobForm').addEventListener('submit', submitJob);
 document.addEventListener('submit', event => {
@@ -482,7 +496,7 @@ document.addEventListener('submit', event => {
 });
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape' && $('#jobDialog').open) $('#jobDialog').close();
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k' && state.token) { event.preventDefault(); newJob(); }
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k' && state.csrfToken) { event.preventDefault(); newJob(); }
 });
 
 updateClock();

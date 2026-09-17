@@ -40,7 +40,7 @@
       <div class="connection" aria-live="polite">
         <span id="liveDot"></span>
         <div><strong id="liveText">Disconnected</strong><small>Secure live feed</small></div>
-        <button id="disconnect" class="disconnect" title="Disconnect and clear token" aria-label="Disconnect">×</button>
+        <button id="disconnect" class="disconnect" title="Disconnect and clear session" aria-label="Disconnect">×</button>
       </div>
       <div class="local-first"><span>LOCAL FIRST</span><small>PostgreSQL + Ollama</small></div>
     </div>
@@ -82,9 +82,9 @@
       <div class="login card">
         <span class="kicker">AUTHENTICATED ACCESS</span>
         <h2>Connect to your agent team</h2>
-        <p>Use the Control Center token configured on this server. It stays only in this browser tab.</p>
-        <label class="token-field"><span>Control Center token</span><input id="token" type="password" autocomplete="current-password" placeholder="Paste your secure token"></label>
-        <button class="primary wide" id="connect">Connect securely <span>→</span></button>
+        <p>Sign in with the Control Center password configured on this server.</p>
+        <label class="token-field"><span>Control Center password</span><input id="password" type="password" autocomplete="current-password" placeholder="Enter your password"></label>
+        <button class="primary wide" id="connect">Sign in securely <span>→</span></button>
         <p id="loginError" class="error" role="alert"></p>
         <div class="security-note"><span>◆</span> Bound to your private infrastructure</div>
       </div>

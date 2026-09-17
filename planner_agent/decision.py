@@ -75,6 +75,18 @@ def validate_decision(decision: PlannerDecision) -> None:
         basis = f"{decision.reasoning_summary} {decision.human_question}".lower()
         if not any(term in basis for term in hard_gate_terms):
             raise InvalidDecision("needs_human is reserved for a concrete hard gate")
+    if decision.decision == "blocked":
+        if decision.job_status not in {"blocked", "running"}:
+            raise InvalidDecision("blocked decision has no valid job status")
+        blocker = decision.blocker
+        if not blocker:
+            raise InvalidDecision("blocked requires a concrete technical blocker")
+        if isinstance(blocker, dict) and str(blocker.get("type", "")).lower() in {
+            "decision", "needs_human", "question"
+        }:
+            raise InvalidDecision("routine decisions must not be represented as blocked")
+        if "needs_human" in json.dumps(blocker).lower():
+            raise InvalidDecision("blocked cannot proxy a human decision")
 
 
 def completion_is_supported(decision: PlannerDecision, steps: list[dict[str, Any]]) -> bool:

@@ -229,11 +229,12 @@ state is PostgreSQL plus Git; memory is disposable.
 
 The Control Center has a separate example unit at
 [`deploy/agent-control-center.service.example`](deploy/agent-control-center.service.example).
-Set a long random `CONTROL_CENTER_TOKEN`, keep it bound to `127.0.0.1`, and expose it
-only through an authenticated TLS reverse proxy:
+Set the Control Center password with `agent-control-center set-password`, keep it bound
+to `127.0.0.1` behind an authenticated TLS reverse proxy (or bind to the server's
+private LAN address and firewall port 8080):
 
 ```bash
-agent-control-center --host 127.0.0.1 --port 8080
+agent-control-center
 ```
 
 GPU data must come from a trusted, bearer-authenticated read-only JSON endpoint on the

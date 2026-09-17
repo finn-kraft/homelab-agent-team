@@ -52,3 +52,18 @@ def test_inappropriate_needs_human_is_rejected_but_hard_gate_is_valid():
         parse_decision(json.dumps({'decision':'needs_human','job_status':'needs_human','reasoning_summary':'unsure','human_question':'Which file should I inspect?'}))
     value=parse_decision(json.dumps({'decision':'needs_human','job_status':'needs_human','reasoning_summary':'Production migration is irreversible','human_question':'Approve destructive production migration?'}))
     assert value.decision=='needs_human'
+
+def test_routine_blocked_decision_is_rejected_without_technical_evidence():
+    value = valid_step()
+    value.update(decision="blocked", job_status="None", step=None, blocker=None)
+    with pytest.raises(InvalidDecision):
+        parse_decision(json.dumps(value))
+
+def test_transient_blocked_decision_is_deferred_for_retry():
+    payload = {"decision":"blocked", "job_status":"blocked",
+               "reasoning_summary":"Ollama unavailable; retry later",
+               "evidence":[], "human_question":None,
+               "blocker":{"type":"inference_unavailable","detail":"connection timeout"}}
+    store=Store(); router=SequenceRouter([ResponseBackend(json.dumps(payload))])
+    decision=PlannerAgent(store,router,Inspector(),'planner',decision_retries=0).plan_once()
+    assert decision.job_status=='running' and store.deferred=='planner_blocker'
