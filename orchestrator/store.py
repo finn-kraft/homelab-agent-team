@@ -230,6 +230,9 @@ class OrchestratorStore:
                 j.planner_worker_id,j.planner_lease_expires_at,
                 COUNT(s.id) FILTER (WHERE s.status <> 'complete') AS open_steps,
                 COUNT(s.id) FILTER (WHERE s.status = 'complete') AS completed_steps,
+                (SELECT e.structured_payload->>'progress_classification' FROM events e
+                 JOIN steps es ON es.id=e.step_id WHERE es.job_id=j.id
+                 AND e.event_type='agent_action' ORDER BY e.id DESC LIMIT 1) AS progress_classification,
                 (SELECT s2.blocker FROM steps s2 WHERE s2.job_id=j.id
                  AND s2.status IN ('blocked','failed','needs_human')
                  ORDER BY s2.updated_at DESC NULLS LAST, s2.id DESC LIMIT 1) AS blocker
