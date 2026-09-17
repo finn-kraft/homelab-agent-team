@@ -1,6 +1,6 @@
 const state = {
   csrfToken: '', overview: null, projects: [], events: [], view: 'dashboard',
-  jobId: null, streamGeneration: 0, eventFilter: '', eventSearch: {},
+  jobId: null, streamGeneration: 0, eventFilter: '', eventSearch: {}, humanDraft: '',
 };
 
 const $ = selector => document.querySelector(selector);
@@ -400,7 +400,7 @@ async function renderJob(id) {
 }
 
 function attentionCard(id, attention) {
-  return `<article class="card attention"><div class="attention-head">${icon('alert')}<h3>Needs attention</h3></div><p><strong>${esc(attention.reason)}</strong></p><p>${esc(attention.question)}</p>${attention.can_answer ? `<textarea id="humanAnswer" placeholder="Enter your decision or instructions"></textarea><button class="primary" data-action="answer-job" data-job-id="${Number(id)}">Continue workflow <span>→</span></button>` : '<p class="muted">Resolve the technical blocker, then use Resume to let the team reassess durable state.</p>'}</article>`;
+  return `<article class="card attention"><div class="attention-head">${icon('alert')}<h3>Needs attention</h3></div><p><strong>${esc(attention.reason)}</strong></p><p>${esc(attention.question)}</p>${attention.can_answer ? `<textarea id="humanAnswer" maxlength="10000" placeholder="Enter your decision or instructions">${esc(state.humanDraft)}</textarea><button class="primary" data-action="answer-job" data-job-id="${Number(id)}">Continue workflow <span>→</span></button>` : '<p class="muted">Resolve the technical blocker, then use Resume to let the team reassess durable state.</p>'}</article>`;
 }
 
 function stepCard(step) {
@@ -423,6 +423,7 @@ async function jobAction(action, button) {
     const labels = {pause: 'paused', resume: 'resumed', cancel: 'cancelled'};
     toast(`Job ${labels[action]}`, `Job #${state.jobId} was updated.`);
     state.overview = await api('/api/overview');
+    state.humanDraft = '';
     await renderJob(state.jobId);
   } catch (error) { toast('Job action failed', error.message, true); }
   finally { setBusy(button, false); }
@@ -484,6 +485,7 @@ document.addEventListener('click', event => {
   if (action === 'job-action') return jobAction(target.dataset.jobAction, target);
   if (action === 'answer-job') return answerJob(Number(target.dataset.jobId), target);
 });
+document.addEventListener('input', event => { if (event.target.id === 'humanAnswer') state.humanDraft = event.target.value; });
 
 $('#connect').addEventListener('click', connect);
 $('#disconnect').addEventListener('click', disconnect);
