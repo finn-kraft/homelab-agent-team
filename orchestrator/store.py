@@ -456,6 +456,18 @@ class OrchestratorStore:
                 AND lease_expires_at < now() RETURNING id""").fetchall()
             return [row["id"] for row in rows]
 
+    def retry_job(self, job_id: int) -> None:
+        """Safely requeue failed/exhausted work while retaining event history."""
+        with self.connect() as connection:
+            row = connection.execute("SELECT id,status FROM jobs WHERE id=%s FOR UPDATE", (job_id,)).fetchone()
+            if not row:
+                raise KeyError(job_id)
+            connection.execute("""UPDATE steps SET status='queued',attempt_count=0,worker_id=NULL,
+                lease_expires_at=NULL,blocker=NULL,updated_at=now() WHERE job_id=%s
+                AND status IN ('failed','blocked')""", (job_id,))
+            connection.execute("UPDATE jobs SET status='running',current_phase='coding',updated_at=now() WHERE id=%s", (job_id,))
+            self._event(connection, job_id, None, "job_retry_requested", {"previous_status": row["status"]})
+
     def start_engineering_session(self, job_id: int, step_id: int | None,
                                   worker_id: str, starting_commit: str | None = None) -> int:
         with self.connect() as connection:

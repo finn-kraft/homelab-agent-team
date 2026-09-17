@@ -67,6 +67,8 @@ def _parser() -> argparse.ArgumentParser:
     for name in ("pause", "resume", "cancel"):
         item = subcommands.add_parser(name, help=f"{name} one job at a safe boundary")
         item.add_argument("job_id", type=int)
+    retry = subcommands.add_parser("retry", help="requeue failed or exhausted work")
+    retry.add_argument("job_id", type=int)
     create = subcommands.add_parser("create-job", help="create a persistent high-level job")
     create.add_argument("goal")
     create.add_argument("--repository", required=True)
@@ -151,6 +153,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command in {"pause", "resume", "cancel"}:
             store.control(args.job_id, args.command)
             print(json.dumps({"status": "ok", "action": args.command, "job_id": args.job_id}))
+            return 0
+        if args.command == "retry":
+            store.retry_job(args.job_id)
+            print(json.dumps({"status": "ok", "action": "retry", "job_id": args.job_id}))
             return 0
         if args.command == "create-job":
             if args.max_iterations <= 0:
