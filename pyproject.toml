@@ -24,6 +24,7 @@ include = ["agent_core*", "coder_agent*", "planner_agent*", "reviewer_agent*", "
 
 [tool.setuptools.package-data]
 agent_core = ["schema.sql"]
+control_center = ["static/*.html", "static/*.css", "static/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

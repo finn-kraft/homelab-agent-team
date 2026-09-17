@@ -241,6 +241,8 @@ Ollama host. The dashboard never accepts SSH details or arbitrary commands.
 
 See [`docs/STATE_MACHINE_AUDIT.md`](docs/STATE_MACHINE_AUDIT.md) for transition
 ownership, leases, recovery behavior, confirmed root causes, and remaining constraints.
+Complete project-catalog, authentication, SSE, human-response, telemetry, and deployment
+instructions are in [`docs/CONTROL_CENTER.md`](docs/CONTROL_CENTER.md).
 
 ## Configuration
 

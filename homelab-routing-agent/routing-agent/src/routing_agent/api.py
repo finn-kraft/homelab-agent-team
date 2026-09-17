@@ -11,6 +11,11 @@ from .router import Router
 
 app = FastAPI(title="Homelab Routing Agent")
 
+@app.get("/health")
+def health() -> dict:
+    """Narrow readiness endpoint for the Control Center."""
+    return {"status": "online", "service": "homelab-routing-agent"}
+
 
 class RouteRequest(BaseModel):
     """Incoming request body."""

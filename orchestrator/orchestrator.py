@@ -60,15 +60,23 @@ class AgentOrchestrator:
     def run(self) -> None:
         """Run until SIGTERM/SIGINT asks for a graceful safe-boundary stop."""
         self._log("orchestrator_started", worker_id=self.config.worker_id)
+        heartbeat = getattr(self.store, "heartbeat_worker", None)
         while not self._stop_requested.is_set():
             try:
+                if heartbeat:
+                    heartbeat(self.config.worker_id, "orchestrator", "running", action="advance")
                 result = self.once()
+                if heartbeat:
+                    heartbeat(self.config.worker_id, "orchestrator", "running",
+                              job_id=result.job_id, step_id=result.step_id, action=result.action)
                 if result.action == "idle":
                     self._stop_requested.wait(self.config.poll_seconds)
             except Exception:  # Database/service interruptions must not kill systemd.
                 LOG.exception("orchestrator_runtime_error worker_id=%s", self.config.worker_id)
                 self._stop_requested.wait(self.config.poll_seconds)
         self._log("orchestrator_stopped", worker_id=self.config.worker_id)
+        if heartbeat:
+            heartbeat(self.config.worker_id, "orchestrator", "stopped", action="stopped")
 
     def once(self) -> AdvanceResult:
         """Perform one deterministic advancement, suitable for tests and cron-like use."""

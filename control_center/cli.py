@@ -3,6 +3,7 @@ import os
 from .app import ControlCenter
 from .store import ControlStore
 from .telemetry import TelemetryClient
+from .projects import ProjectCatalog
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="agent-control-center")
@@ -11,8 +12,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     token = os.getenv("CONTROL_CENTER_TOKEN")
     if not token: raise SystemExit("CONTROL_CENTER_TOKEN is required")
-    ControlCenter(ControlStore(os.environ["DATABASE_URL"]), TelemetryClient(
-        os.getenv("GPU_TELEMETRY_URL"), os.getenv("GPU_TELEMETRY_TOKEN"), os.getenv("OLLAMA_URL")
+    projects = ProjectCatalog.from_env()
+    ControlCenter(ControlStore(os.environ["DATABASE_URL"], projects), TelemetryClient(
+        os.getenv("GPU_TELEMETRY_URL"), os.getenv("GPU_TELEMETRY_TOKEN"),
+        os.getenv("OLLAMA_URL"), os.getenv("ROUTER_URL")
     ), token).serve(args.host, args.port)
     return 0
 
