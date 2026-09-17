@@ -9,13 +9,14 @@ class Store:
 class Telemetry:
     def snapshot(self): return {"gpu": {"status": "ok"}, "ollama": {"status": "ok"}}
 
+class Auth:
+    secure_cookie = False
+    def authenticate(self, _token): return None
+    def check_csrf(self, _session, _value): return True
+
 @pytest.fixture
 def app():
-    return ControlCenter(Store(), Telemetry(), "secret-token")
-
-def test_api_authorization_is_required(app):
-    assert not app.authorized("") and not app.authorized("Bearer wrong")
-    assert app.authorized("Bearer secret-token")
+    return ControlCenter(Store(), Telemetry(), Auth())
 
 def test_cancel_requires_explicit_confirmation(app):
     with pytest.raises(PermissionError): app.perform_action(1, "cancel", {})
@@ -33,6 +34,7 @@ def test_static_dashboard_contains_primary_operator_workflow():
     assert "Start a new job" in html
     assert all(stage in html for stage in ("Planner", "Coder", "Reviewer", "Verification", "Commit"))
     assert "/api/stream" in script and "Needs attention" in script
+    assert "/api/login" in script and "Control Center password" in html
 
 def test_dashboard_uses_accessible_delegated_controls():
     from importlib.resources import files
@@ -41,3 +43,4 @@ def test_dashboard_uses_accessible_delegated_controls():
     assert "aria-label=\"Primary navigation\"" in html
     assert "onclick=" not in html and "onclick=\"" not in script
     assert "data-action=\"job-action\"" in script
+    assert "/api/login" in script and "credentials: 'same-origin'" in script

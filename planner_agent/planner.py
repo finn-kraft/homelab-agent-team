@@ -97,6 +97,13 @@ class PlannerAgent:
                     "Planning retry scheduled; the persistent job remains recoverable.",
                     blocker=reason,
                 )
+            if decision.decision == "blocked" and self._recoverable_blocker(decision.blocker):
+                self.store.defer(job.id, self.worker_id, "planner_blocker",
+                                 json.dumps(decision.blocker, default=str))
+                return PlannerDecision(
+                    "blocked", "running", "Planning retry scheduled; the persistent job remains recoverable.",
+                    blocker="planner_blocker",
+                )
             self.store.apply_decision(job, self.worker_id, decision)
             return decision
         except InspectionError as exc:
@@ -111,3 +118,12 @@ class PlannerAgent:
     @staticmethod
     def _serializable(job) -> dict[str, Any]:
         return {name: getattr(job, name) for name in job.__slots__}
+
+    @staticmethod
+    def _recoverable_blocker(blocker: Any) -> bool:
+        """Keep transient/environment blockers out of permanent job state."""
+        value = json.dumps(blocker, default=str).lower()
+        return any(term in value for term in (
+            "unavailable", "timeout", "timed_out", "transient", "connection",
+            "repository_conflict", "missing_external_resource",
+        ))

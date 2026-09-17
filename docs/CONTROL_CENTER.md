@@ -6,11 +6,17 @@ SQL, or arbitrary Git commands.
 
 ## Configure authorized projects
 
-Set a long random `CONTROL_CENTER_TOKEN` through the host secret mechanism. Configure
-the repository allowlist as JSON on one line:
+Configure the repository allowlist as JSON on one line. The Control Center password is
+stored as a salted bcrypt hash in PostgreSQL, not in `.env` or source code. Set it once
+or change it safely with:
 
 ```text
 CONTROL_CENTER_PROJECTS='[{"id":"align","name":"Align","repository":"/home/finn/work/align","branch":"agents/autonomous-align","roadmap":"docs/roadmap.md"}]'
+```
+
+```bash
+set -a; . ./.env; set +a
+.venv/bin/agent-control-center set-password
 ```
 
 Only catalogued project IDs can create jobs. Repository paths and branches are selected
@@ -23,15 +29,18 @@ latest commit. Workflow mutations remain PostgreSQL records consumed by Orchestr
 ```bash
 set -a; . ./.env; set +a
 agent-orchestrator init-db
-agent-control-center --host 127.0.0.1 --port 8080
+agent-control-center
 ```
 
 Install `deploy/agent-control-center.service.example` for persistent operation. Keep
-the listener on loopback and publish it only through an authenticated TLS reverse proxy.
-The page asks for the bearer token and keeps it only in page memory.
+the listener on loopback behind an authenticated TLS reverse proxy, or bind it to the
+server's actual private LAN address and firewall port 8080 to your trusted network.
+The page establishes an opaque HttpOnly SameSite session; the password is never sent
+again after login.
 
 `GET /health` is an unauthenticated readiness endpoint exposing only `ok` or `degraded`.
-All `/api/*` endpoints require the bearer token. Cancel requires explicit confirmation.
+All `/api/*` endpoints require the HttpOnly session cookie and CSRF header for writes.
+Cancel requires explicit confirmation.
 
 ## Live state
 
@@ -58,6 +67,7 @@ JSON endpoint configured as `GPU_TELEMETRY_URL`; expected fields are:
 ```
 
 Do not point this setting at SSH, a command runner, or a general host-management API.
+If `GPU_TELEMETRY_URL` is unset, a fixed local `nvidia-smi` query is used when present.
 
 For a complete install-to-boot command sequence, including the routing service and the
 single `agent-team.target` lifecycle, see [`RUN_THE_TEAM.md`](RUN_THE_TEAM.md).

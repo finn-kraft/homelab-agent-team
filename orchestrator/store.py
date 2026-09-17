@@ -17,7 +17,7 @@ from typing import Any, Iterable
 from coder_agent.models import Status, Task
 
 
-MIGRATION_VERSION = "orchestrator-0001"
+MIGRATION_VERSION = "orchestrator-0002"
 
 MIGRATION_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -99,6 +99,12 @@ CREATE TABLE IF NOT EXISTS worker_heartbeats (
   started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   metadata JSONB NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS control_center_credentials (
+  id SMALLINT PRIMARY KEY CHECK (id = 1),
+  password_hash TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS steps_orchestrator_claim_idx

@@ -58,18 +58,20 @@ REVIEWER_MODEL=llama3.2:latest
 
 CONTROL_CENTER_HOST=127.0.0.1
 CONTROL_CENTER_PORT=8080
-CONTROL_CENTER_TOKEN=REPLACE_WITH_A_LONG_RANDOM_VALUE
+CONTROL_CENTER_COOKIE_SECURE=false
 CONTROL_CENTER_PROJECTS='[{"id":"align","name":"Align","repository":"/home/finn/work/align","branch":"agents/autonomous-align","roadmap":"docs/roadmap.md"}]'
 ```
 
-Generate the dashboard token with:
+Set the dashboard password interactively after the database migration:
 
 ```bash
-openssl rand -hex 32
+set -a; . ./.env; set +a
+.venv/bin/agent-control-center set-password
 ```
 
 Keep JSON environment values inside outer single quotes. Without them, loading `.env`
-from a shell removes the JSON double quotes.
+from a shell removes the JSON double quotes. Set `CONTROL_CENTER_COOKIE_SECURE=true`
+when the browser connects over HTTPS, including through a TLS reverse proxy.
 
 The safe default is `AUTO_PUSH=false`. The team creates reviewed local checkpoint
 commits on the dedicated worker branch but does not push or merge them automatically.
@@ -109,7 +111,7 @@ is reachable from the agent server.
 ## 4. Initialize the workflow database
 
 Run this once after first install and again after pulling a release that contains an
-additive migration:
+additive migration (including the Control Center credential table):
 
 ```bash
 cd /home/finn/homelab-ai/dev-team
@@ -163,13 +165,13 @@ Terminal 3 — Control Center:
 ```bash
 cd /home/finn/homelab-ai/dev-team
 set -a; . ./.env; set +a
-.venv/bin/agent-control-center --host 127.0.0.1 --port 8080
+.venv/bin/agent-control-center
 ```
 
-Open `http://127.0.0.1:8080` from the same machine and enter
-`CONTROL_CENTER_TOKEN`. For access from another machine, put the loopback listener
-behind your authenticated TLS reverse proxy; do not expose the unauthenticated routing
-API publicly.
+Open `http://127.0.0.1:8080` from the same machine and enter the password you set above.
+For access from another machine, bind `CONTROL_CENTER_HOST` to the server's actual LAN
+address (or `0.0.0.0` with a firewall rule for your private network). HTTPS through an
+authenticated TLS reverse proxy is preferred; do not expose the routing API publicly.
 
 ## 7. Install one-command system services
 
@@ -229,13 +231,14 @@ curl -fsS http://127.0.0.1:8080/health
 
 cd /home/finn/homelab-ai/dev-team
 set -a; . ./.env; set +a
-curl -fsS -H "Authorization: Bearer $CONTROL_CENTER_TOKEN" \
-  http://127.0.0.1:8080/api/overview
+.venv/bin/agent-control-center set-password  # only when first configuring/changing it
 
 .venv/bin/agent-orchestrator status
 ```
 
-All four checks should return JSON without an HTTP error.
+Open the Control Center in a browser and sign in with that password. The dashboard then
+checks `/api/overview` using its HttpOnly session cookie; the password is never stored
+in the page or sent with later requests.
 
 ## 9. Create work
 
