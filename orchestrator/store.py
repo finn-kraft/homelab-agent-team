@@ -237,6 +237,23 @@ class OrchestratorStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def invariant_report(self) -> list[dict[str, Any]]:
+        """Return read-only workflow invariant violations for operators."""
+        checks = {
+            "planning_without_lease": "SELECT id FROM jobs WHERE status='planning' AND planner_worker_id IS NULL",
+            "multiple_active_steps": "SELECT job_id FROM steps WHERE status IN ('queued','running','review','changes_requested','verification') GROUP BY job_id HAVING count(*) > 1",
+            "completed_without_commit": "SELECT id FROM steps WHERE status='complete' AND (resulting_commit IS NULL OR resulting_commit='')",
+            "checkpoint_without_verification": "SELECT id FROM steps WHERE status='checkpoint' AND verification_result IS NULL",
+        }
+        violations = []
+        with self.connect() as connection:
+            for name, query in checks.items():
+                rows = connection.execute(query).fetchall()
+                if rows:
+                    violations.append({"invariant": name, "count": len(rows),
+                                       "ids": [row[0] for row in rows[:50]]})
+        return violations
+
     # ------------------------------------------------------------------
     # Repository mutation lease
     # ------------------------------------------------------------------
