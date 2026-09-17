@@ -28,6 +28,9 @@ def build_agent() -> CoderAgent:
         if path
     ]
 
+    llm_timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "90"))
+    llm_retries = int(os.getenv("LLM_RETRIES", "1"))
+
     local = OllamaBackend(
         os.getenv(
             "OLLAMA_URL",
@@ -37,6 +40,8 @@ def build_agent() -> CoderAgent:
             "CODER_MODEL",
             "qwen2.5-coder:14b",
         ),
+        timeout=llm_timeout,
+        retries=llm_retries,
     )
 
     standard_cloud = None
@@ -52,6 +57,8 @@ def build_agent() -> CoderAgent:
                 "qwen/qwen3-coder-next",
             ),
             api_key,
+            timeout=llm_timeout,
+            retries=llm_retries,
         )
 
         premium_cloud = OpenRouterBackend(
@@ -61,6 +68,8 @@ def build_agent() -> CoderAgent:
                 "openai/gpt-5.2-codex",
             ),
             api_key,
+            timeout=llm_timeout,
+            retries=llm_retries,
         )
 
     local_attempts = int(

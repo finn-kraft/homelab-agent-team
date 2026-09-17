@@ -17,8 +17,11 @@ def build_planner() -> PlannerAgent:
     store = PlannerStore(os.environ["DATABASE_URL"])
     roots = [value for value in os.environ["PLANNER_ALLOWED_REPOSITORIES"].split(os.pathsep)
              if value]
+    llm_timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "90"))
+    llm_retries = int(os.getenv("LLM_RETRIES", "1"))
     local = OllamaBackend(os.getenv("OLLAMA_URL", "http://localhost:11434"),
-                          os.getenv("PLANNER_MODEL", "qwen2.5-coder:14b"))
+                          os.getenv("PLANNER_MODEL", "qwen2.5-coder:14b"),
+                          timeout=llm_timeout, retries=llm_retries)
     standard_cloud = None
     premium_cloud = None
     api_key = os.getenv("OPENROUTER_API_KEY")
@@ -31,6 +34,8 @@ def build_planner() -> PlannerAgent:
                 "qwen/qwen3-coder-flash",
             ),
             api_key,
+            timeout=llm_timeout,
+            retries=llm_retries,
         )
         premium_cloud = OpenRouterBackend(
             "https://openrouter.ai/api/v1",
@@ -39,6 +44,8 @@ def build_planner() -> PlannerAgent:
                 "anthropic/claude-sonnet-4.6",
             ),
             api_key,
+            timeout=llm_timeout,
+            retries=llm_retries,
         )
     escalation_attempt = int(os.getenv(
         "PLANNER_ESCALATE_AFTER", os.getenv("INFERENCE_ESCALATE_AFTER", "4")
@@ -59,6 +66,7 @@ def build_planner() -> PlannerAgent:
         int(os.getenv("PLANNER_LEASE_SECONDS", "300")),
         int(os.getenv("PLANNER_DECISION_RETRIES", "3")),
         escalation_attempt,
+        int(os.getenv("PLANNER_MAX_CONTEXT_CHARS", "120000")),
     )
 
 

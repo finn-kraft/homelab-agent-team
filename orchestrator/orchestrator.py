@@ -196,6 +196,12 @@ class AgentOrchestrator:
             return AdvanceResult("review", work.get("job_id"), step_id, str(verdict))
         except Exception as exc:
             work = self.store.step(step_id) or {}
+            abandon = getattr(self.reviewer, "abandon", None)
+            if abandon is not None:
+                try:
+                    abandon(step_id, str(exc))
+                except Exception:
+                    LOG.exception("review_cleanup_failed step_id=%s", step_id)
             self._log("review_crashed", job_id=work.get("job_id"), step_id=step_id,
                       error=str(exc), level=logging.ERROR)
             return AdvanceResult("review_crashed", work.get("job_id"), step_id, str(exc))

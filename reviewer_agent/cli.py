@@ -35,6 +35,9 @@ def build() -> ReviewerAgent:
         if value
     ]
 
+    llm_timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "90"))
+    llm_retries = int(os.getenv("LLM_RETRIES", "1"))
+
     local = OllamaBackend(
         os.getenv(
             "OLLAMA_URL",
@@ -44,6 +47,8 @@ def build() -> ReviewerAgent:
             "REVIEWER_MODEL",
             "qwen2.5-coder:14b",
         ),
+        timeout=llm_timeout,
+        retries=llm_retries,
     )
 
     standard_cloud = None
@@ -59,6 +64,8 @@ def build() -> ReviewerAgent:
                 "qwen/qwen3-coder-next",
             ),
             api_key,
+            timeout=llm_timeout,
+            retries=llm_retries,
         )
 
         premium_cloud = OpenRouterBackend(
@@ -68,6 +75,8 @@ def build() -> ReviewerAgent:
                 "anthropic/claude-sonnet-4.6",
             ),
             api_key,
+            timeout=llm_timeout,
+            retries=llm_retries,
         )
 
     local_attempts = int(
@@ -131,6 +140,7 @@ def build() -> ReviewerAgent:
                 ),
             )
         ),
+        max_context_chars=int(os.getenv("REVIEWER_MAX_CONTEXT_CHARS", "120000")),
     )
 
 

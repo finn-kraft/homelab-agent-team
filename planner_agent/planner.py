@@ -13,10 +13,11 @@ from .prompt import SYSTEM_PROMPT
 class PlannerAgent:
     def __init__(self, store, router, inspector: ReadOnlyRepositoryInspector,
                  worker_id: str, lease_seconds: int = 300, decision_retries: int = 3,
-                 escalation_attempt: int = 4):
+                 escalation_attempt: int = 4, max_context_chars: int = 120_000):
         self.store, self.router, self.inspector = store, router, inspector
         self.worker_id, self.lease_seconds = worker_id, lease_seconds
         self.decision_retries, self.escalation_attempt = decision_retries, escalation_attempt
+        self.max_context_chars = max(16_000, int(max_context_chars))
         # Observability only: the deterministic Orchestrator uses this after a
         # bounded call to persist model-routing metadata without scraping logs.
         self.last_job_id: int | None = None
@@ -43,9 +44,9 @@ class PlannerAgent:
                 return decision
             context = {
                 "job": self._serializable(job),
-                "repository_evidence": repository,
-                "steps": steps,
-                "recent_events": events,
+                "repository_evidence": self._bounded_repository(repository),
+                "steps": self._bounded_steps(steps),
+                "recent_events": self._bounded_events(events),
                 "rules": {
                     "one_active_step_maximum": True,
                     "planner_is_read_only": True,
@@ -57,7 +58,7 @@ class PlannerAgent:
                  if step.get("status") in {"failed", "blocked"}), default=0
             )
             messages = [{"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": json.dumps(context, default=str)}]
+                        {"role": "user", "content": self._context_json(context)}]
             decision = None
             backend_errors = []
             for repair_attempt in range(self.decision_retries + 1):
@@ -117,6 +118,87 @@ class PlannerAgent:
             self.store.defer(job.id, self.worker_id, "planner_internal_error", str(exc))
             return PlannerDecision("blocked", "running", "Planner failure will retry.",
                                    blocker=str(exc))
+        except Exception as exc:
+            # Inspector subprocess timeouts and unexpected serialization/database
+            # errors must release the planning lease just like known failures.
+            # Leaving it owned would make an otherwise recoverable job appear
+            # stuck until the full lease expires.
+            self.store.defer(job.id, self.worker_id, "planner_internal_error", str(exc))
+            return PlannerDecision("blocked", "running", "Planner failure will retry.",
+                                   blocker=str(exc))
+
+    def _context_json(self, context: dict[str, Any]) -> str:
+        encoded = json.dumps(context, default=str)
+        if len(encoded) <= self.max_context_chars:
+            return encoded
+        compact = {
+            "job": context.get("job", {}),
+            "repository_evidence": {
+                "configured_branch": context.get("repository_evidence", {}).get("configured_branch"),
+                "actual_branch": context.get("repository_evidence", {}).get("actual_branch"),
+                "branch_matches": context.get("repository_evidence", {}).get("branch_matches"),
+                "head": context.get("repository_evidence", {}).get("head"),
+                "git_status": context.get("repository_evidence", {}).get("git_status", [])[:50],
+                "recent_history": context.get("repository_evidence", {}).get("recent_history", [])[:10],
+                "documents": {
+                    name: self._bounded_text(value, 4_000)
+                    for name, value in context.get("repository_evidence", {}).get("documents", {}).items()
+                },
+                "repository_files": context.get("repository_evidence", {}).get("repository_files", [])[:200],
+            },
+            "steps": context.get("steps", []),
+            "recent_events": context.get("recent_events", [])[-5:],
+            "rules": context.get("rules", {}),
+            "context_notice": "Large planning history was truncated; inspect the repository and active steps directly.",
+        }
+        # The compact form is deliberately structured JSON. The configured
+        # budget is large enough for bounded repository metadata and steps;
+        # retain valid JSON if a caller supplies pathological metadata.
+        encoded = json.dumps(compact, default=str)
+        if len(encoded) <= self.max_context_chars:
+            return encoded
+        return json.dumps({
+            "job_id": context.get("job", {}).get("id"),
+            "step_count": len(context.get("steps", [])),
+            "event_count": len(context.get("recent_events", [])),
+            "context_notice": "Planning context was truncated to stay within the model budget.",
+        }, default=str)
+
+    @staticmethod
+    def _bounded_text(value: Any, limit: int) -> str:
+        text = str(value or "")
+        return text if len(text) <= limit else text[:limit] + "\n[TRUNCATED]"
+
+    @classmethod
+    def _bounded_repository(cls, repository: dict[str, Any]) -> dict[str, Any]:
+        result = dict(repository)
+        result["documents"] = {
+            str(name): cls._bounded_text(value, 10_000)
+            for name, value in dict(repository.get("documents") or {}).items()
+        }
+        result["repository_files"] = list(repository.get("repository_files") or [])[:500]
+        return result
+
+    @classmethod
+    def _bounded_steps(cls, steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        bounded = []
+        for step in steps:
+            value = dict(step)
+            for key in ("reviewer_feedback", "coder_response", "blocker"):
+                if key in value:
+                    value[key] = cls._bounded_text(value[key], 6_000)
+            bounded.append(value)
+        return bounded
+
+    @classmethod
+    def _bounded_events(cls, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        bounded = []
+        for event in list(events)[:20]:
+            value = dict(event)
+            if "structured_payload" in value:
+                value["structured_payload"] = cls._bounded_text(value["structured_payload"], 3_000)
+            bounded.append(value)
+        return bounded
 
     @staticmethod
     def _serializable(job) -> dict[str, Any]:
