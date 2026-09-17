@@ -88,7 +88,7 @@ class ControlCenter:
                 self.send_header("Set-Cookie", self.session_cookie_header(token, expires=expires))
 
             def session(self):
-                return app.auth.authenticate(self._cookie_token(self.headers.get("Cookie")))
+                return app.auth.authenticate(app._cookie_token(self.headers.get("Cookie")))
 
             def require_session(self):
                 value = self.session()
