@@ -24,10 +24,17 @@ MIGRATION_VERSION = "orchestrator-0009"
 # reporting table happens to exist.
 REQUIRED_TABLE_COLUMNS = {
     "jobs": {"id", "status", "current_phase", "planner_lease_expires_at"},
-    "steps": {"id", "job_id", "status", "lease_expires_at", "worker_id"},
+    "steps": {
+        "id",
+        "job_id",
+        "status",
+        "lease_expires_at",
+        "worker_id",
+        "review_lease_expires_at",
+    },
     "events": {"job_id", "event_type", "structured_payload"},
     "command_runs": {"step_id", "timed_out", "cancelled"},
-    "reviews": {"step_id", "verdict", "review_lease_expires_at"},
+    "reviews": {"step_id", "verdict"},
     "verification_runs": {"step_id", "status"},
     "checkpoint_runs": {"step_id", "status"},
     "engineering_sessions": {"job_id", "step_id", "turn_count"},
