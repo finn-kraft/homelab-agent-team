@@ -131,7 +131,7 @@ class Store:
             connection.execute(
                 """INSERT INTO command_runs
                 (step_id, argv, stdout, stderr, exit_code, duration_seconds, timed_out, source, attempt)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,'coder-agent',%s)""",
+                VALUES (%s,%s,%s,%s,%s,%s,%s,'engineering-agent',%s)""",
                 (step_id, json.dumps(result.argv), self._redact_command_output(result.stdout),
                  self._redact_command_output(result.stderr),
                  result.exit_code, result.duration_seconds, result.timed_out, attempt),
@@ -154,7 +154,7 @@ class Store:
         with self.connect() as connection:
             connection.execute(
                 """INSERT INTO events(job_id,step_id,agent,event_type,structured_payload)
-                VALUES(%s,%s,'coder-agent',%s,%s)""",
+                VALUES(%s,%s,'engineering-agent',%s,%s)""",
                 (task.job_id, task.step_id, kind, json.dumps(payload)),
             )
 

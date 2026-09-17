@@ -14,7 +14,7 @@ specialist command between steps.
 | Component | Owns | Does not own |
 | --- | --- | --- |
 | Planner | What safe, concrete step happens next; semantic goal completion | Editing, committing, scheduling |
-| EngineeringAgent (legacy Coder alias) | Inspecting a Work Package, implementing, testing, debugging, and recording commands/diff | Approval, commit, goal completion |
+| EngineeringAgent | Inspecting a Work Package, implementing, testing, debugging, and recording commands/diff | Approval, commit, goal completion |
 | Reviewer | Independent acceptance-criteria review | Silent fixes, merge, goal completion |
 | Orchestrator | Deterministic next-state selection, leases, final verification, checkpoint hand-off | LLM planning or code reasoning |
 | Routing Agent | Model/compute policy | Workflow state transitions |
@@ -68,6 +68,9 @@ roadmap item or mark the overall goal complete with evidence.
 - An authenticated, loopback-only Control Center backed by structured PostgreSQL APIs,
   including job controls, durable events, model routes, repository locks, Ollama model
   state, and optional trusted GPU telemetry.
+- Root-level `transaction_manager.py`, `components.py`, and `plugins.py` compatibility
+  primitives for optional integrations: explicit transaction boundaries, component
+  lifecycle/health registration, and entry-point plugin discovery.
 
 The full live Align integration and overnight soak test still require the
 actual `/home/finn/work/align` checkout and PostgreSQL service. They are
@@ -111,8 +114,11 @@ identities. Do not use a database-owner account or commit `.env`.
 The default model transport budget is intentionally fail-fast (`OLLAMA_RETRIES=0`
 and a 60-second local timeout), with OpenRouter available as the immediate
 availability fallback. Adjust `OLLAMA_TIMEOUT_SECONDS`, `OLLAMA_RETRIES`,
-`OPENROUTER_TIMEOUT_SECONDS`, and `OPENROUTER_RETRIES` for your hardware and
-network.
+`OPENROUTER_TIMEOUT_SECONDS`, `OPENROUTER_RETRIES`, and
+`OPENROUTER_CIRCUIT_SECONDS` for your hardware and network. If OpenRouter
+returns an authentication or billing error, its tier is temporarily isolated
+and the router walks back to another cloud tier or local Ollama instead of
+surfacing a circuit-open failure to the workflow.
 
 Apply the **additive** agent-team schema migration once with a migration-capable
 database role:
@@ -198,7 +204,7 @@ After a reviewer approves a step, the Orchestrator runs:
 
 It never extracts arbitrary shell code from instructions or model output. A
 failed check records bounded redacted evidence and returns the *same* step to
-Coder. No commit occurs.
+EngineeringAgent. No commit occurs.
 
 On success, checkpointing verifies the expected worker branch, refuses
 protected branches, requires a clean index, validates the exact approved file
@@ -283,6 +289,7 @@ See [`.env.example`](.env.example). The principal values are:
 | `INFERENCE_ESCALATE_AFTER` | First normal cloud-eligible attempt (default `4`) |
 | `OLLAMA_TIMEOUT_SECONDS` / `OLLAMA_RETRIES` | Local request timeout and retry budget (defaults `60` / `0`) |
 | `OPENROUTER_TIMEOUT_SECONDS` / `OPENROUTER_RETRIES` | Cloud request timeout and retry budget (defaults `90` / `1`) |
+| `OPENROUTER_CIRCUIT_SECONDS` | Paid-backend breaker cooldown after authentication/billing failures (default `60`) |
 | `ENGINEERING_MAX_CONTEXT_CHARS`, `PLANNER_MAX_CONTEXT_CHARS`, `REVIEWER_MAX_CONTEXT_CHARS` | Hard prompt character budgets |
 | `PLANNER_PACKAGE_STEPS` | Maximum ordered steps emitted before replanning (default `3`) |
 | `PLANNER_DECISION_RETRIES` | Short planning repair budget (default `1`; two total planning calls) |
@@ -316,7 +323,7 @@ bounded real integration against `/home/finn/work/align` on
 `agents/autonomous-align` and prove at least two consecutive roadmap steps:
 
 ```text
-Planner → Coder → Reviewer → verification → checkpoint → Planner → second step
+Planner → EngineeringAgent → Reviewer → verification → checkpoint → Planner → second step
 ```
 
 Never run that integration on `main`, and stop on `needs_human` rather than

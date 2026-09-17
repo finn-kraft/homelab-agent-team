@@ -54,6 +54,7 @@ class PlannerAgent:
                 "steps": self._bounded_steps(steps),
                 "recent_events": self._bounded_events(events),
                 "rules": {
+                    "original_goal_is_binding": True,
                     "one_active_package_maximum": True,
                     "bounded_package_max_steps": self.max_package_steps,
                     "planner_is_read_only": True,

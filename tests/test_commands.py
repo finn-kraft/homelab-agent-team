@@ -1,4 +1,5 @@
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -32,3 +33,7 @@ def test_captures_command_truth(tmp_path):
     assert result.exit_code == 7
     assert result.duration_seconds >= 0
 
+
+def test_python_tools_can_use_the_service_interpreter():
+    resolved = CommandRunner._resolve_python_tool(["pytest", "-q"], {"PATH": ""})
+    assert resolved[:3] == [sys.executable, "-m", "pytest"]

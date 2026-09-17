@@ -80,9 +80,9 @@ class ReviewerStore:
         with self.connect() as c:
             if attempt is None:
                 return list(c.execute("""SELECT * FROM command_runs
-                WHERE step_id=%s AND source='coder-agent' ORDER BY id""",(step_id,)).fetchall())
+                WHERE step_id=%s AND source IN ('engineering-agent','coder-agent') ORDER BY id""",(step_id,)).fetchall())
             return list(c.execute("""SELECT * FROM command_runs
-            WHERE step_id=%s AND source='coder-agent' AND attempt=%s ORDER BY id""",
+            WHERE step_id=%s AND source IN ('engineering-agent','coder-agent') AND attempt=%s ORDER BY id""",
             (step_id,attempt)).fetchall())
 
     def prior_issues(self,step_id):

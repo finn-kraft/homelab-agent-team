@@ -66,8 +66,18 @@ function statusClass(value) {
   return String(value || 'unknown').toLowerCase().replace(/[^a-z0-9_-]/g, '');
 }
 
+function phaseLabel(value) {
+  const labels = {coder: 'Engineering', coding: 'Engineering', engineering: 'Engineering',
+    coder_revision: 'Engineering revision', engineering_revision: 'Engineering revision',
+    review: 'Review', verification: 'Verification', checkpoint: 'Commit'};
+  return labels[String(value || '').toLowerCase()] || value || 'Waiting';
+}
+
 function badge(value) {
-  const label = String(value || 'unknown').replaceAll('_', ' ');
+  const raw = String(value || 'unknown').toLowerCase();
+  const labels = {coder: 'Engineering', coding: 'Engineering', engineering: 'Engineering',
+    coder_revision: 'Engineering revision', engineering_revision: 'Engineering revision'};
+  const label = labels[raw] || raw.replaceAll('_', ' ');
   return `<span class="status ${statusClass(value)}">${esc(label)}</span>`;
 }
 
@@ -339,14 +349,17 @@ function progressFor(job) {
 }
 
 function jobsTable(jobs) {
+  // Removed jobs remain in PostgreSQL for auditability, but are no longer
+  // part of the operator's active queue.
+  jobs = jobs.filter(job => job.status !== 'cancelled');
   if (!jobs.length) return '<div class="card empty"><div><strong>No active jobs</strong>Launch a job when you are ready to put the team to work.</div></div>';
   return `<div class="card table-card"><table><thead><tr><th>Mission</th><th>Project</th><th>Status</th><th>Current phase</th><th>Progress</th><th>Blocker / action</th><th></th></tr></thead><tbody>${jobs.map(job => {
     const progress = progressFor(job);
     const blocker = job.blocker ? (typeof job.blocker === 'string' ? job.blocker : (job.blocker.reason || job.blocker.message || JSON.stringify(job.blocker))) : '';
     const lease = job.planner_worker_id ? `${job.planner_worker_id} · expires ${age(job.planner_lease_expires_at)}` : 'Unleased';
     const progressState = job.progress_classification ? ` · ${job.progress_classification.replaceAll('_', ' ')}` : '';
-    const remove = job.status === 'pending' ? `<button class="row-remove" data-action="job-action" data-job-action="remove" data-job-id="${Number(job.id)}" aria-label="Remove queued job ${Number(job.id)}" title="Remove queued job">×</button>` : '';
-    return `<tr class="clickable"><td class="job-goal">${esc(job.goal)}</td><td>${esc(projectFor(job.repository)?.name || job.repository)}</td><td>${badge(job.status)}</td><td>${esc(job.current_phase || 'Waiting')}<small class="table-meta">${esc(lease)}${esc(progressState)}</small></td><td><div class="progress"><div class="progress-label"><span>${progress.done}/${progress.total || '—'} steps</span><span>${progress.percent}%</span></div><div class="bar"><span style="width:${progress.percent}%"></span></div></div></td><td class="job-blocker">${esc(blocker || (['blocked','needs_human','failed'].includes(job.status) ? 'Needs attention' : '—'))}</td><td class="job-row-actions">${remove}<button class="row-open" data-action="open-job" data-job-id="${Number(job.id)}" aria-label="Manage job ${Number(job.id)}">→</button></td></tr>`;
+    const remove = job.status !== 'cancelled' ? `<button class="row-remove" data-action="job-action" data-job-action="remove" data-job-id="${Number(job.id)}" aria-label="Remove job ${Number(job.id)}" title="Remove from queue">×</button>` : '';
+    return `<tr class="clickable"><td class="job-goal">${esc(job.goal)}</td><td>${esc(projectFor(job.repository)?.name || job.repository)}</td><td>${badge(job.status)}</td><td>${esc(phaseLabel(job.current_phase))}<small class="table-meta">${esc(lease)}${esc(progressState)}</small></td><td><div class="progress"><div class="progress-label"><span>${progress.done}/${progress.total || '—'} steps</span><span>${progress.percent}%</span></div><div class="bar"><span style="width:${progress.percent}%"></span></div></div></td><td class="job-blocker">${esc(blocker || (['blocked','needs_human','failed'].includes(job.status) ? 'Needs attention' : '—'))}</td><td class="job-row-actions">${remove}<button class="row-open" data-action="open-job" data-job-id="${Number(job.id)}" aria-label="Manage job ${Number(job.id)}">→</button></td></tr>`;
   }).join('')}</tbody></table></div>`;
 }
 
@@ -387,7 +400,7 @@ function derivedAgents() {
   const active = work[0];
   return [
     {name: 'Planner', role: 'Strategy & decomposition', icon: 'brain', state: active?.current_phase === 'planning' ? 'planning' : 'idle', detail: events['planner-agent']?.event_type, meta: active?.provider ? `${active.provider} / ${active.model}` : 'Ready for the next roadmap decision'},
-    {name: 'Engineer', role: 'Implementation & debugging', icon: 'code', state: active?.status === 'running' ? 'engineering' : 'idle', detail: active?.status === 'running' ? active.title : (events['engineering-agent']?.event_type || events['coder-agent']?.event_type), meta: active?.files_changed?.length ? `${active.files_changed.length} files · ${active.command_count} recorded commands` : 'No implementation currently claimed'},
+    {name: 'EngineeringAgent', role: 'Implementation & debugging', icon: 'code', state: active?.status === 'running' ? 'engineering' : 'idle', detail: active?.status === 'running' ? active.title : (events['engineering-agent']?.event_type || events['coder-agent']?.event_type), meta: active?.files_changed?.length ? `${active.files_changed.length} files · ${active.command_count} recorded commands` : 'No implementation currently claimed'},
     {name: 'Reviewer', role: 'Independent quality gate', icon: 'review', state: active?.status === 'review' ? 'reviewing' : 'idle', detail: active?.verdict || events['reviewer-agent']?.event_type, meta: active?.open_issue_count ? `${active.open_issue_count} open review issues` : 'Waiting for reviewable work'},
     {name: 'Orchestrator', role: 'Deterministic coordination', icon: 'route', state: orchestrator?.online ? 'running' : 'stopped', detail: orchestrator?.current_action, meta: orchestrator?.started_at ? `Started ${age(orchestrator.started_at)} · heartbeat ${age(orchestrator.heartbeat_at)}` : 'No durable heartbeat'},
   ];
@@ -427,15 +440,20 @@ async function openJob(id) {
 }
 
 function stageFor(status) {
-  return {pending: 'planner', planning: 'planner', queued: 'coder', running: 'coder', reviewing: 'reviewer', review: 'reviewer', changes_requested: 'coder', verifying: 'verification', verification: 'verification', checkpointing: 'commit', checkpoint: 'commit', complete: 'commit'}[status] || 'planner';
+  return {pending: 'planner', planning: 'planner', queued: 'engineer', running: 'engineer',
+    coder: 'engineer', coding: 'engineer', engineering: 'engineer', coder_revision: 'engineer',
+    reviewing: 'reviewer', review: 'reviewer', changes_requested: 'engineer',
+    verifying: 'verification', verification: 'verification', checkpointing: 'commit',
+    checkpoint: 'commit', complete: 'commit'}[status] || 'planner';
 }
 
 function jobControls(job) {
   const active = ['pending', 'planning', 'running', 'reviewing', 'verifying', 'checkpointing'].includes(job.status);
   const resumable = ['paused', 'blocked', 'failed'].includes(job.status);
   const cancellable = !['complete', 'cancelled'].includes(job.status);
-  const removable = job.status === 'pending';
-  return `${active ? '<button data-action="job-action" data-job-action="pause">Pause</button>' : ''}${resumable ? '<button class="primary" data-action="job-action" data-job-action="resume">Resume</button>' : ''}${removable ? '<button class="danger" data-action="job-action" data-job-action="remove">Remove from queue</button>' : ''}${cancellable ? '<button class="danger" data-action="job-action" data-job-action="cancel">Cancel</button>' : ''}`;
+  const removable = job.status !== 'cancelled';
+  const id = Number(job.id);
+  return `${active ? `<button type="button" data-action="job-action" data-job-action="pause" data-job-id="${id}">Pause</button>` : ''}${resumable ? `<button type="button" class="primary" data-action="job-action" data-job-action="resume" data-job-id="${id}">Resume</button>` : ''}${removable ? `<button type="button" class="danger" data-action="job-action" data-job-action="remove" data-job-id="${id}">Remove from queue</button>` : ''}${cancellable ? `<button type="button" class="danger" data-action="job-action" data-job-action="cancel" data-job-id="${id}">Cancel</button>` : ''}`;
 }
 
 async function renderJob(id) {
@@ -445,7 +463,8 @@ async function renderJob(id) {
     const job = detail.job;
     const current = detail.current_step_detail;
     const stage = stageFor(current?.status || job.status);
-    const stages = ['planner', 'coder', 'reviewer', 'verification', 'commit'];
+    const stages = ['planner', 'engineer', 'reviewer', 'verification', 'commit'];
+    const stageNames = {planner: 'Planner', engineer: 'Engineering', reviewer: 'Reviewer', verification: 'Verification', commit: 'Commit'};
     const activeIndex = stages.indexOf(stage);
     const activeHumanAnswer = document.activeElement?.id === 'humanAnswer';
     const humanAnswer = $('#humanAnswer');
@@ -455,7 +474,7 @@ async function renderJob(id) {
     } : null;
     $('#jobView').innerHTML = `
       ${detail.needs_attention ? attentionCard(id, detail.needs_attention) : ''}
-      <article class="card job-hero"><div class="section-head tight"><div><span class="kicker">JOB #${Number(job.id)}</span><h2>${esc(job.goal)}</h2><span>${badge(job.status)} <span class="muted">· ${esc(projectFor(job.repository)?.name || job.repository)} · ${esc(job.branch)}</span></span></div><div class="job-actions">${jobControls(job)}</div></div><div class="job-flow"><div class="flow">${stages.map((item, index) => `${index ? '<span class="arrow">›</span>' : ''}<span class="stage ${item === stage ? 'active' : ''} ${index < activeIndex || job.status === 'complete' ? 'done' : ''}"><i>${index + 1}</i>${item[0].toUpperCase() + item.slice(1)}</span>${item === 'reviewer' && current?.status === 'changes_requested' ? '<span class="loop">↩ revision</span>' : ''}`).join('')}</div></div></article>
+      <article class="card job-hero"><div class="section-head tight"><div><span class="kicker">JOB #${Number(job.id)}</span><h2>${esc(job.goal)}</h2><span>${badge(job.status)} <span class="muted">· ${esc(projectFor(job.repository)?.name || job.repository)} · ${esc(job.branch)}</span></span></div><div class="job-actions">${jobControls(job)}</div></div><div class="job-flow"><div class="flow">${stages.map((item, index) => `${index ? '<span class="arrow">›</span>' : ''}<span class="stage ${item === stage ? 'active' : ''} ${index < activeIndex || job.status === 'complete' ? 'done' : ''}"><i>${index + 1}</i>${stageNames[item]}</span>${item === 'reviewer' && current?.status === 'changes_requested' ? '<span class="loop">↩ revision</span>' : ''}`).join('')}</div></div></article>
       ${current ? stepCard(current) : ''}
       <div class="section-head"><div class="section-title"><h2>Completed steps</h2><small>Durable checkpoints already accepted</small></div><span>${detail.steps.filter(step => step.status === 'complete').length} complete</span></div>
       <div class="card timeline">${detail.steps.filter(step => step.status === 'complete').map(stepTimeline).join('') || '<div class="empty"><div><strong>No completed steps yet</strong>The first checkpoint will appear here.</div></div>'}</div>`;
@@ -470,7 +489,9 @@ async function renderJob(id) {
 }
 
 function attentionCard(id, attention) {
-  return `<article class="card attention"><div class="attention-head">${icon('alert')}<h3>Needs attention</h3></div><p><strong>${esc(attention.reason)}</strong></p><p>${esc(attention.question)}</p>${attention.can_answer ? `<textarea id="humanAnswer" maxlength="10000" placeholder="Enter your decision or instructions">${esc(state.humanDraft)}</textarea><button class="primary" data-action="answer-job" data-job-id="${Number(id)}">Continue workflow <span>→</span></button>` : '<p class="muted">Resolve the technical blocker, then use Resume to let the team reassess durable state.</p>'}</article>`;
+  const context = attention.context && Object.keys(attention.context).length
+    ? `<details><summary>Technical context</summary><pre class="code">${esc(JSON.stringify(attention.context, null, 2))}</pre></details>` : '';
+  return `<article class="card attention"><div class="attention-head">${icon('alert')}<h3>Needs attention</h3></div><p><strong>${esc(attention.reason)}</strong></p><p>${esc(attention.question)}</p>${context}${attention.can_answer ? `<textarea id="humanAnswer" maxlength="10000" placeholder="Enter your decision or instructions">${esc(state.humanDraft)}</textarea><button class="primary" data-action="answer-job" data-job-id="${Number(id)}">Continue workflow <span>→</span></button>` : '<p class="muted">Fix the reported issue, then use Resume. The team will reassess the same workflow step.</p>'}</article>`;
 }
 
 function stepCard(step) {
@@ -489,7 +510,7 @@ function stepTimeline(step) {
 async function jobAction(action, button) {
   const jobId = Number(button?.dataset.jobId || state.jobId);
   const confirmation = action === 'remove'
-    ? 'Remove this queued job permanently? It has not started and cannot be restored.'
+    ? 'Remove this job from the queue? It will stop running and be kept only in the audit history.'
     : 'Cancel this job? The team will stop claiming new work.';
   if (['cancel', 'remove'].includes(action) && !confirm(confirmation)) return;
   setBusy(button, true);
@@ -516,7 +537,7 @@ async function answerJob(id, button) {
   setBusy(button, true, 'Saving…');
   try {
     await api(`/api/jobs/${id}/answer`, {method: 'POST', body: JSON.stringify({answer})});
-    toast('Decision recorded', 'The same workflow step has been returned to the Coder.');
+    toast('Decision recorded', 'The same workflow step has been returned to EngineeringAgent.');
     state.overview = await api('/api/overview');
     await renderJob(id);
   } catch (error) { toast('Could not save your answer', error.message, true); }

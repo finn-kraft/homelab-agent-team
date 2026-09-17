@@ -45,6 +45,7 @@ def build_engineer() -> EngineeringAgent:
     ollama_retries = int(os.getenv("OLLAMA_RETRIES", str(llm_retries)))
     cloud_timeout = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "90"))
     cloud_retries = int(os.getenv("OPENROUTER_RETRIES", "1"))
+    circuit_seconds = float(os.getenv("OPENROUTER_CIRCUIT_SECONDS", "60"))
 
     local = OllamaBackend(
         os.getenv(
@@ -74,17 +75,22 @@ def build_engineer() -> EngineeringAgent:
             api_key,
             timeout=cloud_timeout,
             retries=cloud_retries,
+            circuit_seconds=circuit_seconds,
         )
 
         premium_cloud = OpenRouterBackend(
             OPENROUTER_URL,
             os.getenv(
                 "OPENROUTER_ENGINEERING_PREMIUM_MODEL",
-                os.getenv("OPENROUTER_CODER_PREMIUM_MODEL", "openai/gpt-5.2-codex"),
+                os.getenv(
+                    "OPENROUTER_CODER_PREMIUM_MODEL",
+                    os.getenv("OPENROUTER_MODEL", "openai/gpt-5.2-codex"),
+                ),
             ),
             api_key,
             timeout=cloud_timeout,
             retries=cloud_retries,
+            circuit_seconds=circuit_seconds,
         )
 
     local_attempts = int(os.getenv("INFERENCE_LOCAL_ATTEMPTS", "3"))

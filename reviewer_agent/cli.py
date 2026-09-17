@@ -41,6 +41,7 @@ def build() -> ReviewerAgent:
     ollama_retries = int(os.getenv("OLLAMA_RETRIES", str(llm_retries)))
     cloud_timeout = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "90"))
     cloud_retries = int(os.getenv("OPENROUTER_RETRIES", "1"))
+    circuit_seconds = float(os.getenv("OPENROUTER_CIRCUIT_SECONDS", "60"))
 
     local = OllamaBackend(
         os.getenv(
@@ -70,17 +71,19 @@ def build() -> ReviewerAgent:
             api_key,
             timeout=cloud_timeout,
             retries=cloud_retries,
+            circuit_seconds=circuit_seconds,
         )
 
         premium_cloud = OpenRouterBackend(
             OPENROUTER_URL,
             os.getenv(
                 "OPENROUTER_REVIEWER_PREMIUM_MODEL",
-                "anthropic/claude-sonnet-4.6",
+                os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.6"),
             ),
             api_key,
             timeout=cloud_timeout,
             retries=cloud_retries,
+            circuit_seconds=circuit_seconds,
         )
 
     local_attempts = int(os.getenv("INFERENCE_LOCAL_ATTEMPTS", "3"))

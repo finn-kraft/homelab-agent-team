@@ -1,4 +1,4 @@
-"""Compatibility import surface for the V2 EngineeringAgent."""
+"""Public V2 EngineeringAgent surface over the preserved implementation."""
 
 from coder_agent.agent import CoderAgent, EngineeringAgent
 

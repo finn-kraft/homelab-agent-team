@@ -1,4 +1,4 @@
-"""V2 model aliases retained in the proven coder transport module."""
+"""V2 model aliases retained in the proven workspace transport module."""
 
 from coder_agent.models import AgentResult, CommandResult, Status, Task, WorkPackage
 

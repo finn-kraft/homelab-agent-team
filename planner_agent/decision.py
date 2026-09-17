@@ -68,8 +68,8 @@ def validate_decision(decision: PlannerDecision) -> None:
             if not isinstance(criteria, list) or not criteria or not all(
                     isinstance(item, str) and len(item.strip()) >= 8 for item in criteria):
                 raise InvalidDecision("acceptance criteria must be concrete strings")
-            if step["assigned_agent"] != "coder-agent":
-                raise InvalidDecision("MVP only assigns implementation to coder-agent")
+            if step["assigned_agent"] not in {"engineering-agent", "coder-agent"}:
+                raise InvalidDecision("implementation must be assigned to engineering-agent")
     if decision.decision == "complete" and len(decision.evidence) < 2:
         raise InvalidDecision("overall completion requires multiple evidence items")
     if decision.decision == "needs_human" and not decision.human_question:
