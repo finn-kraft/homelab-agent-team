@@ -65,6 +65,18 @@ roadmap item or mark the overall goal complete with evidence.
   several clear steps before another planning pass.
 - Durable `phase_metrics` telemetry records phase duration, prompt size, model,
   provider, and crash status for operations and the Control Center.
+- Worktree admission is crash-safe and periodically reconciles orphaned managed
+  trees; per-repository concurrency, priority ordering, and optional queue
+  backpressure prevent one repository from monopolizing the team.
+- Prompt budgets support an approximate token ceiling and a context digest, while
+  repository documents, diffs, command output, and prior events are explicitly
+  delimited as untrusted evidence.
+- Per-agent provider, capability, privacy, cloud-cost, and latency policies are
+  enforced by the inference router. Backend breaker state persists across
+  restarts and health probes are available without spending a model request.
+- `agent-model-evals` runs fixed planner/Engineering/reviewer contract fixtures;
+  verification also infers safe Python, Node, Rust, Go, or Make test commands
+  when no project-specific Verification section exists.
 - An authenticated, loopback-only Control Center backed by structured PostgreSQL APIs,
   including job controls, durable events, model routes, repository locks, Ollama model
   state, and optional trusted GPU telemetry.
@@ -291,6 +303,7 @@ See [`.env.example`](.env.example). The principal values are:
 | `OPENROUTER_TIMEOUT_SECONDS` / `OPENROUTER_RETRIES` | Cloud request timeout and retry budget (defaults `90` / `1`) |
 | `OPENROUTER_CIRCUIT_SECONDS` | Paid-backend breaker cooldown after authentication/billing failures (default `60`) |
 | `ENGINEERING_MAX_CONTEXT_CHARS`, `PLANNER_MAX_CONTEXT_CHARS`, `REVIEWER_MAX_CONTEXT_CHARS` | Hard prompt character budgets |
+| `ENGINEERING_MAX_PROMPT_TOKENS`, `PLANNER_MAX_PROMPT_TOKENS`, `REVIEWER_MAX_PROMPT_TOKENS` | Approximate token ceilings (`0` disables) |
 | `PLANNER_PACKAGE_STEPS` | Maximum ordered steps emitted before replanning (default `3`) |
 | `PLANNER_DECISION_RETRIES` | Short planning repair budget (default `1`; two total planning calls) |
 | `ENGINEERING_TURN_LIMIT` | Optional compatibility cap; `0`/unset means progress-based Engineering with no overall turn cutoff |
@@ -299,12 +312,18 @@ See [`.env.example`](.env.example). The principal values are:
 | `AUTO_COMMIT` | Enables reviewer-approved local checkpoints |
 | `AUTO_PUSH` | Off by default; no force/history rewrite is ever permitted |
 | `MISSION_PACKAGE_LIMIT` | Maximum unchecked roadmap items materialized per mission pass (default `3`) |
+| `ORCHESTRATOR_MAX_CONCURRENT_PER_REPOSITORY` | Active Engineering jobs allowed per source repository (default `1`) |
+| `ORCHESTRATOR_QUEUE_BACKPRESSURE` | Maximum ready package backlog (`0` disables) |
+| `ORCHESTRATOR_WORKTREE_CLEANUP_SECONDS` | Managed worktree reconciliation interval (default `60`) |
+| `*_ALLOWED_PROVIDERS`, `*_REQUIRED_CAPABILITIES` | Per-agent routing allowlists and capability requirements |
+| `*_MAX_CLOUD_COST`, `*_MAX_LATENCY_SECONDS` | Per-agent cloud spend and recent-latency guardrails (`0` disables) |
 | `AUTO_INTEGRATE` | Opt-in integration of verified package commits into a non-protected mission branch |
 
 V2 operations are also available from the orchestrator CLI: `missions`,
 `expand-mission`, `packages`, `human-queue`, `answer-human`, and
 `integrate-package`. The Control Center exposes the same mission/package and human
-queue read models after running the additive `orchestrator-0005` migration.
+queue read models after running the current additive migration (recorded in the
+database as `orchestrator-0010`).
 The dashboard's `/api/telemetry` path is independent of the workflow stream and polls
 Ollama/GPU data once per second, including loaded and installed model details.
 
@@ -315,6 +334,12 @@ Run deterministic tests without a live LLM or production database:
 ```bash
 pip install -e ".[test]"
 pytest -q
+```
+
+Run the fixed model contract fixtures with:
+
+```bash
+agent-model-evals
 ```
 
 The tests mock specialist agents/routing decisions and use temporary Git

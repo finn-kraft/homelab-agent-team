@@ -21,7 +21,8 @@ The first five reliability slices are now implemented alongside V1:
   checkpoint commit for each package.
 - EngineeringAgent command execution polls at safe boundaries, terminates the
   complete process group on pause/cancel, and persists `cancelled` evidence in
-  `command_runs` (migration `orchestrator-0009`).
+  `command_runs` (migration `orchestrator-0009`). The follow-on prompt telemetry
+  and context-digest columns are included in migration `orchestrator-0010`.
 - `engineering-agent` is the canonical installed entry point and durable event
   identity; the old Coder names remain only as compatibility shims during the
   migration.
@@ -35,6 +36,15 @@ is exposed by `/health`, Engineering is the canonical durable hand-off with V1
 aliases, sessions restore their last action/model/tier/test state, reviewer
 revisions emit a same-session hand-off, and stagnation tracks semantic worktree
 changes, repeated failures, missing verification, and action oscillation.
+
+The following ten slices (items 11–20) are implemented in this checkout: managed
+worktree reconciliation and branch-collision recovery; crash-safe package
+claiming with per-repository admission, priority ordering, and queue
+backpressure; one canonical V1/V2 admission/state vocabulary; token-aware,
+hashed prompt snapshots; untrusted-input wrappers for repository data; per-agent
+routing/privacy/cost/latency policies; persisted circuit breakers and health
+probes; fixed-fixture model evaluations; environment-aware verification
+discovery; and process-group termination with bounded, hashed command evidence.
 
 ## P0 — reliability before unattended operation
 

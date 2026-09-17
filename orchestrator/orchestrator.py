@@ -68,6 +68,7 @@ class AgentOrchestrator:
             self.store, max_packages=getattr(config, "mission_package_limit", 3)
         )
         self._stop_requested = threading.Event()
+        self._last_worktree_reconcile = 0.0
 
     def request_stop(self) -> None:
         """Ask the foreground loop to finish its current bounded action."""
@@ -101,34 +102,51 @@ class AgentOrchestrator:
 
     def once(self) -> AdvanceResult:
         """Perform one deterministic advancement, suitable for tests and cron-like use."""
-        self._populate_mission_queue()
-        claim_engineering = getattr(self.store, "claim_engineering_package", None)
-        if claim_engineering:
+        self._reconcile_worktrees()
+        recover_packages = getattr(self.store, "recover_work_packages", None)
+        if recover_packages is not None:
             try:
-                claimed = claim_engineering(
+                recovered_packages = recover_packages()
+                if recovered_packages:
+                    self._log("work_packages_recovered", package_ids=recovered_packages)
+            except Exception:
+                # Package recovery is additive to the V1 lease path; a
+                # partially migrated database must still advance ordinary
+                # Engineering steps.
+                LOG.debug("work_package_recovery_unavailable", exc_info=True)
+        self._populate_mission_queue()
+        claim_next = getattr(self.store, "claim_next_engineering", None)
+        if claim_next is not None:
+            try:
+                claimed = claim_next(
                     self.engineer.worker_id,
                     self.config.lease_seconds,
                     self.config.repository_lock_seconds,
                     WorktreeManager(os.getenv("ENGINEERING_WORKTREE_ROOT", "/tmp/agent-worktrees")),
+                    max_concurrent_per_repository=self.config.max_concurrent_jobs_per_repository,
+                    queue_backpressure=self.config.queue_backpressure,
                 )
                 if claimed:
                     return self._code(claimed["task"], package=claimed.get("package"))
             except Exception:
-                LOG.debug("v2_native_package_claim_unavailable", exc_info=True)
-        # V2 packages are admitted into the existing durable Step pipeline.
-        # Keep this additive and safe for databases that have not migrated yet.
-        claim_package = getattr(self.store, "claim_work_package", None)
-        if claim_package:
-            try:
-                package = claim_package(
-                    self.config.worker_id,
-                    self.config.repository_lock_seconds,
-                    WorktreeManager(os.getenv("ENGINEERING_WORKTREE_ROOT", "/tmp/agent-worktrees")),
-                )
-                if package:
-                    return AdvanceResult("package_claimed", package.get("job_id"), package.get("step_id"))
-            except Exception:
-                LOG.debug("v2_package_queue_unavailable", exc_info=True)
+                LOG.debug("engineering_admission_unavailable", exc_info=True)
+        else:
+            # Compatibility with stores from before the unified admission
+            # method was introduced. This path is intentionally isolated from
+            # the authoritative method above and can be removed after upgrade.
+            claim_engineering = getattr(self.store, "claim_engineering_package", None)
+            if claim_engineering:
+                try:
+                    claimed = claim_engineering(
+                        self.engineer.worker_id,
+                        self.config.lease_seconds,
+                        self.config.repository_lock_seconds,
+                        WorktreeManager(os.getenv("ENGINEERING_WORKTREE_ROOT", "/tmp/agent-worktrees")),
+                    )
+                    if claimed:
+                        return self._code(claimed["task"], package=claimed.get("package"))
+                except Exception:
+                    LOG.debug("v2_native_package_claim_unavailable", exc_info=True)
 
         recovered = self.store.recover_expired()
         if recovered:
@@ -172,15 +190,49 @@ class AgentOrchestrator:
             return self._review(step_id)
 
         claim_step = getattr(self.store, "claim_engineering", None) or self.store.claim_coding
-        task = claim_step(
-            self.engineer.worker_id,
-            self.config.lease_seconds,
-            self.config.repository_lock_seconds,
-        )
+        try:
+            task = claim_step(
+                self.engineer.worker_id,
+                self.config.lease_seconds,
+                self.config.repository_lock_seconds,
+                max_concurrent_per_repository=self.config.max_concurrent_jobs_per_repository,
+            )
+        except TypeError as exc:
+            # Older V1 stores do not accept the optional concurrency policy;
+            # preserve their transport contract during the migration.
+            if "max_concurrent_per_repository" not in str(exc):
+                raise
+            task = claim_step(
+                self.engineer.worker_id,
+                self.config.lease_seconds,
+                self.config.repository_lock_seconds,
+            )
         if task:
             return self._code(task)
 
         return self._plan()
+
+    def _reconcile_worktrees(self) -> None:
+        """Periodically remove only worktrees proven orphaned by durable state."""
+        reconcile = getattr(self.store, "reconcile_worktrees", None)
+        if reconcile is None:
+            return
+        interval = max(1, int(getattr(self.config, "worktree_cleanup_seconds", 60)))
+        now = time.monotonic()
+        if now - self._last_worktree_reconcile < interval:
+            return
+        self._last_worktree_reconcile = now
+        try:
+            report = reconcile(
+                WorktreeManager(os.getenv("ENGINEERING_WORKTREE_ROOT", "/tmp/agent-worktrees")),
+                remove_orphans=True,
+            )
+            if report.get("orphaned"):
+                self._log("worktrees_reconciled", **report)
+        except Exception:
+            # Cleanup is best-effort and must never prevent the workflow from
+            # claiming otherwise healthy work.
+            LOG.debug("worktree_reconciliation_unavailable", exc_info=True)
 
     def _populate_mission_queue(self) -> None:
         """Materialize the next bounded roadmap packages before claiming work."""
@@ -268,7 +320,11 @@ class AgentOrchestrator:
             status = self.store.finish_review_handoff(step_id)
             sync_package = getattr(self.store, "sync_package_for_step", None)
             if sync_package:
-                package_status = {"changes_requested": "engineering", "verifying": "verifying"}.get(status)
+                # A package in ``engineering`` is actively leased.  Once a
+                # reviewer asks for changes, return it to ``ready`` so the
+                # next Engineering worker can claim it (possibly on another
+                # host) instead of leaving the old worker id attached.
+                package_status = {"changes_requested": "ready", "verifying": "verifying"}.get(status)
                 if package_status:
                     sync_package(step_id, package_status)
             work = self.store.step(step_id) or {}
@@ -325,7 +381,12 @@ class AgentOrchestrator:
             next_state = self.store.record_verification(work, self.config.worker_id, result)
             sync_package = getattr(self.store, "sync_package_for_step", None)
             if sync_package:
-                package_status = "complete" if next_state == "complete" else ("engineering" if not getattr(result, "passed", False) else "verifying")
+                package_status = (
+                    "complete" if next_state == "complete" else
+                    "ready" if next_state == "changes_requested" else
+                    "blocked" if next_state == "blocked" else
+                    "verifying"
+                )
                 sync_package(work["id"], package_status, getattr(result, "commit_sha", None))
             self._log("verification_finished", job_id=work["job_id"], step_id=work["id"],
                       passed=bool(getattr(result, "passed", False)), next_state=next_state)
@@ -548,6 +609,8 @@ class AgentOrchestrator:
                              step_id: int | None = None, detail: str = "") -> None:
         duration = time.monotonic() - started
         prompt_chars = int(getattr(agent, "last_prompt_chars", 0) or 0)
+        prompt_tokens = int(getattr(agent, "last_prompt_tokens", 0) or 0)
+        context_sha256 = getattr(agent, "last_context_sha256", None)
         route = getattr(getattr(agent, "router", None), "last_route", None)
         provider = getattr(route, "provider", None)
         model = getattr(route, "model", None) or getattr(agent, "last_model", None)
@@ -561,6 +624,8 @@ class AgentOrchestrator:
                     status=status,
                     duration_seconds=duration,
                     prompt_chars=prompt_chars,
+                    prompt_tokens=prompt_tokens,
+                    context_sha256=context_sha256,
                     provider=provider,
                     model=model,
                     detail={"detail": detail[:4_000]} if detail else {},
@@ -570,7 +635,8 @@ class AgentOrchestrator:
                               phase, job_id, step_id)
         self._log("phase_finished", phase=phase, status=status, job_id=job_id,
                   step_id=step_id, duration_seconds=round(duration, 3),
-                  prompt_chars=prompt_chars, provider=provider, model=model)
+                  prompt_chars=prompt_chars, prompt_tokens=prompt_tokens,
+                  context_sha256=context_sha256, provider=provider, model=model)
 
     @staticmethod
     def _clear_route(agent: Any) -> None:

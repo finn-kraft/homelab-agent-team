@@ -17,7 +17,7 @@ from typing import Any, Iterable
 from engineering_agent.models import Status, Task
 
 
-MIGRATION_VERSION = "orchestrator-0009"
+MIGRATION_VERSION = "orchestrator-0010"
 
 # Keep this list deliberately small and authoritative. Health checks should
 # answer whether the workflow can safely run, not whether every optional
@@ -33,7 +33,7 @@ REQUIRED_TABLE_COLUMNS = {
     "engineering_sessions": {"job_id", "step_id", "turn_count"},
     "engineering_actions": {"session_id", "sequence", "action"},
     "worker_heartbeats": {"worker_id", "component", "heartbeat_at"},
-    "phase_metrics": {"phase", "duration_seconds", "prompt_chars"},
+    "phase_metrics": {"phase", "duration_seconds", "prompt_chars", "prompt_tokens", "context_sha256"},
 }
 
 MIGRATION_SQL = """
@@ -216,12 +216,16 @@ CREATE TABLE IF NOT EXISTS phase_metrics (
   status TEXT NOT NULL,
   duration_seconds DOUBLE PRECISION NOT NULL,
   prompt_chars INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  context_sha256 TEXT,
   provider TEXT,
   model TEXT,
   detail JSONB NOT NULL DEFAULT '{}',
   started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   completed_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE phase_metrics ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE phase_metrics ADD COLUMN IF NOT EXISTS context_sha256 TEXT;
 CREATE INDEX IF NOT EXISTS phase_metrics_job_idx
   ON phase_metrics (job_id, completed_at DESC);
 
@@ -632,48 +636,114 @@ class OrchestratorStore:
             ).fetchone()
             return dict(row) if row else None
 
+    def reconcile_worktrees(self, worktree_manager, *, remove_orphans: bool = False) -> dict[str, list[str]]:
+        """Detect managed worktrees no longer represented by active packages.
+
+        Database state remains authoritative: active package paths are never
+        removed automatically. Completed/cancelled package trees and paths
+        left behind by a rolled-back claim are safe cleanup candidates because
+        they are confined to ``ENGINEERING_WORKTREE_ROOT``.
+        """
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT repository,worktree,status FROM work_packages
+                   WHERE worktree IS NOT NULL"""
+            ).fetchall()
+        by_repository: dict[str, set[str]] = {}
+        for row in rows:
+            if row.get("status") not in {"complete", "cancelled"}:
+                by_repository.setdefault(str(row["repository"]), set()).add(str(row["worktree"]))
+        orphaned: list[str] = []
+        removed: list[str] = []
+        repositories = {str(row["repository"]) for row in rows}
+        for repository in repositories:
+            try:
+                candidates = worktree_manager.orphan_records(
+                    repository, by_repository.get(repository, set())
+                )
+            except (OSError, RuntimeError, ValueError):
+                continue
+            paths = [str(record["path"]) for record in candidates]
+            orphaned.extend(paths)
+            if remove_orphans and paths:
+                try:
+                    removed.extend(str(path) for path in worktree_manager.cleanup_orphans(
+                        repository, by_repository.get(repository, set())
+                    ))
+                except (OSError, RuntimeError, ValueError):
+                    continue
+        return {"orphaned": sorted(set(orphaned)), "removed": sorted(set(removed))}
+
     def claim_work_package(self, worker_id: str, lease_seconds: int = 900,
-                           worktree_manager=None) -> dict[str, Any] | None:
+                           worktree_manager=None, *,
+                           max_concurrent_per_repository: int = 1,
+                           queue_backpressure: int = 0) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute("""WITH candidate AS (
                 SELECT p.id FROM work_packages p JOIN missions m ON m.id=p.mission_id
+                LEFT JOIN jobs j ON j.id=p.job_id
                 WHERE p.status='ready' AND m.status='active'
                   AND (p.lease_expires_at IS NULL OR p.lease_expires_at < now())
+                  AND (%s <= 0 OR (
+                    SELECT count(*) FROM work_packages active
+                    WHERE active.repository=p.repository
+                      AND active.status IN ('engineering','review','verifying')
+                  ) < %s)
+                  AND (%s <= 0 OR (
+                    SELECT count(*) FROM work_packages queued
+                    WHERE queued.status='ready'
+                  ) < %s)
                   AND NOT EXISTS (SELECT 1 FROM work_packages d
                     WHERE d.id = ANY(SELECT jsonb_array_elements_text(p.dependencies)::bigint)
                     AND d.status <> 'complete')
-                ORDER BY p.id FOR UPDATE SKIP LOCKED LIMIT 1)
+                ORDER BY COALESCE(j.priority,0) DESC, p.updated_at, p.id
+                FOR UPDATE OF p SKIP LOCKED LIMIT 1)
                 UPDATE work_packages p SET status='engineering',worker_id=%s,
                   lease_expires_at=now()+(%s*interval '1 second'),updated_at=now()
-                FROM candidate WHERE p.id=candidate.id RETURNING p.*""", (worker_id, lease_seconds)).fetchone()
+                FROM candidate WHERE p.id=candidate.id RETURNING p.*""",
+                (max_concurrent_per_repository, max_concurrent_per_repository,
+                 queue_backpressure, queue_backpressure, worker_id, lease_seconds)).fetchone()
             if not row:
                 return None
             package = dict(row)
-            if worktree_manager is not None and not package.get("worktree"):
-                worktree = worktree_manager.create(package["repository"], package["mission_id"],
-                                                   package["id"], package["branch"])
-                connection.execute("UPDATE work_packages SET worktree=%s,starting_commit=%s,branch=%s WHERE id=%s",
-                                   (str(worktree.path), worktree.starting_commit, worktree.branch, package["id"]))
-                connection.execute("UPDATE jobs SET repository=%s,branch=%s WHERE id=%s",
-                                   (str(worktree.path), worktree.branch, package.get("job_id")))
-                connection.execute("UPDATE steps SET repository=%s,branch=%s WHERE id=%s",
-                                   (str(worktree.path), worktree.branch, package.get("step_id")))
-                package.update(worktree=str(worktree.path), starting_commit=worktree.starting_commit,
-                               branch=worktree.branch)
-            # A package is a complete admission decision. Move its linked V1
-            # row into the running Engineering state so the next coordinator pass
-            # claims Engineering directly instead of handing the package back
-            # to Planner because the synthetic job is still pending.
-            if package.get("job_id") and package.get("step_id"):
-                connection.execute("""
-                    UPDATE jobs SET status='running',current_phase='engineering',current_step=%s,updated_at=now()
-                    WHERE id=%s AND status IN ('pending','planning')
-                """, (package["step_id"], package["job_id"]))
-                self._event(connection, package["job_id"], package["step_id"], "package_claimed", {
-                    "package_id": package["id"], "worker_id": worker_id,
-                    "worktree": package.get("worktree"),
-                })
-            return package
+            worktree = None
+            try:
+                if worktree_manager is not None and not package.get("worktree"):
+                    worktree = worktree_manager.create(
+                        package["repository"], package["mission_id"],
+                        package["id"], package["branch"]
+                    )
+                    connection.execute("UPDATE work_packages SET worktree=%s,starting_commit=%s,branch=%s WHERE id=%s",
+                                       (str(worktree.path), worktree.starting_commit, worktree.branch, package["id"]))
+                    connection.execute("UPDATE jobs SET repository=%s,branch=%s WHERE id=%s",
+                                       (str(worktree.path), worktree.branch, package.get("job_id")))
+                    connection.execute("UPDATE steps SET repository=%s,branch=%s WHERE id=%s",
+                                       (str(worktree.path), worktree.branch, package.get("step_id")))
+                    package.update(worktree=str(worktree.path), starting_commit=worktree.starting_commit,
+                                   branch=worktree.branch)
+                # A package is a complete admission decision. Move its linked
+                # row into the running Engineering state so the next
+                # coordinator pass claims Engineering directly instead of
+                # handing the package back to Planner.
+                if package.get("job_id") and package.get("step_id"):
+                    connection.execute("""
+                        UPDATE jobs SET status='running',current_phase='engineering',current_step=%s,updated_at=now()
+                        WHERE id=%s AND status IN ('pending','planning')
+                    """, (package["step_id"], package["job_id"]))
+                    self._event(connection, package["job_id"], package["step_id"], "package_claimed", {
+                        "package_id": package["id"], "worker_id": worker_id,
+                        "worktree": package.get("worktree"),
+                    })
+                return package
+            except Exception:
+                # If the DB transaction rolls back after a fresh worktree was
+                # created, remove that path before allowing a retry.
+                if worktree is not None and getattr(worktree, "created", False):
+                    try:
+                        worktree_manager.remove(package["repository"], worktree.path)
+                    except Exception:
+                        pass
+                raise
 
     def claim_engineering_for_step(self, step_id: int, worker_id: str, lease_seconds: int,
                                    repository_lock_seconds: int) -> Task | None:
@@ -683,7 +753,11 @@ class OrchestratorStore:
                 """SELECT s.* FROM steps s JOIN jobs j ON j.id=s.job_id
                 WHERE s.id=%s AND j.status='running' AND s.status IN ('queued','changes_requested')
                   AND (s.lease_expires_at IS NULL OR s.lease_expires_at < now())
-                FOR UPDATE OF s,j SKIP LOCKED""", (step_id,)
+                  AND (NOT EXISTS (SELECT 1 FROM work_packages wp WHERE wp.step_id=s.id)
+                       OR EXISTS (SELECT 1 FROM work_packages wp
+                                  WHERE wp.step_id=s.id AND wp.status='engineering'
+                                    AND wp.worker_id=%s))
+                FOR UPDATE OF s,j SKIP LOCKED""", (step_id, worker_id)
             ).fetchone()
             if not row:
                 return None
@@ -706,13 +780,19 @@ class OrchestratorStore:
                         row.get("reviewer_feedback"))
 
     def claim_engineering_package(self, worker_id: str, lease_seconds: int,
-                                  repository_lock_seconds: int, worktree_manager=None) -> dict[str, Any] | None:
+                                  repository_lock_seconds: int, worktree_manager=None, *,
+                                  max_concurrent_per_repository: int = 1,
+                                  queue_backpressure: int = 0) -> dict[str, Any] | None:
         """Admit and claim one package directly for Engineering in one pass.
 
         The linked Step remains the compatibility transport for Reviewer and
         Verification, but no unrelated queued step can steal this package.
         """
-        package = self.claim_work_package(worker_id, lease_seconds, worktree_manager)
+        package = self.claim_work_package(
+            worker_id, lease_seconds, worktree_manager,
+            max_concurrent_per_repository=max_concurrent_per_repository,
+            queue_backpressure=queue_backpressure,
+        )
         if not package or not package.get("step_id"):
             return None
         task = self.claim_engineering_for_step(package["step_id"], worker_id,
@@ -743,7 +823,7 @@ class OrchestratorStore:
 
     def update_work_package(self, package_id: int, worker_id: str, status: str,
                             resulting_commit: str | None = None) -> None:
-        if status not in {'engineering', 'review', 'verifying', 'complete', 'blocked'}:
+        if status not in {'ready', 'engineering', 'review', 'verifying', 'complete', 'blocked', 'cancelled'}:
             raise ValueError('invalid work package status')
         with self.connect() as connection:
             result = connection.execute("""UPDATE work_packages SET status=%s,
@@ -755,8 +835,11 @@ class OrchestratorStore:
 
     def advance_work_package(self, package_id: int, worker_id: str, current: str,
                              next_status: str, resulting_commit: str | None = None) -> None:
-        allowed = {"engineering": {"review", "blocked"}, "review": {"verifying", "engineering", "blocked"},
-                   "verifying": {"complete", "engineering", "blocked"}}
+        allowed = {
+            "engineering": {"review", "blocked"},
+            "review": {"verifying", "engineering", "ready", "blocked"},
+            "verifying": {"complete", "engineering", "ready", "blocked"},
+        }
         if next_status not in allowed.get(current, set()):
             raise ValueError(f"invalid package transition: {current} -> {next_status}")
         with self.connect() as connection:
@@ -790,9 +873,14 @@ class OrchestratorStore:
 
     def recover_work_packages(self) -> list[int]:
         with self.connect() as connection:
-            rows = connection.execute("""UPDATE work_packages SET status='ready',worker_id=NULL,
-                lease_expires_at=NULL,updated_at=now() WHERE status IN ('engineering','review','verifying')
-                AND lease_expires_at < now() RETURNING id""").fetchall()
+            # Only an Engineering admission that never reached a running Step
+            # is safe to return to the queue. Review/verification have their
+            # own durable leases and must be recovered by those phase claims.
+            rows = connection.execute("""UPDATE work_packages p SET status='ready',worker_id=NULL,
+                lease_expires_at=NULL,updated_at=now()
+                FROM steps s WHERE p.step_id=s.id AND p.status='engineering'
+                AND s.status IN ('queued','changes_requested')
+                AND p.lease_expires_at < now() RETURNING p.id""").fetchall()
             return [row["id"] for row in rows]
 
     def retry_job(self, job_id: int) -> None:
@@ -926,14 +1014,23 @@ class OrchestratorStore:
     # Engineering and Reviewer hand-offs
     # ------------------------------------------------------------------
     def claim_engineering(self, worker_id: str, lease_seconds: int,
-                          repository_lock_seconds: int) -> Task | None:
+                          repository_lock_seconds: int, *,
+                          max_concurrent_per_repository: int = 1) -> Task | None:
         """Claim exactly one mutation step and its repository lease atomically."""
         with self.connect() as connection:
             row = connection.execute(
                 """SELECT s.* FROM steps s JOIN jobs j ON j.id=s.job_id
                 WHERE j.status='running' AND s.status IN ('queued','changes_requested')
                   AND (s.lease_expires_at IS NULL OR s.lease_expires_at < now())
-                ORDER BY j.priority DESC,s.id FOR UPDATE OF s,j SKIP LOCKED LIMIT 1"""
+                  AND (%s <= 0 OR (
+                    SELECT count(*) FROM steps active JOIN jobs active_job
+                      ON active_job.id=active.job_id
+                    WHERE active.repository=s.repository
+                      AND active.status='running'
+                      AND active_job.status='running'
+                  ) < %s)
+                ORDER BY j.priority DESC,j.updated_at,s.id FOR UPDATE OF s,j SKIP LOCKED LIMIT 1""",
+                (max_concurrent_per_repository, max_concurrent_per_repository),
             ).fetchone()
             if not row:
                 return None
@@ -966,6 +1063,36 @@ class OrchestratorStore:
                      repository_lock_seconds: int) -> Task | None:
         """V1 compatibility alias for :meth:`claim_engineering`."""
         return self.claim_engineering(worker_id, lease_seconds, repository_lock_seconds)
+
+    def claim_next_engineering(self, worker_id: str, lease_seconds: int,
+                               repository_lock_seconds: int, worktree_manager=None, *,
+                               max_concurrent_per_repository: int = 1,
+                               queue_backpressure: int = 0) -> dict[str, Any] | None:
+        """Use one authoritative Engineering admission path for V2 and V1.
+
+        A migrated database admits a package and its linked step atomically.
+        Older databases fall back to the durable step transport without
+        requiring a second coordinator state machine.
+        """
+        package_claim = getattr(self, "claim_engineering_package", None)
+        if package_claim is not None:
+            try:
+                claimed = package_claim(
+                    worker_id, lease_seconds, repository_lock_seconds, worktree_manager,
+                    max_concurrent_per_repository=max_concurrent_per_repository,
+                    queue_backpressure=queue_backpressure,
+                )
+                if claimed:
+                    return {"package": claimed["package"], "task": claimed["task"]}
+            except Exception:
+                # Additive V2 tables may not exist yet; continue through the
+                # same canonical Engineering step claim below.
+                pass
+        task = self.claim_engineering(
+            worker_id, lease_seconds, repository_lock_seconds,
+            max_concurrent_per_repository=max_concurrent_per_repository,
+        )
+        return {"task": task} if task else None
 
     def finish_engineering_handoff(self, step_id: int, worker_id: str) -> str | None:
         """Synchronize a bounded Engineering call with workflow state."""
@@ -1344,6 +1471,9 @@ class OrchestratorStore:
             "duration_seconds": float(get("duration_seconds", 0.0)),
             "timed_out": bool(get("timed_out", False)),
             "cancelled": bool(get("cancelled", False)),
+            "stdout_sha256": get("stdout_sha256"),
+            "stderr_sha256": get("stderr_sha256"),
+            "output_truncated": bool(get("output_truncated", False)),
         }
 
     # ------------------------------------------------------------------
@@ -1671,6 +1801,8 @@ class OrchestratorStore:
         status: str,
         duration_seconds: float,
         prompt_chars: int = 0,
+        prompt_tokens: int = 0,
+        context_sha256: str | None = None,
         provider: str | None = None,
         model: str | None = None,
         detail: dict[str, Any] | None = None,
@@ -1679,10 +1811,12 @@ class OrchestratorStore:
         with self.connect() as connection:
             connection.execute(
                 """INSERT INTO phase_metrics
-                (job_id,step_id,phase,status,duration_seconds,prompt_chars,provider,model,detail)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (job_id,step_id,phase,status,duration_seconds,prompt_chars,prompt_tokens,
+                 context_sha256,provider,model,detail)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (job_id, step_id, phase, status, max(0.0, float(duration_seconds)),
-                 max(0, int(prompt_chars or 0)), provider, model,
+                 max(0, int(prompt_chars or 0)), max(0, int(prompt_tokens or 0)),
+                 context_sha256, provider, model,
                  json.dumps(detail or {}, default=str)),
             )
 

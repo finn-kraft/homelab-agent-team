@@ -4,7 +4,10 @@ import json
 import time
 import urllib.error
 
-from agent_core.llm import BackendError, HTTPBackend, InferenceRouter, LLMResponse, Router
+from agent_core.llm import (
+    BackendError, CircuitStateStore, HTTPBackend, InferenceRouter, LLMResponse,
+    Router, RoutingPolicy,
+)
 
 
 class Backend:
@@ -161,3 +164,44 @@ def test_open_circuit_is_skipped_if_it_opens_after_chain_creation():
     # Simulate a breaker opening between route selection and model execution.
     standard._circuit_open_until = time.time() + 60
     assert backend.complete([]).backend == "ollama"
+
+
+def test_per_agent_policy_can_forbid_cloud_and_require_capabilities():
+    local, cloud = Backend("ollama"), Backend("openrouter")
+    router = InferenceRouter(
+        local, cloud, caller_agent="reviewer-agent", task_type="code_review",
+        router_url=None, escalate_after=2,
+        policy=RoutingPolicy(allowed_providers=frozenset({"ollama"}),
+                             required_capabilities=frozenset({"vision"})),
+    )
+    assert router.choose(4).complete([]).backend == "ollama"
+
+
+def test_circuit_state_survives_backend_reconstruction(tmp_path):
+    path = tmp_path / "circuits.json"
+    state = CircuitStateStore(str(path))
+    state.save("openrouter", "https://example.invalid", "model", time.time() + 60)
+    backend = HTTPBackend(
+        "https://example.invalid", "model", "secret", retries=0,
+        circuit_state_path=str(path),
+    )
+    assert backend.circuit_open is True
+
+
+def test_failover_records_cloud_usage_once():
+    local = Backend("ollama")
+    standard = Backend("openrouter-standard", fail=True)
+
+    class Premium(Backend):
+        def complete(self, messages):
+            return LLMResponse("{}", self.model, "openrouter", 0.2, {"cost": 0.25})
+
+    premium = Premium("openrouter-premium")
+    router = InferenceRouter(
+        local, standard, premium, caller_agent="engineering-agent",
+        task_type="code_implementation", router_url=None, escalate_after=4,
+    )
+
+    assert router.choose(4).complete([]).backend == "openrouter"
+    assert router.cloud_spend == 0.25
+    assert router.cloud_latency_seconds == [0.2]

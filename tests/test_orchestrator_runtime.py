@@ -84,6 +84,17 @@ def test_engineering_attempt_setting_is_canonical(monkeypatch):
     assert loaded.max_engineering_attempts == 7
 
 
+def test_admission_policy_reads_repository_concurrency_and_backpressure(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://unused")
+    monkeypatch.setenv("ORCHESTRATOR_MAX_CONCURRENT_PER_REPOSITORY", "2")
+    monkeypatch.setenv("ORCHESTRATOR_QUEUE_BACKPRESSURE", "8")
+    monkeypatch.setenv("ORCHESTRATOR_WORKTREE_CLEANUP_SECONDS", "30")
+    loaded = OrchestratorConfig.from_env()
+    assert loaded.max_concurrent_jobs_per_repository == 2
+    assert loaded.queue_backpressure == 8
+    assert loaded.worktree_cleanup_seconds == 30
+
+
 def test_schema_readiness_reports_missing_migration(monkeypatch):
     store = OrchestratorStore("postgresql://unused")
 

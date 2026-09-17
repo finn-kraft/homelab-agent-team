@@ -13,6 +13,7 @@ from .llm import (
     OllamaBackend,
     OpenRouterBackend,
 )
+from agent_core.llm import routing_policy_from_env
 from .worker import Worker
 
 
@@ -120,6 +121,7 @@ def build_engineer() -> EngineeringAgent:
             "false",
         ).lower()
         in {"1", "true", "yes", "on"},
+        policy=routing_policy_from_env("ENGINEERING"),
     )
 
     return EngineeringAgent(
@@ -142,6 +144,7 @@ def build_engineer() -> EngineeringAgent:
             os.getenv("CODER_MAX_CONTEXT_CHARS", "120000"),
         )),
         max_stagnation_episodes=int(os.getenv("ENGINEERING_MAX_STAGNATION_EPISODES", "6")),
+        max_prompt_tokens=int(os.getenv("ENGINEERING_MAX_PROMPT_TOKENS", "0")) or None,
     )
 
 

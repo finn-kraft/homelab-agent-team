@@ -10,6 +10,7 @@ from agent_core.llm import (
     InferenceRouter,
     OllamaBackend,
     OpenRouterBackend,
+    routing_policy_from_env,
 )
 from planner_agent.store import PlannerStore
 
@@ -113,6 +114,7 @@ def build() -> ReviewerAgent:
             "false",
         ).lower()
         in {"1", "true", "yes", "on"},
+        policy=routing_policy_from_env("REVIEWER"),
     )
 
     return ReviewerAgent(
@@ -149,6 +151,7 @@ def build() -> ReviewerAgent:
             )
         ),
         max_context_chars=int(os.getenv("REVIEWER_MAX_CONTEXT_CHARS", "120000")),
+        max_context_tokens=int(os.getenv("REVIEWER_MAX_PROMPT_TOKENS", "0")) or None,
     )
 
 

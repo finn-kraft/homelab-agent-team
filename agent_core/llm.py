@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Callable
 
 from .models import ModelRoute
@@ -13,6 +17,78 @@ from .models import ModelRoute
 
 class BackendError(RuntimeError):
     pass
+
+
+class CircuitStateStore:
+    """Tiny atomic JSON store for backend breaker state across restarts."""
+
+    def __init__(self, path: str | None = None):
+        configured = path or os.getenv(
+            "INFERENCE_CIRCUIT_STATE_FILE",
+            str(Path.home() / ".cache" / "homelab-agent-team" / "circuit-state.json"),
+        )
+        self.path = Path(configured).expanduser()
+
+    @staticmethod
+    def _key(provider: str, base_url: str, model: str) -> str:
+        return hashlib.sha256(f"{provider}|{base_url}|{model}".encode()).hexdigest()
+
+    def load(self, provider: str, base_url: str, model: str) -> float:
+        try:
+            values = json.loads(self.path.read_text())
+            return max(0.0, float(values.get(self._key(provider, base_url, model), 0)))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return 0.0
+
+    def save(self, provider: str, base_url: str, model: str, until: float) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            values = {}
+            try:
+                values = json.loads(self.path.read_text())
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+            values[self._key(provider, base_url, model)] = max(0.0, float(until))
+            handle, temporary = tempfile.mkstemp(prefix=".circuit-", dir=self.path.parent)
+            with os.fdopen(handle, "w") as stream:
+                json.dump(values, stream)
+            os.replace(temporary, self.path)
+        except OSError:
+            # Breaker persistence is best-effort; a read-only service account
+            # must still be able to use in-process failover.
+            return
+
+
+@dataclass(frozen=True, slots=True)
+class RoutingPolicy:
+    """Per-agent routing guardrails applied after router recommendations."""
+
+    allowed_providers: frozenset[str] = frozenset({"ollama", "openrouter"})
+    privacy_sensitive: bool = False
+    max_cloud_cost: float | None = None
+    max_latency_seconds: float | None = None
+    required_capabilities: frozenset[str] = frozenset()
+
+
+def routing_policy_from_env(prefix: str) -> RoutingPolicy:
+    """Load optional per-agent routing guardrails from environment variables."""
+    raw = os.getenv(f"{prefix}_ALLOWED_PROVIDERS", "ollama,openrouter")
+    providers = frozenset(value.strip().lower() for value in raw.split(",") if value.strip())
+    cost = float(os.getenv(f"{prefix}_MAX_CLOUD_COST", "0"))
+    latency = float(os.getenv(f"{prefix}_MAX_LATENCY_SECONDS", "0"))
+    capabilities = frozenset(
+        value.strip().lower()
+        for value in os.getenv(f"{prefix}_REQUIRED_CAPABILITIES", "").split(",")
+        if value.strip()
+    )
+    return RoutingPolicy(
+        allowed_providers=providers or frozenset({"ollama"}),
+        privacy_sensitive=os.getenv(f"{prefix}_PRIVACY_SENSITIVE", "false").lower()
+        in {"1", "true", "yes", "on"},
+        max_cloud_cost=cost if cost > 0 else None,
+        max_latency_seconds=latency if latency > 0 else None,
+        required_capabilities=capabilities,
+    )
 
 
 @dataclass(slots=True)
@@ -33,6 +109,7 @@ class HTTPBackend:
         timeout: int = 120,
         retries: int = 2,
         circuit_seconds: float = 900,
+        circuit_state_path: str | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -40,7 +117,11 @@ class HTTPBackend:
         self.timeout = max(0.1, float(timeout))
         self.retries = max(0, int(retries))
         self.circuit_seconds = max(1.0, float(circuit_seconds))
-        self._circuit_open_until = 0.0
+        self._circuit_state = CircuitStateStore(circuit_state_path)
+        self._provider_name = "openrouter" if api_key else "ollama"
+        self._circuit_open_until = self._circuit_state.load(
+            self._provider_name, self.base_url, self.model
+        )
 
     @property
     def circuit_open(self) -> bool:
@@ -74,6 +155,7 @@ class HTTPBackend:
                     request,
                     timeout=self.timeout,
                 ) as response:
+                    self._clear_circuit()
                     return (
                         json.load(response),
                         time.monotonic() - started,
@@ -83,6 +165,9 @@ class HTTPBackend:
                 last = exc
                 if self.api_key and exc.code in {401, 402, 403}:
                     self._circuit_open_until = time.time() + self.circuit_seconds
+                    self._circuit_state.save(
+                        self._provider_name, self.base_url, self.model, self._circuit_open_until
+                    )
                     raise BackendError(
                         f"paid backend circuit opened after HTTP {exc.code}"
                     ) from exc
@@ -94,9 +179,37 @@ class HTTPBackend:
                 if attempt < self.retries:
                     time.sleep(2 ** attempt)
 
-        raise BackendError(
-            f"backend unavailable after retries: {last}"
+        # Repeated transport failures are also circuit-worthy. Persisting this
+        # short cool-down prevents every worker restart from stampeding a dead
+        # endpoint while still allowing the normal availability fallback.
+        self._circuit_open_until = time.time() + self.circuit_seconds
+        self._circuit_state.save(
+            self._provider_name, self.base_url, self.model, self._circuit_open_until
         )
+        raise BackendError(f"backend unavailable after retries: {last}")
+
+    def health_probe(self) -> dict[str, Any]:
+        """Probe provider availability without consuming a model completion."""
+        if self.circuit_open:
+            return {"ok": False, "status": "circuit_open", "retry_seconds": self.circuit_retry_seconds}
+        endpoint = f"{self.base_url}/models" if self.api_key else f"{self.base_url}/api/tags"
+        request = urllib.request.Request(endpoint, headers={
+            "Authorization": f"Bearer {self.api_key}" if self.api_key else "",
+        })
+        started = time.monotonic()
+        try:
+            with urllib.request.urlopen(request, timeout=min(self.timeout, 5.0)) as response:
+                response.read(1)
+            return {"ok": True, "status": "ready",
+                    "latency_seconds": time.monotonic() - started}
+        except (OSError, TimeoutError, urllib.error.URLError) as exc:
+            return {"ok": False, "status": "unavailable", "error": str(exc)[:300],
+                    "latency_seconds": time.monotonic() - started}
+
+    def _clear_circuit(self) -> None:
+        if self._circuit_open_until:
+            self._circuit_open_until = 0.0
+            self._circuit_state.save(self._provider_name, self.base_url, self.model, 0.0)
 
 
 class OllamaBackend(HTTPBackend):
@@ -280,6 +393,11 @@ class InferenceRouter(Router):
         escalate_after: int = 6,
         timeout: float = 3.0,
         privacy_sensitive: bool = False,
+        policy: RoutingPolicy | None = None,
+        allowed_providers: frozenset[str] | None = None,
+        max_cloud_cost: float | None = None,
+        max_latency_seconds: float | None = None,
+        required_capabilities: frozenset[str] | None = None,
     ):
         super().__init__(
             local,
@@ -292,8 +410,17 @@ class InferenceRouter(Router):
         self.task_type = task_type
         self.router_url = self._inference_endpoint(router_url)
         self.timeout = max(0.1, float(timeout))
-        self.privacy_sensitive = privacy_sensitive
+        self.policy = policy or RoutingPolicy(
+            allowed_providers=allowed_providers or frozenset({"ollama", "openrouter"}),
+            privacy_sensitive=privacy_sensitive,
+            max_cloud_cost=max_cloud_cost,
+            max_latency_seconds=max_latency_seconds,
+            required_capabilities=required_capabilities or frozenset(),
+        )
+        self.privacy_sensitive = privacy_sensitive or self.policy.privacy_sensitive
         self.last_route: ModelRoute | None = None
+        self.cloud_spend = 0.0
+        self.cloud_latency_seconds: list[float] = []
 
     @staticmethod
     def _inference_endpoint(
@@ -334,6 +461,12 @@ class InferenceRouter(Router):
             ),
             "privacy_sensitive": self.privacy_sensitive,
             "needs_strong_model": bool(needs_strong_model),
+            "allowed_providers": sorted(self.policy.allowed_providers),
+            "required_capabilities": sorted(self.policy.required_capabilities),
+            "cloud_budget_remaining": (
+                max(0.0, self.policy.max_cloud_cost - self.cloud_spend)
+                if self.policy.max_cloud_cost is not None else None
+            ),
         }
 
         request = urllib.request.Request(
@@ -404,10 +537,34 @@ class InferenceRouter(Router):
             backend.circuit_seconds,
         )
 
-    @staticmethod
-    def _available(backend: HTTPBackend | None) -> bool:
+    def _provider(self, backend: HTTPBackend | None) -> str:
+        return "ollama" if backend is self.local else "openrouter"
+
+    def _policy_allows(self, backend: HTTPBackend | None) -> bool:
+        if backend is None:
+            return False
+        provider = self._provider(backend)
+        if provider not in self.policy.allowed_providers:
+            return False
+        if provider == "ollama":
+            return True
+        if self.privacy_sensitive:
+            return False
+        if self.policy.max_cloud_cost is not None and self.cloud_spend >= self.policy.max_cloud_cost:
+            return False
+        if (
+            self.policy.max_latency_seconds is not None
+            and self.cloud_latency_seconds
+            and sum(self.cloud_latency_seconds[-3:]) / len(self.cloud_latency_seconds[-3:])
+            > self.policy.max_latency_seconds
+        ):
+            return False
+        capabilities = set(getattr(backend, "capabilities", {"text", "code"}))
+        return self.policy.required_capabilities.issubset(capabilities)
+
+    def _available(self, backend: HTTPBackend | None) -> bool:
         """Return whether a backend can be attempted without tripping its breaker."""
-        return backend is not None and not getattr(backend, "circuit_open", False)
+        return self._policy_allows(backend) and not getattr(backend, "circuit_open", False)
 
     def _first_available(self, *backends: HTTPBackend | None) -> HTTPBackend | None:
         return next((backend for backend in backends if self._available(backend)), None)
@@ -417,9 +574,10 @@ class InferenceRouter(Router):
         chain = None
         for backend in reversed(backends):
             if self._available(backend):
-                chain = _FailoverBackend(
-                    backend, chain, on_response=self._record_response
-                )
+                # The outer chain records the final response once. Nested
+                # callbacks would double-count cloud spend and latency when a
+                # request walks through more than one availability fallback.
+                chain = _FailoverBackend(backend, chain)
         return chain
 
     def _set_route(
@@ -486,6 +644,17 @@ class InferenceRouter(Router):
                 on_response=self._record_response,
             )
 
+        if "ollama" not in self.policy.allowed_providers:
+            primary = self._first_available(self.cloud, self.premium_cloud)
+            if primary is None:
+                raise BackendError("routing policy disallows local Ollama and no cloud backend is available")
+            self._set_route(
+                provider="openrouter", model=primary.model, location="cloud",
+                reason="Per-agent routing policy requires an allowed cloud provider.",
+                attempt=attempt,
+            )
+            return _FailoverBackend(primary, None, on_response=self._record_response)
+
         # Normal local tier.
         if attempt < self.escalate_after:
             primary = self.local
@@ -549,7 +718,7 @@ class InferenceRouter(Router):
             )
 
         # First scheduled cloud tier.
-        if self.cloud is not None and getattr(self.cloud, "circuit_open", False):
+        if self.cloud is not None and self._policy_allows(self.cloud) and getattr(self.cloud, "circuit_open", False):
             primary = self.local
             self._set_route(
                 provider="ollama", model=primary.model, location="local",
@@ -561,7 +730,7 @@ class InferenceRouter(Router):
 
         if (
             attempt == self.escalate_after
-            and self.cloud is not None
+            and self._policy_allows(self.cloud)
         ):
             primary = self.cloud
 
@@ -602,7 +771,7 @@ class InferenceRouter(Router):
         # Premium rescue tier.
         if (
             attempt > self.escalate_after
-            and self.premium_cloud is not None
+            and self._policy_allows(self.premium_cloud)
         ):
             primary = self.premium_cloud
 
@@ -624,7 +793,7 @@ class InferenceRouter(Router):
             )
 
         # Premium tier missing: continue with standard cloud.
-        if self.cloud is not None:
+        if self._policy_allows(self.cloud):
             primary = self.cloud
 
             self._set_route(
@@ -664,6 +833,21 @@ class InferenceRouter(Router):
             on_response=self._record_response,
         )
 
+    def health(self) -> dict[str, Any]:
+        """Return a fast provider health snapshot for operators and probes."""
+        result: dict[str, Any] = {"caller_agent": self.caller_agent,
+                                  "cloud_spend": self.cloud_spend, "backends": {}}
+        for name, backend in (("ollama", self.local), ("openrouter", self.cloud),
+                              ("openrouter_premium", self.premium_cloud)):
+            if backend is None:
+                continue
+            probe = getattr(backend, "health_probe", None)
+            result["backends"][name] = probe() if probe else {
+                "ok": not getattr(backend, "circuit_open", False),
+                "status": "circuit_open" if getattr(backend, "circuit_open", False) else "unknown",
+            }
+        return result
+
     def _record_response(
         self,
         response: LLMResponse,
@@ -698,5 +882,9 @@ class InferenceRouter(Router):
                     pass
 
                 break
+
+            if self.last_route.estimated_cloud_cost is not None:
+                self.cloud_spend += max(0.0, self.last_route.estimated_cloud_cost)
+            self.cloud_latency_seconds.append(max(0.0, float(response.latency_seconds or 0)))
 
         self.last_route.timestamp = datetime.now(UTC)

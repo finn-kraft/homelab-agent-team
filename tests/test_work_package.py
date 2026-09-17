@@ -2,6 +2,7 @@ import pytest
 from types import SimpleNamespace
 
 from coder_agent import CoderAgent, EngineeringAgent
+from engineering_agent.cli import main as engineering_cli_main
 from coder_agent.models import Status, Task, WorkPackage
 from orchestrator.config import OrchestratorConfig
 from orchestrator.orchestrator import AgentOrchestrator
@@ -11,6 +12,7 @@ def test_engineering_agent_is_canonical_with_v1_compatibility_alias():
     assert EngineeringAgent is CoderAgent
     assert hasattr(EngineeringAgent, "run_work_package")
     assert hasattr(EngineeringAgent, "run_package")
+    assert callable(engineering_cli_main)
 
 
 def test_orchestrator_builds_engineering_package_on_isolated_step_checkout():

@@ -7,6 +7,7 @@ from typing import Any
 
 from agent_core.models import Job, JobStatus, PlannerDecision, Step, StepStatus
 from .decision import normalize_objective
+from orchestrator.state import canonical_agent
 
 
 class PlannerStore:
@@ -126,11 +127,7 @@ class PlannerStore:
                     # V1 planners may still emit the compatibility alias, but
                     # durable workflow rows must use the V2 EngineeringAgent
                     # identity so the UI and workers agree after migration.
-                    assigned_agent = (
-                        "engineering-agent"
-                        if step["assigned_agent"] == "coder-agent"
-                        else step["assigned_agent"]
-                    )
+                    assigned_agent = canonical_agent(step["assigned_agent"])
                     row = connection.execute(
                         """INSERT INTO steps(job_id,sequence,repository,branch,title,objective,
                         rationale,acceptance_criteria,constraints,suggested_files,dependencies,assigned_agent)

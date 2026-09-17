@@ -11,6 +11,9 @@ import os
 import importlib.util
 import re
 import shlex
+import hashlib
+import json
+import signal
 import shutil
 import subprocess
 import sys
@@ -71,6 +74,9 @@ class VerificationCommandResult:
     duration_seconds: float
     timed_out: bool = False
     source: str = ""
+    stdout_sha256: str | None = None
+    stderr_sha256: str | None = None
+    output_truncated: bool = False
 
     @property
     def passed(self) -> bool:
@@ -323,7 +329,48 @@ class VerificationService:
                 if command.argv not in seen:
                     discovered.append(command)
                     seen.add(command.argv)
-        return discovered
+        if discovered:
+            return discovered
+        return self.infer_commands(root, starting_commit=starting_commit)
+
+    def infer_commands(self, repository: str | Path, *, starting_commit: str | None = None) -> list[VerificationCommand]:
+        """Infer a conservative test command from the committed project shape."""
+        root = self._repository_root(repository)
+
+        def exists(relative: str) -> bool:
+            if starting_commit is None:
+                return (root / relative).is_file()
+            result = self._run(
+                root, ("git", "cat-file", "-e", f"{starting_commit}:{relative}"),
+                source="deterministic:environment-detection", redact_output=False,
+            )
+            return result.exit_code == 0
+
+        if exists("pyproject.toml") or exists("pytest.ini") or exists("tox.ini"):
+            return [VerificationCommand(("pytest", "-q"), "inferred:python")]
+        if exists("package.json"):
+            try:
+                if starting_commit:
+                    content = self._run(
+                        root, ("git", "show", f"{starting_commit}:package.json"),
+                        source="deterministic:environment-detection", redact_output=False,
+                    ).stdout
+                else:
+                    content = (root / "package.json").read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                package = json.loads(content)
+                if isinstance(package, dict) and "test" in dict(package.get("scripts") or {}):
+                    return [VerificationCommand(("npm", "test"), "inferred:node")]
+            except (json.JSONDecodeError, VerificationError):
+                pass
+        if exists("Cargo.toml"):
+            return [VerificationCommand(("cargo", "test"), "inferred:rust")]
+        if exists("go.mod"):
+            return [VerificationCommand(("go", "test", "./..."), "inferred:go")]
+        if exists("Makefile"):
+            return [VerificationCommand(("make", "test"), "inferred:make")]
+        return []
 
     def _configured_commands(
         self, commands: Sequence[Sequence[str]], source: str
@@ -392,22 +439,26 @@ class VerificationService:
         environment = self._safe_environment()
         execution_argv = self._resolve_tool(argv_list, environment)
         started = time.monotonic()
+        process = None
         try:
-            done = subprocess.run(
+            process = subprocess.Popen(
                 execution_argv,
                 cwd=root,
                 env=environment,
                 text=True,
-                capture_output=True,
-                timeout=self.config.timeout_seconds,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 shell=False,
+                start_new_session=(os.name == "posix"),
             )
-            stdout, stderr, exit_code, timed_out = (
-                done.stdout,
-                done.stderr,
-                done.returncode,
-                False,
-            )
+            try:
+                stdout, stderr = process.communicate(timeout=self.config.timeout_seconds)
+                exit_code, timed_out = process.returncode, False
+            except subprocess.TimeoutExpired as exc:
+                stdout = self._as_text(exc.stdout)
+                stderr = self._as_text(exc.stderr)
+                self._terminate(process)
+                exit_code, timed_out = 124, True
         except subprocess.TimeoutExpired as exc:
             stdout = self._as_text(exc.stdout)
             stderr = self._as_text(exc.stderr)
@@ -419,15 +470,42 @@ class VerificationService:
                 "install the repository test tools in the service virtualenv "
                 "(for example: .venv/bin/python -m pip install -e '.[test]')"
             ), 127, False
+        raw_stdout, raw_stderr = stdout, stderr
+        stdout = self._truncate_and_redact(stdout)
+        stderr = self._truncate_and_redact(stderr)
         return VerificationCommandResult(
             argv=argv_list,
             exit_code=exit_code,
-            stdout=self._truncate_and_redact(stdout) if redact_output else stdout,
-            stderr=self._truncate_and_redact(stderr) if redact_output else stderr,
+            stdout=stdout if redact_output else raw_stdout,
+            stderr=stderr if redact_output else raw_stderr,
             duration_seconds=time.monotonic() - started,
             timed_out=timed_out,
             source=source,
+            stdout_sha256=hashlib.sha256(raw_stdout.encode("utf-8", "replace")).hexdigest(),
+            stderr_sha256=hashlib.sha256(raw_stderr.encode("utf-8", "replace")).hexdigest(),
+            output_truncated=(stdout.endswith("\n[TRUNCATED]") or stderr.endswith("\n[TRUNCATED]")),
         )
+
+    @staticmethod
+    def _terminate(process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGTERM)
+            else:  # pragma: no cover
+                process.terminate()
+            process.communicate(timeout=2)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            if process.poll() is None:
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:  # pragma: no cover
+                    process.kill()
+                process.communicate()
 
     def _scan_candidate(self, root: Path, starting_commit: str, files: list[str]) -> list[str]:
         # Diff covers tracked changes; reading the candidate files additionally
