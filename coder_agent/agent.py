@@ -130,6 +130,12 @@ class CoderAgent:
                 self.store.event(task, "agent_action", {
                     "turn": turn + 1, "model": response.model,
                     "action": action.get("action"), "observation": self._redact(observation),
+                    "progress_classification": (
+                        "invalid_action" if action.get("action") == "invalid" else
+                        "verification_progress" if action.get("action") == "run" and verified else
+                        "repository_change" if action.get("action") in {"write", "delete"} else
+                        "no_progress"
+                    ),
                 })
                 if observation == previous_observation or action.get("action") == "invalid":
                     stagnation += 1
