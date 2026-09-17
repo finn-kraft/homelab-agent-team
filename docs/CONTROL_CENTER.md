@@ -40,7 +40,10 @@ again after login.
 
 `GET /health` is an unauthenticated readiness endpoint exposing only `ok` or `degraded`.
 All `/api/*` endpoints require the HttpOnly session cookie and CSRF header for writes.
-Cancel requires explicit confirmation.
+Cancel and Remove from queue require explicit confirmation. Remove is available for
+any job that is not already cancelled: it stops new claims, releases active leases,
+clears stale blockers and open human requests, and keeps the job's audit history while
+removing it from the active queue.
 
 ## Live state
 
@@ -55,7 +58,7 @@ heartbeat so online/offline is objective.
 The job page combines steps with reviews, verification runs, safe command metadata,
 model routes, and checkpoint records. It shows the same-step `changes_requested` loop as
 a revision, not a failed job. Human answers are accepted only for `needs_human`, appended
-to durable job notes/events, and return the existing step to Coder when appropriate.
+to durable job notes/events, and return the existing step to EngineeringAgent when appropriate.
 
 ## GPU and Ollama telemetry
 

@@ -23,7 +23,7 @@ class ControlCenter:
         if action in {"cancel", "remove"} and data.get("confirm") is not True:
             raise PermissionError("confirmation_required")
         if action == "remove":
-            self.store.remove_queued_job(job_id)
+            self.store.remove_job(job_id)
             return {"status": "removed"}
         self.store.action(job_id, action)
         return {"status": action}

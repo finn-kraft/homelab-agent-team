@@ -1,6 +1,6 @@
 """Public V2 EngineeringAgent package.
 
-The implementation intentionally lives beside the proven V1 coder tooling so
+The implementation intentionally reuses the proven workspace/tooling module so
 existing imports and installations continue to work during the migration.
 """
 

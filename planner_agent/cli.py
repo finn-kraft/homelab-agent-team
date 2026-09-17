@@ -23,6 +23,7 @@ def build_planner() -> PlannerAgent:
     ollama_retries = int(os.getenv("OLLAMA_RETRIES", str(llm_retries)))
     cloud_timeout = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "90"))
     cloud_retries = int(os.getenv("OPENROUTER_RETRIES", "1"))
+    circuit_seconds = float(os.getenv("OPENROUTER_CIRCUIT_SECONDS", "60"))
     local = OllamaBackend(os.getenv("OLLAMA_URL", "http://localhost:11434"),
                           os.getenv("PLANNER_MODEL", "qwen2.5-coder:14b"),
                           timeout=ollama_timeout, retries=ollama_retries)
@@ -40,16 +41,18 @@ def build_planner() -> PlannerAgent:
             api_key,
             timeout=cloud_timeout,
             retries=cloud_retries,
+            circuit_seconds=circuit_seconds,
         )
         premium_cloud = OpenRouterBackend(
             "https://openrouter.ai/api/v1",
             os.getenv(
                 "OPENROUTER_PLANNER_PREMIUM_MODEL",
-                "anthropic/claude-sonnet-4.6",
+                os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.6"),
             ),
             api_key,
             timeout=cloud_timeout,
             retries=cloud_retries,
+            circuit_seconds=circuit_seconds,
         )
     escalation_attempt = int(os.getenv(
         "PLANNER_ESCALATE_AFTER", os.getenv("INFERENCE_ESCALATE_AFTER", "4")

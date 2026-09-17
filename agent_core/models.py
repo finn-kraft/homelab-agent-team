@@ -62,7 +62,7 @@ class Step:
     constraints: list[str] = field(default_factory=list)
     suggested_files: list[str] = field(default_factory=list)
     dependencies: list[int] = field(default_factory=list)
-    assigned_agent: str = "coder-agent"
+    assigned_agent: str = "engineering-agent"
     status: StepStatus = StepStatus.QUEUED
     attempt_count: int = 0
     reviewer_feedback: dict[str, Any] | None = None
@@ -79,7 +79,7 @@ class TaskContract:
     acceptance_criteria: list[str]
     constraints: list[str]
     suggested_files: list[str]
-    assigned_agent: str = "coder-agent"
+    assigned_agent: str = "engineering-agent"
 
 
 @dataclass(slots=True)

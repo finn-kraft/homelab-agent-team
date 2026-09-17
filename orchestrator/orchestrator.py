@@ -19,7 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from coder_agent.models import WorkPackage
+from engineering_agent.models import WorkPackage
 
 from .config import OrchestratorConfig
 from .integration import IntegrationManager
@@ -156,7 +156,8 @@ class AgentOrchestrator:
         if step_id is not None:
             return self._review(step_id)
 
-        task = self.store.claim_coding(
+        claim_step = getattr(self.store, "claim_engineering", None) or self.store.claim_coding
+        task = claim_step(
             self.engineer.worker_id,
             self.config.lease_seconds,
             self.config.repository_lock_seconds,
@@ -189,6 +190,8 @@ class AgentOrchestrator:
         # The durable claim is owned by the Coder worker identity, not the
         # Orchestrator process identity.  These are commonly different under
         # systemd and must match exactly for release.
+        # Keep the durable lock suffix stable for V1 workers upgrading in
+        # place; the owning component and UI identity are EngineeringAgent.
         owner = f"{self.engineer.worker_id}:coder:{task.step_id}"
         started = time.monotonic()
         phase_status = "crashed"
@@ -197,7 +200,7 @@ class AgentOrchestrator:
             self._clear_route(self.engineer)
             package = package or self._work_package_for_step(task)
             with self._lease_heartbeat(
-                task.repository, owner, task.step_id, "coder", self.engineer.worker_id,
+                task.repository, owner, task.step_id, "engineering", self.engineer.worker_id,
                 package_id=(package or {}).get("id"),
             ):
                 run_package = getattr(self.engineer, "run_work_package", None)
@@ -205,7 +208,8 @@ class AgentOrchestrator:
                     result = run_package(package, step_id=task.step_id, attempt=task.attempt)
                 else:
                     result = self.engineer.run_task(task)
-            status = self.store.finish_coding_handoff(task.step_id, self.engineer.worker_id)
+            finish_step = getattr(self.store, "finish_engineering_handoff", None) or self.store.finish_coding_handoff
+            status = finish_step(task.step_id, self.engineer.worker_id)
             self._record_route(self.engineer, task.job_id, task.step_id, task.attempt)
             detail = getattr(result, "summary", "")
             phase_status = str(getattr(result, "status", status))
@@ -576,8 +580,10 @@ class AgentOrchestrator:
                     repository_ok = self.store.heartbeat_repository_lock(
                         repository, owner, self.config.repository_lock_seconds
                     )
-                    if lease_kind == "coder":
-                        work_ok = self.store.heartbeat_coding(
+                    if lease_kind in {"coder", "engineering"}:
+                        heartbeat_engineering = getattr(self.store, "heartbeat_engineering", None)
+                        heartbeat = heartbeat_engineering or self.store.heartbeat_coding
+                        work_ok = heartbeat(
                             step_id, lease_worker_id, self.config.lease_seconds
                         )
                     else:

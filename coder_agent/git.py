@@ -42,6 +42,11 @@ class GitRepository:
             files.append(path.rsplit(" -> ", 1)[-1])
         return files
 
+    def files(self, limit: int = 1_000) -> list[str]:
+        """Return tracked and standard untracked files for safe path discovery."""
+        result = self._git("ls-files", "--cached", "--others", "--exclude-standard")
+        return [line for line in result.stdout.splitlines()[:max(1, limit)] if line]
+
     def commit(self, files: list[str], message: str) -> str:
         if not files:
             raise GitError("refusing to commit without explicit files")

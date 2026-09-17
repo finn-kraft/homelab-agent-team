@@ -8,6 +8,7 @@ and always performs a Git whitespace check and a local secret scan first.
 from __future__ import annotations
 
 import os
+import importlib.util
 import re
 import shlex
 import shutil
@@ -388,15 +389,14 @@ class VerificationService:
         redact_output: bool = True,
     ) -> VerificationCommandResult:
         argv_list = list(argv)
-        execution_argv = argv_list
-        if argv_list and argv_list[0] == "python" and shutil.which("python") is None:
-            execution_argv = [sys.executable, *argv_list[1:]]
+        environment = self._safe_environment()
+        execution_argv = self._resolve_tool(argv_list, environment)
         started = time.monotonic()
         try:
             done = subprocess.run(
                 execution_argv,
                 cwd=root,
-                env=self._safe_environment(),
+                env=environment,
                 text=True,
                 capture_output=True,
                 timeout=self.config.timeout_seconds,
@@ -413,7 +413,12 @@ class VerificationService:
             stderr = self._as_text(exc.stderr)
             exit_code, timed_out = 124, True
         except OSError as exc:
-            stdout, stderr, exit_code, timed_out = "", str(exc), 127, False
+            command = argv_list[0] if argv_list else "command"
+            stdout, stderr, exit_code, timed_out = "", (
+                f"{command} is not installed in the agent environment; "
+                "install the repository test tools in the service virtualenv "
+                "(for example: .venv/bin/python -m pip install -e '.[test]')"
+            ), 127, False
         return VerificationCommandResult(
             argv=argv_list,
             exit_code=exit_code,
@@ -473,7 +478,7 @@ class VerificationService:
             "AWS_SECRET_ACCESS_KEY",
             "AWS_SESSION_TOKEN",
         }
-        return {
+        environment = {
             key: value
             for key, value in os.environ.items()
             if key not in blocked
@@ -481,6 +486,26 @@ class VerificationService:
             and not key.endswith("_TOKEN")
             and not key.endswith("_SECRET")
         }
+        interpreter_bin = os.path.dirname(sys.executable)
+        environment["PATH"] = os.pathsep.join(
+            part for part in (interpreter_bin, environment.get("PATH", "")) if part
+        )
+        return environment
+
+    @staticmethod
+    def _resolve_tool(argv: list[str], environment: dict[str, str]) -> list[str]:
+        """Use the service virtualenv for Python tools when PATH is minimal."""
+        if not argv:
+            return argv
+        command = argv[0]
+        modules = {"pytest": "pytest", "ruff": "ruff", "mypy": "mypy"}
+        # Resolve through the interpreter running the orchestrator, not an
+        # unrelated global executable that happens to be on PATH.
+        if command in modules and importlib.util.find_spec(modules[command]) is not None:
+            return [sys.executable, "-m", modules[command], *argv[1:]]
+        if command in {"python", "python3"} and shutil.which(command, path=environment.get("PATH")) is None:
+            return [sys.executable, *argv[1:]]
+        return argv
 
     @staticmethod
     def _failure_summary(checks: list[VerificationCommandResult]) -> str:

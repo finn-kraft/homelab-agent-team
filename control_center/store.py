@@ -122,20 +122,51 @@ class ControlStore:
         return result
     @staticmethod
     def _attention(result):
-        if result["job"]["status"] not in {"needs_human","blocked"}: return None
+        status = result["job"]["status"]
+        if status not in {"needs_human", "blocked"}:
+            return None
+
+        # A blocked job is a technical stop, not a question for the operator.
+        # Prefer the durable step blocker so the UI does not hide the useful
+        # detail behind a generic "Provide instructions" message.
+        current = result.get("current_step_detail")
+        step_blocker = current.get("blocker") if current else None
+        job_blocker = result["job"].get("blocker")
+        if step_blocker or job_blocker:
+            return {
+                "reason": step_blocker or job_blocker or status,
+                "question": (
+                    "Resolve the technical blocker, then use Resume to let the "
+                    "team reassess durable state."
+                ),
+                "context": {"step_blocker": step_blocker, "job_blocker": job_blocker},
+                "event_id": None,
+                "can_answer": False,
+            }
+
         for event in result["events"]:
             payload = event.get("structured_payload") or {}
             if isinstance(payload, str):
                 try: payload = json.loads(payload)
                 except json.JSONDecodeError: payload = {}
             question = payload.get("human_question") or payload.get("question")
-            if question or event["event_type"] in {"job_needs_human","human_input_requested","job_blocked"}:
-                return {"reason":payload.get("reason") or payload.get("blocker") or event["event_type"],
-                        "question":question or "Review the context and provide instructions to continue.",
+            reason = (payload.get("reason") or payload.get("blocker") or
+                      payload.get("summary") or event["event_type"])
+            if question or event["event_type"] in {"job_needs_human", "human_input_requested", "job_blocked"}:
+                return {"reason":reason,
+                        "question":question or (
+                            "Resolve the technical blocker, then use Resume to let the "
+                            "team reassess durable state."
+                        ),
                         "context":payload,"event_id":event["id"],
-                        "can_answer":result["job"]["status"] == "needs_human"}
-        return {"reason":result["job"]["status"],"question":"Provide instructions to continue.",
-                "context":{},"can_answer":result["job"]["status"] == "needs_human"}
+                        "can_answer":status == "needs_human"}
+        return {"reason":status,
+                "question":(
+                    "Provide a decision to continue."
+                    if status == "needs_human" else
+                    "Resolve the technical blocker, then use Resume to let the team reassess durable state."
+                ),
+                "context":{},"can_answer":status == "needs_human"}
     def events(self, filters):
         clauses, values = [], []
         for key in ("job_id","step_id","agent","event_type"):
@@ -155,6 +186,7 @@ class ControlStore:
         return self.planner.create_job(goal, project.repository, project.branch,
                                        priority, max_iterations)
     def action(self, job_id, action): self.workflow.control(job_id, action)
+    def remove_job(self, job_id): self.workflow.remove_job(job_id)
     def answer(self, job_id, answer):
         answer = str(answer).strip()
         if not answer or len(answer) > 12_000:
