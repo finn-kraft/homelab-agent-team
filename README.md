@@ -59,6 +59,9 @@ roadmap item or mark the overall goal complete with evidence.
   repeated local failures (default fourth attempt).
 - Pause, resume, cancel, inspection, events, structured logs, worker leases,
   and safe recovery of expired verification/checkpoint leases.
+- An authenticated, loopback-only Control Center backed by structured PostgreSQL APIs,
+  including job controls, durable events, model routes, repository locks, Ollama model
+  state, and optional trusted GPU telemetry.
 
 The full live Align integration and overnight soak test still require the
 actual `/home/finn/work/align` checkout and PostgreSQL service. They are
@@ -223,6 +226,21 @@ sudo journalctl -u agent-orchestrator -f
 The service intentionally has no interactive prompts and works as a foreground
 process, so it is also suitable for a future Kubernetes Deployment. Durable
 state is PostgreSQL plus Git; memory is disposable.
+
+The Control Center has a separate example unit at
+[`deploy/agent-control-center.service.example`](deploy/agent-control-center.service.example).
+Set a long random `CONTROL_CENTER_TOKEN`, keep it bound to `127.0.0.1`, and expose it
+only through an authenticated TLS reverse proxy:
+
+```bash
+agent-control-center --host 127.0.0.1 --port 8080
+```
+
+GPU data must come from a trusted, bearer-authenticated read-only JSON endpoint on the
+Ollama host. The dashboard never accepts SSH details or arbitrary commands.
+
+See [`docs/STATE_MACHINE_AUDIT.md`](docs/STATE_MACHINE_AUDIT.md) for transition
+ownership, leases, recovery behavior, confirmed root causes, and remaining constraints.
 
 ## Configuration
 

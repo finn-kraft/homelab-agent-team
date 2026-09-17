@@ -1,0 +1,1 @@
+"""Authenticated structured operations dashboard."""

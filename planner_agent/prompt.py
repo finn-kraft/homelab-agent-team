@@ -13,6 +13,16 @@ replace_step, wait_for_review, needs_human, blocked, complete. A create_step or
 replace_step includes: title, objective, rationale, acceptance_criteria, constraints,
 suggested_files, dependencies, assigned_agent (always coder-agent). Completion requires
 an evidence list tying the original goal to actual repository state, tests, approved
-review, and completed steps. needs_human requires one specific human_question.
-"""
+review, and completed steps. needs_human requires one specific human_question and is
+reserved for destructive/irreversible production work, unavailable credentials,
+genuinely contradictory requirements, explicit deployment/merge approval, or exhausted
+bounded recovery. Repository inspection, roadmap selection, and ordinary architecture
+choices are never reasons for needs_human.
 
+For create_step and replace_step use this exact top-level shape, including null/empty
+fields: {"decision":"create_step","job_status":"running","reasoning_summary":"...",
+"step":{"title":"...","objective":"...","rationale":"...",
+"acceptance_criteria":["..."],"constraints":["..."],"suggested_files":["..."],
+"dependencies":[],"assigned_agent":"coder-agent"},"evidence":[],
+"human_question":null,"blocker":null}.
+"""

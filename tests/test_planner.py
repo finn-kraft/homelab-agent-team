@@ -17,6 +17,7 @@ def step_payload(objective="Add a tested health endpoint"):
     return {
         "decision": "create_step", "job_status": "running",
         "reasoning_summary": "The endpoint is the next bounded roadmap item.",
+        "evidence": [], "human_question": None, "blocker": None,
         "step": {
             "title": "Add health endpoint", "objective": objective,
             "rationale": "Provides a testable application entry point.",
@@ -65,6 +66,7 @@ class MemoryStore:
         self.events = []
         self.owner = None
         self.decision = None
+        self.deferred = None
 
     def claim_job(self, worker_id, lease_seconds):
         if self.job.status in {JobStatus.PAUSED, JobStatus.CANCELLED, JobStatus.COMPLETE}:
@@ -90,6 +92,12 @@ class MemoryStore:
             self.job.status = JobStatus(decision.job_status)
         self.owner = None
         return len(self.steps) if decision.step else None
+
+    def defer(self, job_id, worker_id, failure_kind, detail, retry_seconds=20):
+        assert self.owner == worker_id
+        self.deferred = {"failure_kind": failure_kind, "detail": detail}
+        self.job.status = JobStatus.RUNNING
+        self.owner = None
 
 
 def planner(store, payloads, inspector=None):
@@ -270,4 +278,3 @@ def test_repository_escape_is_blocked(tmp_path):
     other = tmp_path.parent
     with pytest.raises(InspectionError):
         ReadOnlyRepositoryInspector([str(root)]).resolve_repository(str(other))
-

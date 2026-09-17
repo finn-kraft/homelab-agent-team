@@ -1,0 +1,18 @@
+[Unit]
+Description=Homelab Agent Team Control Center
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=finn
+WorkingDirectory=/home/finn/homelab-ai/dev-team
+EnvironmentFile=/home/finn/homelab-ai/dev-team/.env
+ExecStart=/home/finn/homelab-ai/dev-team/.venv/bin/agent-control-center --host 127.0.0.1 --port 8080
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
