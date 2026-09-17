@@ -3,12 +3,12 @@
 This is the operator runbook for one persistent local stack:
 
 ```text
-PostgreSQL ─┬─ Orchestrator (embeds Planner, Coder, and Reviewer)
+PostgreSQL ─┬─ Orchestrator (embeds Planner, EngineeringAgent, and Reviewer)
             └─ Control Center web UI
 Ollama ── Routing Agent ── Orchestrator
 ```
 
-Do **not** also start the legacy `planner-agent run`, `coder-agent run`, or
+Do **not** also start the legacy `planner-agent run`, `engineering-agent run`, or
 `reviewer-agent run` loops. `agent-orchestrator run` constructs and coordinates all
 three specialists.
 
@@ -47,13 +47,13 @@ At minimum, verify these values:
 DATABASE_URL=postgresql://agent_team_app@127.0.0.1:5432/agent_team
 
 PLANNER_ALLOWED_REPOSITORIES=/home/finn/work
-CODER_WORKSPACES=/home/finn/work
+ENGINEERING_WORKSPACES=/home/finn/work
 REVIEWER_ALLOWED_REPOSITORIES=/home/finn/work
 
 ROUTER_URL=http://127.0.0.1:8090
 OLLAMA_URL=http://192.168.10.193:11434
 PLANNER_MODEL=llama3.2:latest
-CODER_MODEL=llama3.2:latest
+ENGINEERING_MODEL=llama3.2:latest
 REVIEWER_MODEL=llama3.2:latest
 
 CONTROL_CENTER_HOST=127.0.0.1

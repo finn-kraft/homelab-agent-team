@@ -382,6 +382,14 @@ class OrchestratorStore:
             query += " ORDER BY id"
             return [dict(row) for row in connection.execute(query, params).fetchall()]
 
+    def work_package_for_step(self, step_id: int) -> dict[str, Any] | None:
+        """Return the V2 package linked to a durable implementation step."""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM work_packages WHERE step_id=%s LIMIT 1", (step_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
     def claim_work_package(self, worker_id: str, lease_seconds: int = 900,
                            worktree_manager=None) -> dict[str, Any] | None:
         with self.connect() as connection:
@@ -506,6 +514,12 @@ class OrchestratorStore:
             connection.execute("""UPDATE engineering_sessions SET turn_count=%s,
                 last_successful_action=CASE WHEN %s NOT IN ('invalid','no_progress') THEN %s ELSE last_successful_action END,
                 updated_at=now() WHERE id=%s""", (sequence, action, action, session_id))
+
+    def complete_engineering_session_for_step(self, step_id: int) -> None:
+        """Close the Engineer session only after checkpoint completion."""
+        with self.connect() as connection:
+            connection.execute("""UPDATE engineering_sessions SET completed_at=now(),updated_at=now()
+                WHERE step_id=%s AND completed_at IS NULL""", (step_id,))
 
     # ------------------------------------------------------------------
     # Repository mutation lease

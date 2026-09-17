@@ -76,6 +76,25 @@ def test_engineering_session_helpers_support_default_psycopg_tuple_rows(monkeypa
     assert store.resume_engineering_session(1, 2) == 23
 
 
+def test_engineering_baseline_recovers_original_human_changes(monkeypatch):
+    store = Store("postgresql://unused")
+    connection = _FakeConnection([
+        ("a" * 40,),
+        ({"preexisting_changes": ["notes.txt"]},),
+    ])
+
+    @contextmanager
+    def connect():
+        yield connection
+
+    monkeypatch.setattr(store, "connect", connect)
+    baseline = store.engineering_baseline(1, 2)
+    assert baseline == {
+        "starting_commit": "a" * 40,
+        "preexisting_changes": ["notes.txt"],
+    }
+
+
 class _AgentStore:
     def __init__(self, status="running"):
         self.status = status

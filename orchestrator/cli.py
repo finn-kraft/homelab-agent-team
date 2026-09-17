@@ -7,7 +7,7 @@ import signal
 import sys
 from typing import Sequence
 
-from coder_agent.cli import build_agent
+from coder_agent.cli import build_engineer
 from planner_agent.cli import build_planner
 from planner_agent.store import PlannerStore
 from reviewer_agent.cli import build as build_reviewer
@@ -22,14 +22,14 @@ from .verification import VerificationService
 def build_orchestrator(config: OrchestratorConfig | None = None) -> AgentOrchestrator:
     """Construct bounded specialist agents around one deterministic coordinator."""
     config = config or OrchestratorConfig.from_env()
-    coder = build_agent()
+    engineer = build_engineer()
     reviewer = build_reviewer()
-    coder.max_attempts = config.max_coder_attempts
+    engineer.max_attempts = config.max_coder_attempts
     reviewer.max_attempts = config.max_review_attempts
     return AgentOrchestrator(
         store=OrchestratorStore(config.database_url),
         planner=build_planner(),
-        coder=coder,
+        engineer=engineer,
         reviewer=reviewer,
         verifier=VerificationService(),
         checkpoint=CheckpointService(),

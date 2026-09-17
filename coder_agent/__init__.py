@@ -1,8 +1,9 @@
-"""Persistent repository-scoped Engineering Worker (V1-compatible CoderAgent)."""
+"""Persistent repository-scoped Engineering Worker.
 
-from .agent import CoderAgent
+``CoderAgent`` remains an import-compatible alias for V1 deployments.
+"""
 
-EngineeringAgent = CoderAgent
+from .agent import CoderAgent, EngineeringAgent
 
 __all__ = ["CoderAgent", "EngineeringAgent"]
 

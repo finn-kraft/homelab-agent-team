@@ -37,7 +37,7 @@ change branches, access secrets, or expand the assignment. Prefer small, reviewa
 """
 
 
-class CoderAgent:
+class EngineeringAgent:
     def __init__(self, store: Store, router: Router, worker_id: str,
                  allowed_roots: list[str], max_turns: int = 30, max_attempts: int = 4,
                  max_prompt_chars: int = DEFAULT_PROMPT_CHARS):
@@ -46,8 +46,8 @@ class CoderAgent:
         self.max_prompt_chars = max(1_024, int(max_prompt_chars))
         self.last_prompt_chars = 0
 
-    def run_package(self, package: WorkPackage | Task, step_id: int | None = None,
-                    attempt: int = 0) -> AgentResult:
+    def run_work_package(self, package: WorkPackage | Task, step_id: int | None = None,
+                         attempt: int = 0) -> AgentResult:
         """Run one Work Package using the preserved workspace/tooling loop.
 
         ``Task`` remains the V1-compatible transport while V2 introduces a
@@ -60,6 +60,12 @@ class CoderAgent:
                 raise ValueError("a V2 WorkPackage requires its durable step_id")
             package = package.as_task(step_id, attempt)
         return self.run_task(package)
+
+    # V2's public name is ``run_work_package``. Keep the earlier method name
+    # for callers that adopted the first package transport increment.
+    def run_package(self, package: WorkPackage | Task, step_id: int | None = None,
+                    attempt: int = 0) -> AgentResult:
+        return self.run_work_package(package, step_id, attempt)
 
     @staticmethod
     def _parse_action(text: str) -> dict[str, Any]:
@@ -87,7 +93,7 @@ class CoderAgent:
             result = AgentResult(
                 Status.FAILED,
                 "retry limit reached; return step for replanning",
-                blocker="maximum coder attempts exceeded",
+                blocker="maximum engineering attempts exceeded",
             )
             self.store.update_step(
                 task.step_id,
@@ -102,9 +108,14 @@ class CoderAgent:
             git = GitRepository(runner)
             starting_commit = git.head()
             session_id = None
+            session_baseline: dict[str, Any] = {}
             resume_session = getattr(self.store, "resume_engineering_session", None)
             if resume_session:
                 session_id = resume_session(task.job_id, task.step_id)
+            get_baseline = getattr(self.store, "engineering_baseline", None)
+            if session_id is not None and get_baseline:
+                session_baseline = get_baseline(task.job_id, task.step_id) or {}
+                starting_commit = session_baseline.get("starting_commit") or starting_commit
             start_session = getattr(self.store, "start_engineering_session", None)
             if session_id is None and start_session:
                 session_id = start_session(task.job_id, task.step_id, self.worker_id, starting_commit)
@@ -113,9 +124,15 @@ class CoderAgent:
                 raise RuntimeError(
                     f"expected branch {task.branch!r}, found {current_branch!r}; branch changes require human setup"
                 )
-            initial_changes = set(git.changed_files())
-            self.store.event(task, "started", {"starting_commit": starting_commit,
-                                                "preexisting_changes": sorted(initial_changes)})
+            if "preexisting_changes" in session_baseline:
+                initial_changes = set(session_baseline.get("preexisting_changes") or [])
+            else:
+                initial_changes = set(git.changed_files())
+            self.store.event(task, "resumed" if session_baseline else "started", {
+                "starting_commit": starting_commit,
+                "preexisting_changes": sorted(initial_changes),
+                "session_id": session_id,
+            })
             backend = self.router.choose(task.attempt)
             context = {
                 "task": {
@@ -138,6 +155,7 @@ class CoderAgent:
             verified = False
             previous_observation = ""
             stagnation = 0
+            escalation_level = 0
             for turn in range(self.max_turns):
                 controlled = self._controlled_result(task, last_model)
                 if controlled is not None:
@@ -149,7 +167,15 @@ class CoderAgent:
                         return controlled
                     raise RuntimeError("coder lease is no longer owned")
                 if stagnation >= 3:
-                    backend = self.router.choose(task.attempt + stagnation, True)
+                    escalation_level += 1
+                    first_cloud_attempt = int(getattr(
+                        self.router, "escalate_after", task.attempt + 3
+                    ))
+                    route_attempt = max(
+                        task.attempt + 2 + escalation_level,
+                        first_cloud_attempt + escalation_level - 1,
+                    )
+                    backend = self.router.choose(route_attempt, True)
                     last_model = backend.model
                     stagnation = 0
                 request_messages = bounded_messages(messages, self.max_prompt_chars)
@@ -169,6 +195,22 @@ class CoderAgent:
                     observation = f"Action rejected: {exc}. Choose a valid path relative to the repository root."
                     messages.extend([{"role": "assistant", "content": response.text},
                                      {"role": "user", "content": observation}])
+                run_succeeded = False
+                if action.get("action") == "run":
+                    try:
+                        run_succeeded = json.loads(observation).get("exit_code") == 0
+                    except (TypeError, json.JSONDecodeError, AttributeError):
+                        run_succeeded = False
+                if action.get("action") == "invalid":
+                    progress_classification = "invalid_action"
+                elif run_succeeded:
+                    progress_classification = "verification_progress"
+                elif action.get("action") in {"write", "delete"}:
+                    progress_classification = "repository_change"
+                elif observation != previous_observation and action.get("action") in {"read", "inspect"}:
+                    progress_classification = "inspection_progress"
+                else:
+                    progress_classification = "no_progress"
                 if action["action"] == "run":
                     try:
                         verified = verified or json.loads(observation)["exit_code"] == 0
@@ -177,23 +219,25 @@ class CoderAgent:
                 self.store.event(task, "agent_action", {
                     "turn": turn + 1, "model": response.model,
                     "action": action.get("action"), "observation": self._redact(observation),
-                    "progress_classification": (
-                        "invalid_action" if action.get("action") == "invalid" else
-                        "verification_progress" if action.get("action") == "run" and verified else
-                        "repository_change" if action.get("action") in {"write", "delete"} else
-                        "no_progress"
-                    ),
+                    "progress_classification": progress_classification,
                 })
                 if session_id is not None:
                     record_action = getattr(self.store, "record_engineering_action", None)
                     if record_action:
                         record_action(session_id, turn + 1, action.get("action", "invalid"),
                                       self._redact(observation), response.model,
-                                      "invalid_action" if action.get("action") == "invalid" else None)
+                                      progress_classification)
                 if observation == previous_observation or action.get("action") == "invalid":
                     stagnation += 1
                 else:
                     stagnation = 0
+                    if escalation_level:
+                        # A resolved difficult turn returns routine work to the
+                        # local model, preserving cloud budget for the next
+                        # genuinely stalled problem.
+                        backend = self.router.choose(task.attempt, False)
+                        last_model = backend.model
+                        escalation_level = 0
                 previous_observation = observation
                 if action["action"] == "blocked":
                     result = AgentResult(Status.BLOCKED, "implementation blocked",
@@ -222,10 +266,6 @@ class CoderAgent:
                             coder_response={"summary": result.summary,
                                             "verification": action.get("verification", [])},
                         )
-                        if session_id is not None:
-                            complete_session = getattr(self.store, "complete_engineering_session", None)
-                            if complete_session:
-                                complete_session(session_id)
                         return result
                 messages.extend([{"role": "assistant", "content": response.text},
                                  {"role": "user", "content": observation}])
@@ -348,3 +388,7 @@ class CoderAgent:
             if any(pattern.search(content) for pattern in secret_patterns):
                 flagged.append(relative)
         return sorted(flagged)
+
+
+# Backwards-compatible V1 import. New code should use EngineeringAgent.
+CoderAgent = EngineeringAgent

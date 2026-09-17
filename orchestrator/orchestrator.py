@@ -7,6 +7,7 @@ LLM output to decide a transition; it advances exclusively from durable state
 such as a reviewer verdict, a command exit status, and a Git checkpoint result.
 """
 
+import json
 import logging
 import subprocess
 import threading
@@ -17,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+
+from coder_agent.models import WorkPackage
 
 from .config import OrchestratorConfig
 from .worktrees import WorktreeManager
@@ -41,7 +44,8 @@ class AgentOrchestrator:
         *,
         store,
         planner,
-        coder,
+        coder=None,
+        engineer=None,
         reviewer,
         verifier,
         checkpoint,
@@ -49,7 +53,11 @@ class AgentOrchestrator:
     ):
         self.store = store
         self.planner = planner
-        self.coder = coder
+        self.engineer = engineer or coder
+        if self.engineer is None:
+            raise ValueError("an EngineeringAgent (or legacy coder) is required")
+        # Keep the old attribute for integrations that inspect the coordinator.
+        self.coder = self.engineer
         self.reviewer = reviewer
         self.verifier = verifier
         self.checkpoint = checkpoint
@@ -130,7 +138,7 @@ class AgentOrchestrator:
             return self._review(step_id)
 
         task = self.store.claim_coding(
-            self.coder.worker_id,
+            self.engineer.worker_id,
             self.config.lease_seconds,
             self.config.repository_lock_seconds,
         )
@@ -146,18 +154,23 @@ class AgentOrchestrator:
         # The durable claim is owned by the Coder worker identity, not the
         # Orchestrator process identity.  These are commonly different under
         # systemd and must match exactly for release.
-        owner = f"{self.coder.worker_id}:coder:{task.step_id}"
+        owner = f"{self.engineer.worker_id}:coder:{task.step_id}"
         started = time.monotonic()
         phase_status = "crashed"
         phase_detail = ""
         try:
-            self._clear_route(self.coder)
+            self._clear_route(self.engineer)
             with self._lease_heartbeat(
-                task.repository, owner, task.step_id, "coder", self.coder.worker_id
+                task.repository, owner, task.step_id, "coder", self.engineer.worker_id
             ):
-                result = self.coder.run_task(task)
-            status = self.store.finish_coding_handoff(task.step_id, self.coder.worker_id)
-            self._record_route(self.coder, task.job_id, task.step_id, task.attempt)
+                package = self._work_package_for_step(task)
+                run_package = getattr(self.engineer, "run_work_package", None)
+                if package is not None and run_package is not None:
+                    result = run_package(package, step_id=task.step_id, attempt=task.attempt)
+                else:
+                    result = self.engineer.run_task(task)
+            status = self.store.finish_coding_handoff(task.step_id, self.engineer.worker_id)
+            self._record_route(self.engineer, task.job_id, task.step_id, task.attempt)
             detail = getattr(result, "summary", "")
             phase_status = str(getattr(result, "status", status))
             phase_detail = detail
@@ -180,7 +193,7 @@ class AgentOrchestrator:
                 )
             return AdvanceResult("coding_crashed", task.job_id, task.step_id, str(exc))
         finally:
-            self._record_phase_metric(self.coder, "coding", started, phase_status,
+            self._record_phase_metric(self.engineer, "engineering", started, phase_status,
                                       task.job_id, task.step_id, phase_detail)
             self.store.release_repository_lock(task.repository, owner)
 
@@ -297,6 +310,10 @@ class AgentOrchestrator:
             result = SimpleNamespace(success=False, retryable=False, error=f"checkpoint service failed: {exc}")
         try:
             next_state = self.store.record_checkpoint(work, self.config.worker_id, result)
+            if next_state == "complete":
+                complete_session = getattr(self.store, "complete_engineering_session_for_step", None)
+                if complete_session:
+                    complete_session(work["id"])
             sync_package = getattr(self.store, "sync_package_for_step", None)
             if sync_package and next_state == "complete":
                 sync_package(work["id"], "complete", getattr(result, "commit_sha", None))
@@ -402,6 +419,37 @@ class AgentOrchestrator:
             fallback=bool(getattr(route, "fallback", False)),
         )
 
+    def _work_package_for_step(self, task) -> WorkPackage | None:
+        """Load the V2 package linked to a claimed V1 step, when present."""
+        getter = getattr(self.store, "work_package_for_step", None)
+        if getter is None:
+            return None
+        try:
+            row = getter(task.step_id)
+        except Exception:
+            # Work-package tables are additive. A V1 database can continue
+            # using the durable Step transport until its migration is applied.
+            LOG.debug("v2_work_package_lookup_unavailable step_id=%s", task.step_id,
+                      exc_info=True)
+            return None
+        if not row:
+            return None
+        return WorkPackage(
+            id=int(row["id"]),
+            job_id=int(row["job_id"] or task.job_id),
+            # The linked package keeps the source repository, while the
+            # claimed Step may point at its isolated Engineering worktree.
+            # Always execute against the Step's current repository/branch.
+            repository=str(task.repository),
+            branch=str(task.branch),
+            objective=str(row["objective"] or task.objective),
+            acceptance_criteria=self._list_value(row.get("acceptance_criteria")) or list(task.acceptance_criteria),
+            constraints=self._list_value(row.get("constraints")) or list(task.constraints),
+            roadmap_reference=row.get("roadmap_reference"),
+            dependencies=[int(value) for value in self._list_value(row.get("dependencies"))],
+            reviewer_feedback=task.reviewer_feedback,
+        )
+
     def _record_phase_metric(self, agent: Any, phase: str, started: float,
                              status: str, job_id: int | None = None,
                              step_id: int | None = None, detail: str = "") -> None:
@@ -500,6 +548,12 @@ class AgentOrchestrator:
             return [str(item) for item in value]
         if isinstance(value, tuple):
             return [str(item) for item in value]
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError):
+                return []
+            return AgentOrchestrator._list_value(parsed)
         return []
 
     @staticmethod

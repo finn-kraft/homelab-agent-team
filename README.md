@@ -14,7 +14,7 @@ specialist command between steps.
 | Component | Owns | Does not own |
 | --- | --- | --- |
 | Planner | What safe, concrete step happens next; semantic goal completion | Editing, committing, scheduling |
-| Coder | Implementing one assigned step and recording commands/diff | Approval, commit, goal completion |
+| EngineeringAgent (legacy Coder alias) | Inspecting a Work Package, implementing, testing, debugging, and recording commands/diff | Approval, commit, goal completion |
 | Reviewer | Independent acceptance-criteria review | Silent fixes, merge, goal completion |
 | Orchestrator | Deterministic next-state selection, leases, final verification, checkpoint hand-off | LLM planning or code reasoning |
 | Routing Agent | Model/compute policy | Workflow state transitions |
@@ -25,8 +25,8 @@ The Orchestrator is intentionally not another reasoning agent. Its normal
 transition is deterministic:
 
 ```text
-Planner → queued step → Coder → Reviewer
-                               ├─ changes requested → same Coder step
+Planner → queued Work Package → EngineeringAgent → Reviewer
+                               ├─ changes requested → same EngineeringAgent step
                                └─ approved → final verification → checkpoint
                                                         ↓
                                                      Planner again
@@ -40,13 +40,13 @@ roadmap item or mark the overall goal complete with evidence.
 
 - A foreground `agent-orchestrator run` service and bounded
   `agent-orchestrator once` command.
-- Reuse of the existing Planner, Coder, Reviewer, PostgreSQL `jobs`, `steps`,
+- Reuse of the existing Planner, EngineeringAgent, Reviewer, PostgreSQL `jobs`, `steps`,
   `events`, `reviews`, `review_issues`, and `command_runs` contracts.
 - Additive PostgreSQL migration for repository locks, verification runs,
   checkpoint recovery markers, model-routing audit records, and orchestration
   leases. No second orchestration database is created.
 - Same-step revision cycles: a reviewer or verifier rejection returns the
-  existing `step_id` to Coder rather than creating a duplicate Planner step.
+  existing `step_id` to EngineeringAgent rather than creating a duplicate Planner step.
 - Final deterministic verification after reviewer approval and before a
   commit. It runs `git diff --check`, scans candidate files for likely
   secrets, and runs only explicit allowlisted project verification commands.
@@ -77,7 +77,7 @@ operational validation steps, not silently claimed by this source package.
 
 - The dedicated worker branch is required. `main` and `master` are protected
   by default and never receive autonomous commits.
-- The Coder command policy rejects `git add`, `git commit`, `git push`, branch
+- The EngineeringAgent command policy rejects `git add`, `git commit`, `git push`, branch
   changes, history rewrites, and destructive Git cleanup. Checkpointing has
   separate narrow authority after review and verification.
 - The checkpoint stages only the reviewer-approved files and refuses unknown,
@@ -171,7 +171,7 @@ agent-orchestrator run
 
 `run` remains in the foreground, writes structured stdout/stderr logs, sleeps
 when idle (default ten seconds), and handles `SIGTERM` at a safe boundary. Do
-not simultaneously run `planner-agent run`, `coder-agent run`, or
+not simultaneously run `planner-agent run`, `engineering-agent run`, or
 `reviewer-agent run` against the same jobs; those legacy independent workers
 can bypass coordinator timing.
 
@@ -283,7 +283,7 @@ See [`.env.example`](.env.example). The principal values are:
 | `INFERENCE_ESCALATE_AFTER` | First normal cloud-eligible attempt (default `4`) |
 | `OLLAMA_TIMEOUT_SECONDS` / `OLLAMA_RETRIES` | Local request timeout and retry budget (defaults `60` / `0`) |
 | `OPENROUTER_TIMEOUT_SECONDS` / `OPENROUTER_RETRIES` | Cloud request timeout and retry budget (defaults `90` / `1`) |
-| `CODER_MAX_CONTEXT_CHARS`, `PLANNER_MAX_CONTEXT_CHARS`, `REVIEWER_MAX_CONTEXT_CHARS` | Hard prompt character budgets |
+| `ENGINEERING_MAX_CONTEXT_CHARS`, `PLANNER_MAX_CONTEXT_CHARS`, `REVIEWER_MAX_CONTEXT_CHARS` | Hard prompt character budgets |
 | `PLANNER_PACKAGE_STEPS` | Maximum ordered steps emitted before replanning (default `3`) |
 | `PROTECTED_BRANCHES` | Comma-separated autonomous-commit deny list |
 | `AUTO_COMMIT` | Enables reviewer-approved local checkpoints |
