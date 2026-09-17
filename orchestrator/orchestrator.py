@@ -97,6 +97,19 @@ class AgentOrchestrator:
     def once(self) -> AdvanceResult:
         """Perform one deterministic advancement, suitable for tests and cron-like use."""
         self._populate_mission_queue()
+        claim_engineering = getattr(self.store, "claim_engineering_package", None)
+        if claim_engineering:
+            try:
+                claimed = claim_engineering(
+                    self.engineer.worker_id,
+                    self.config.lease_seconds,
+                    self.config.repository_lock_seconds,
+                    WorktreeManager(os.getenv("ENGINEERING_WORKTREE_ROOT", "/tmp/agent-worktrees")),
+                )
+                if claimed:
+                    return self._code(claimed["task"], package=claimed.get("package"))
+            except Exception:
+                LOG.debug("v2_native_package_claim_unavailable", exc_info=True)
         # V2 packages are admitted into the existing durable Step pipeline.
         # Keep this additive and safe for databases that have not migrated yet.
         claim_package = getattr(self.store, "claim_work_package", None)
@@ -172,7 +185,7 @@ class AgentOrchestrator:
     # ------------------------------------------------------------------
     # State machine actions
     # ------------------------------------------------------------------
-    def _code(self, task) -> AdvanceResult:
+    def _code(self, task, package: dict[str, Any] | None = None) -> AdvanceResult:
         # The durable claim is owned by the Coder worker identity, not the
         # Orchestrator process identity.  These are commonly different under
         # systemd and must match exactly for release.
@@ -185,7 +198,7 @@ class AgentOrchestrator:
             with self._lease_heartbeat(
                 task.repository, owner, task.step_id, "coder", self.engineer.worker_id
             ):
-                package = self._work_package_for_step(task)
+                package = package or self._work_package_for_step(task)
                 run_package = getattr(self.engineer, "run_work_package", None)
                 if package is not None and run_package is not None:
                     result = run_package(package, step_id=task.step_id, attempt=task.attempt)

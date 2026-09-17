@@ -598,6 +598,56 @@ class OrchestratorStore:
                 })
             return package
 
+    def claim_coding_for_step(self, step_id: int, worker_id: str, lease_seconds: int,
+                              repository_lock_seconds: int) -> Task | None:
+        """Claim the exact Engineering step admitted by a Work Package."""
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT s.* FROM steps s JOIN jobs j ON j.id=s.job_id
+                WHERE s.id=%s AND j.status='running' AND s.status IN ('queued','changes_requested')
+                  AND (s.lease_expires_at IS NULL OR s.lease_expires_at < now())
+                FOR UPDATE OF s,j SKIP LOCKED""", (step_id,)
+            ).fetchone()
+            if not row:
+                return None
+            row = dict(row)
+            owner = f"{worker_id}:coder:{row['id']}"
+            if not self._acquire_repository_lock(connection, row["repository"], owner, repository_lock_seconds):
+                return None
+            connection.execute("""UPDATE steps SET status='running',worker_id=%s,
+                lease_expires_at=now()+(%s*interval '1 second'),attempt_count=attempt_count+1,
+                updated_at=now(),started_at=COALESCE(started_at,now()) WHERE id=%s""",
+                (worker_id, lease_seconds, row["id"]))
+            attempt = int(row["attempt_count"]) + 1
+            self._event(connection, row["job_id"], row["id"], "coding_started", {
+                "worker_id": worker_id, "attempt": attempt, "package_step": True,
+                "repository_lock_owner": owner,
+            })
+            return Task(row["job_id"], row["id"], row["repository"], row["branch"],
+                        row["objective"], self._json_list(row["acceptance_criteria"]),
+                        self._json_list(row["constraints"]), Status.RUNNING, attempt,
+                        row.get("reviewer_feedback"))
+
+    def claim_engineering_package(self, worker_id: str, lease_seconds: int,
+                                  repository_lock_seconds: int, worktree_manager=None) -> dict[str, Any] | None:
+        """Admit and claim one package directly for Engineering in one pass.
+
+        The linked Step remains the compatibility transport for Reviewer and
+        Verification, but no unrelated queued step can steal this package.
+        """
+        package = self.claim_work_package(worker_id, lease_seconds, worktree_manager)
+        if not package or not package.get("step_id"):
+            return None
+        task = self.claim_coding_for_step(package["step_id"], worker_id,
+                                          lease_seconds, repository_lock_seconds)
+        if task is None:
+            with self.connect() as connection:
+                connection.execute("""UPDATE work_packages SET status='ready',worker_id=NULL,
+                    lease_expires_at=NULL,updated_at=now() WHERE id=%s AND worker_id=%s""",
+                                   (package["id"], worker_id))
+            return None
+        return {"package": package, "task": task}
+
     def resume_engineering_session(self, job_id: int, step_id: int | None = None) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute("""SELECT * FROM engineering_sessions WHERE job_id=%s
