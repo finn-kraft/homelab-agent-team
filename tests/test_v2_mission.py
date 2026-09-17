@@ -94,3 +94,42 @@ def test_integration_manager_refuses_protected_branch(tmp_path):
         IntegrationManager(Store()).integrate(
             {"id": 1, "mission_id": 1, "branch": "agents/x", "resulting_commit": "abc1234"}, tmp_path
         )
+
+
+def test_integration_conflict_creates_human_escalation(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "mission"], cwd=repo, check=True)
+    (repo / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                    "commit", "-qm", "base"], cwd=repo, check=True)
+    git(repo, "checkout", "-qb", "agents/conflict")
+    (repo / "README.md").write_text("package\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                    "commit", "-qm", "package"], cwd=repo, check=True)
+    feature = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "mission")
+    (repo / "README.md").write_text("mission\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                    "commit", "-qm", "mission"], cwd=repo, check=True)
+
+    class Store:
+        def __init__(self): self.records = []; self.human = []; self.mission_status = None
+        def mission_detail(self, _id): return {"branch": "mission"}
+        def upsert_integration(self, **kwargs): self.records.append(kwargs)
+        def enqueue_human_request(self, **kwargs): self.human.append(kwargs)
+        def update_mission_status(self, _id, status): self.mission_status = status
+
+    store = Store()
+    result = IntegrationManager(store).integrate(
+        {"id": 2, "mission_id": 1, "job_id": 9, "step_id": 3,
+         "status": "complete", "branch": "agents/conflict", "resulting_commit": feature}, repo
+    )
+    assert result["status"] == "conflict"
+    assert store.records[-1]["status"] == "conflict"
+    assert store.human[0]["kind"] == "integration-conflict"
+    assert store.human[0]["job_id"] == 9
+    assert store.mission_status == "blocked"

@@ -17,7 +17,7 @@ from typing import Any, Iterable
 from engineering_agent.models import Status, Task
 
 
-MIGRATION_VERSION = "orchestrator-0010"
+MIGRATION_VERSION = "orchestrator-0011"
 
 # Keep this list deliberately small and authoritative. Health checks should
 # answer whether the workflow can safely run, not whether every optional
@@ -41,6 +41,7 @@ REQUIRED_TABLE_COLUMNS = {
     "engineering_actions": {"session_id", "sequence", "action"},
     "worker_heartbeats": {"worker_id", "component", "heartbeat_at"},
     "phase_metrics": {"phase", "duration_seconds", "prompt_chars", "prompt_tokens", "context_sha256"},
+    "control_operations": {"operation_id", "job_id", "action", "status", "created_at", "updated_at"},
 }
 
 MIGRATION_SQL = """
@@ -235,6 +236,22 @@ ALTER TABLE phase_metrics ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER NOT NUL
 ALTER TABLE phase_metrics ADD COLUMN IF NOT EXISTS context_sha256 TEXT;
 CREATE INDEX IF NOT EXISTS phase_metrics_job_idx
   ON phase_metrics (job_id, completed_at DESC);
+
+CREATE TABLE IF NOT EXISTS control_operations (
+  operation_id TEXT PRIMARY KEY,
+  job_id BIGINT REFERENCES jobs(id) ON DELETE SET NULL,
+  action TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'submitted',
+  requested_by TEXT NOT NULL DEFAULT 'control-center',
+  detail JSONB NOT NULL DEFAULT '{}',
+  error TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at TIMESTAMPTZ,
+  CHECK (status IN ('submitted','accepted','applied','failed'))
+);
+CREATE INDEX IF NOT EXISTS control_operations_job_idx
+  ON control_operations (job_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS human_queue (
   id BIGSERIAL PRIMARY KEY,
@@ -901,6 +918,120 @@ class OrchestratorStore:
                 AND status IN ('failed','blocked')""", (job_id,))
             connection.execute("UPDATE jobs SET status='running',current_phase='engineering',updated_at=now() WHERE id=%s", (job_id,))
             self._event(connection, job_id, None, "job_retry_requested", {"previous_status": row["status"]})
+
+    def recover_job(self, job_id: int) -> dict[str, Any]:
+        """Release expired non-mutating leases for one operator-selected job.
+
+        Engineering leases with an in-flight mutation are deliberately not
+        requeued here; the coordinator still performs its clean-worktree check
+        before deciding whether that edit is safe to replay.
+        """
+        with self.connect() as connection:
+            job = connection.execute(
+                "SELECT id,status FROM jobs WHERE id=%s FOR UPDATE", (job_id,)
+            ).fetchone()
+            if not job:
+                raise KeyError(f"job {job_id} does not exist")
+            recovered = {"planning": 0, "review": 0, "orchestration": 0,
+                         "packages": 0, "engineering_pending_review": 0}
+            result = connection.execute(
+                """UPDATE jobs SET status='running',planner_worker_id=NULL,
+                   planner_lease_expires_at=NULL,updated_at=now()
+                   WHERE id=%s AND status='planning'
+                     AND planner_lease_expires_at IS NOT NULL
+                     AND planner_lease_expires_at < now()""", (job_id,)
+            )
+            recovered["planning"] = result.rowcount
+            result = connection.execute(
+                """UPDATE steps SET reviewer_worker_id=NULL,
+                   review_lease_expires_at=NULL,updated_at=now()
+                   WHERE job_id=%s AND status='review'
+                     AND review_lease_expires_at IS NOT NULL
+                     AND review_lease_expires_at < now()""", (job_id,)
+            )
+            recovered["review"] = result.rowcount
+            result = connection.execute(
+                """UPDATE steps SET orchestrator_worker_id=NULL,
+                   orchestrator_lease_expires_at=NULL,updated_at=now()
+                   WHERE job_id=%s AND status IN ('verification','checkpoint')
+                     AND orchestrator_lease_expires_at IS NOT NULL
+                     AND orchestrator_lease_expires_at < now()""", (job_id,)
+            )
+            recovered["orchestration"] = result.rowcount
+            result = connection.execute(
+                """SELECT count(*) AS n FROM steps
+                   WHERE job_id=%s AND status='running'
+                     AND lease_expires_at IS NOT NULL AND lease_expires_at < now()""",
+                (job_id,),
+            ).fetchone()
+            recovered["engineering_pending_review"] = int(result["n"] or 0)
+            result = connection.execute(
+                """UPDATE work_packages p SET status='ready',worker_id=NULL,
+                   lease_expires_at=NULL,updated_at=now()
+                   FROM steps s WHERE p.step_id=s.id AND p.job_id=%s
+                     AND p.status='engineering'
+                     AND s.status IN ('queued','changes_requested')
+                     AND p.lease_expires_at IS NOT NULL
+                     AND p.lease_expires_at < now()""", (job_id,)
+            )
+            recovered["packages"] = result.rowcount
+            if any(recovered.values()):
+                self._event(connection, job_id, None, "operator_leases_recovered", recovered)
+            return recovered
+
+    def rerun_verification(self, job_id: int, step_id: int | None = None) -> int:
+        """Explicitly send a candidate back through deterministic verification."""
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT s.*,j.status AS job_status FROM steps s JOIN jobs j ON j.id=s.job_id
+                   WHERE s.job_id=%s AND (%s IS NULL OR s.id=%s)
+                     AND s.status IN ('changes_requested','checkpoint','verification')
+                   ORDER BY s.updated_at DESC,s.id DESC LIMIT 1 FOR UPDATE OF s,j""",
+                (job_id, step_id, step_id),
+            ).fetchone()
+            if not row:
+                raise ValueError("job has no candidate that can be verified")
+            row = dict(row)
+            connection.execute(
+                """UPDATE steps SET status='verification',blocker=NULL,
+                   orchestrator_worker_id=NULL,orchestrator_lease_expires_at=NULL,updated_at=now()
+                   WHERE id=%s""", (row["id"],)
+            )
+            connection.execute(
+                """UPDATE jobs SET status='verifying',current_phase='verification',
+                   current_step=%s,updated_at=now() WHERE id=%s""",
+                (row["id"], job_id),
+            )
+            connection.execute(
+                """UPDATE work_packages SET status='verifying',worker_id=NULL,
+                   lease_expires_at=NULL,updated_at=now() WHERE step_id=%s""", (row["id"],)
+            )
+            self._event(connection, job_id, row["id"], "verification_rerun_requested", {})
+            return int(row["id"])
+
+    def refresh_planning(self, job_id: int) -> None:
+        """Request a fresh planner pass when no implementation is in flight."""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT id,status FROM jobs WHERE id=%s FOR UPDATE", (job_id,)
+            ).fetchone()
+            if not row:
+                raise KeyError(f"job {job_id} does not exist")
+            active = connection.execute(
+                """SELECT 1 FROM steps WHERE job_id=%s AND status IN
+                   ('queued','running','review','changes_requested','verification','checkpoint')
+                   LIMIT 1""", (job_id,)
+            ).fetchone()
+            if active:
+                raise ValueError("cannot refresh planning while an implementation step is active")
+            if row["status"] in {"complete", "cancelled"}:
+                raise ValueError(f"cannot refresh planning for a {row['status']} job")
+            connection.execute(
+                """UPDATE jobs SET status='running',current_phase='planning',current_step=NULL,
+                   planner_worker_id=NULL,planner_lease_expires_at=NULL,updated_at=now()
+                   WHERE id=%s""", (job_id,)
+            )
+            self._event(connection, job_id, None, "planning_refresh_requested", {})
 
     def start_engineering_session(self, job_id: int, step_id: int | None,
                                   worker_id: str, starting_commit: str | None = None) -> int:
@@ -1618,6 +1749,64 @@ class OrchestratorStore:
     def block_abandoned_coding(self, step_id: int, evidence: str) -> None:
         """V1 compatibility alias for :meth:`block_abandoned_engineering`."""
         self.block_abandoned_engineering(step_id, evidence)
+
+    # ------------------------------------------------------------------
+    # Operator operation tracking
+    # ------------------------------------------------------------------
+    def begin_control_operation(self, job_id: int | None, action: str,
+                                requested_by: str = "control-center") -> str:
+        """Create an auditable operation before applying a control action."""
+        operation_id = str(uuid.uuid4())
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO control_operations
+                   (operation_id,job_id,action,status,requested_by)
+                   VALUES(%s,%s,%s,'submitted',%s)""",
+                (operation_id, job_id, str(action), str(requested_by)[:200]),
+            )
+        return operation_id
+
+    def update_control_operation(self, operation_id: str, status: str,
+                                 *, detail: dict[str, Any] | None = None,
+                                 error: str | None = None) -> None:
+        if status not in {"submitted", "accepted", "applied", "failed"}:
+            raise ValueError("invalid control operation status")
+        completed = "now()" if status in {"applied", "failed"} else "NULL"
+        with self.connect() as connection:
+            result = connection.execute(
+                f"""UPDATE control_operations SET status=%s,
+                    detail=COALESCE(%s::jsonb,detail),error=%s,updated_at=now(),
+                    completed_at={completed} WHERE operation_id=%s""",
+                (status, json.dumps(detail, default=str) if detail is not None else None,
+                 str(error)[:30_000] if error else None, operation_id),
+            )
+            if result.rowcount != 1:
+                raise KeyError(operation_id)
+
+    def control_operation(self, operation_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM control_operations WHERE operation_id=%s",
+                (operation_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_control_operations(self, job_id: int | None = None,
+                                limit: int = 100) -> list[dict[str, Any]]:
+        limit = max(1, min(500, int(limit)))
+        with self.connect() as connection:
+            if job_id is None:
+                rows = connection.execute(
+                    "SELECT * FROM control_operations ORDER BY created_at DESC LIMIT %s",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """SELECT * FROM control_operations WHERE job_id=%s
+                       ORDER BY created_at DESC LIMIT %s""",
+                    (job_id, limit),
+                ).fetchall()
+            return [dict(row) for row in rows]
 
     def control(self, job_id: int, action: str) -> None:
         mapping = {"pause": "paused", "resume": "running", "cancel": "cancelled"}

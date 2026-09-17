@@ -43,6 +43,7 @@ async function api(path, options = {}) {
     try {
       const payload = await response.json();
       message = payload.detail || payload.error || message;
+      if (payload.operation_id) message += ` (operation ${payload.operation_id})`;
     } catch (_) { /* no JSON body */ }
     throw new Error(message.replaceAll('_', ' '));
   }
@@ -246,10 +247,14 @@ function render() {
   if (state.view === 'dashboard') renderDashboard();
   if (state.view === 'projects') renderProjects();
   if (state.view === 'agents') renderAgents();
-  if (state.view === 'jobs') $('#jobsView').innerHTML = `<div class="section-head"><div class="section-title"><h2>All jobs</h2><small>Running, waiting, blocked, and completed work</small></div></div>${jobsTable(state.overview.jobs || [])}`;
+  if (state.view === 'jobs') renderJobs();
   if (state.view === 'missions') renderMissions();
   if (state.view === 'events') renderEventView();
   if (state.view === 'job' && state.jobId) renderJob(state.jobId);
+}
+
+function renderJobs() {
+  $('#jobsView').innerHTML = `<div class="section-head"><div class="section-title"><h2>All jobs</h2><small>Running, waiting, blocked, and completed work</small></div><button data-action="worktree-cleanup">Clean up worktrees</button></div>${jobsTable(state.overview.jobs || [])}`;
 }
 
 function metricCard(label, value, detail, iconName, stateName = '') {
@@ -455,8 +460,16 @@ function jobControls(job) {
   const resumable = ['paused', 'blocked', 'failed'].includes(job.status);
   const cancellable = !['complete', 'cancelled'].includes(job.status);
   const removable = job.status !== 'cancelled';
+  const canRetry = ['blocked', 'failed'].includes(job.status);
+  const canRefreshPlanning = !['complete', 'cancelled'].includes(job.status);
+  const canRerunVerification = ['verifying', 'verification', 'changes_requested'].includes(job.status) || job.current_phase === 'verification';
   const id = Number(job.id);
-  return `${active ? `<button type="button" data-action="job-action" data-job-action="pause" data-job-id="${id}">Pause</button>` : ''}${resumable ? `<button type="button" class="primary" data-action="job-action" data-job-action="resume" data-job-id="${id}">Resume</button>` : ''}${removable ? `<button type="button" class="danger" data-action="job-action" data-job-action="remove" data-job-id="${id}">Remove from queue</button>` : ''}${cancellable ? `<button type="button" class="danger" data-action="job-action" data-job-action="cancel" data-job-id="${id}">Cancel</button>` : ''}`;
+  return `${active ? `<button type="button" data-action="job-action" data-job-action="pause" data-job-id="${id}">Pause</button>` : ''}${resumable ? `<button type="button" class="primary" data-action="job-action" data-job-action="resume" data-job-id="${id}">Resume</button>` : ''}${canRetry ? `<button type="button" class="primary" data-action="job-action" data-job-action="retry" data-job-id="${id}">Retry job</button>` : ''}${canRerunVerification ? `<button type="button" data-action="job-action" data-job-action="rerun-verification" data-job-id="${id}">Rerun verification</button>` : ''}${active ? `<button type="button" data-action="job-action" data-job-action="recover-lease" data-job-id="${id}">Recover lease</button>` : ''}${canRefreshPlanning ? `<button type="button" data-action="job-action" data-job-action="refresh-planning" data-job-id="${id}">Refresh planning</button>` : ''}${removable ? `<button type="button" class="danger" data-action="job-action" data-job-action="remove" data-job-id="${id}">Remove from queue</button>` : ''}${cancellable ? `<button type="button" class="danger" data-action="job-action" data-job-action="cancel" data-job-id="${id}">Cancel</button>` : ''}`;
+}
+
+function operationsPanel(operations) {
+  if (!operations?.length) return '';
+  return `<div class="section-head"><div class="section-title"><h2>Operator actions</h2><small>Durable control requests and their outcomes</small></div></div><div class="card operation-list">${operations.slice(0, 12).map(operation => `<div class="operation-row"><span class="code">${esc(String(operation.operation_id || '').slice(0, 8))}</span>${badge(operation.action)}${badge(operation.status)}<small>${esc(age(operation.created_at))}${operation.error ? ` · ${esc(operation.error)}` : ''}</small></div>`).join('')}</div>`;
 }
 
 async function renderJob(id) {
@@ -479,6 +492,7 @@ async function renderJob(id) {
       ${detail.needs_attention ? attentionCard(id, detail.needs_attention) : ''}
       <article class="card job-hero"><div class="section-head tight"><div><span class="kicker">JOB #${Number(job.id)}</span><h2>${esc(job.goal)}</h2><span>${badge(job.status)} <span class="muted">· ${esc(projectFor(job.repository)?.name || job.repository)} · ${esc(job.branch)}</span></span></div><div class="job-actions">${jobControls(job)}</div></div><div class="job-flow"><div class="flow">${stages.map((item, index) => `${index ? '<span class="arrow">›</span>' : ''}<span class="stage ${item === stage ? 'active' : ''} ${index < activeIndex || job.status === 'complete' ? 'done' : ''}"><i>${index + 1}</i>${stageNames[item]}</span>${item === 'reviewer' && current?.status === 'changes_requested' ? '<span class="loop">↩ revision</span>' : ''}`).join('')}</div></div></article>
       ${current ? stepCard(current) : ''}
+      ${operationsPanel(detail.operations)}
       <div class="section-head"><div class="section-title"><h2>Completed steps</h2><small>Durable checkpoints already accepted</small></div><span>${detail.steps.filter(step => step.status === 'complete').length} complete</span></div>
       <div class="card timeline">${detail.steps.filter(step => step.status === 'complete').map(stepTimeline).join('') || '<div class="empty"><div><strong>No completed steps yet</strong>The first checkpoint will appear here.</div></div>'}</div>`;
     if (activeHumanAnswer) {
@@ -503,7 +517,9 @@ function stepCard(step) {
   const route = step.model_routes?.at(-1);
   const phase = step.phase_metrics?.at(-1);
   const issues = (step.review_issues || []).filter(issue => issue.status === 'open');
-  return `<div class="section-head"><div class="section-title"><h2>Current step</h2><small>Live implementation and quality evidence</small></div>${badge(step.status)}</div><div class="step-summary"><article class="card"><span class="kicker">OBJECTIVE</span><h3>${esc(step.title)}</h3><p>${esc(step.objective)}</p><h4>Acceptance criteria</h4><ul class="criteria">${(step.acceptance_criteria || []).map(item => `<li>${esc(item)}</li>`).join('') || '<li>No criteria recorded</li>'}</ul><h4>Changed files</h4><div class="chips">${(step.files_changed || []).map(item => `<span class="chip">${esc(item)}</span>`).join('') || '<span class="muted">No changed files recorded</span>'}</div>${issues.length ? `<h4>Reviewer issues</h4><ul class="criteria">${issues.map(issue => `<li><strong>${esc(issue.severity)}</strong> · ${esc(issue.problem)}</li>`).join('')}</ul>` : ''}</article><article class="card"><span class="kicker">EXECUTION EVIDENCE</span><div class="facts"><div class="fact"><span>Attempt</span><strong>${Number(step.attempt_count || 0)}</strong></div><div class="fact"><span>Elapsed</span><strong>${age(step.started_at)}</strong></div><div class="fact"><span>Model route</span><strong>${esc(route?.model || step.model_used || '—')} · ${esc(route?.provider || '—')}</strong></div><div class="fact"><span>Reviewer</span>${badge(review?.verdict || 'waiting')}</div><div class="fact"><span>Verification</span>${badge(verification?.status || 'waiting')}</div><div class="fact"><span>Commands / tests</span><strong>${(step.commands || []).length}</strong></div><div class="fact"><span>Last phase</span><strong>${esc(phase ? `${phase.phase} · ${Number(phase.duration_seconds || 0).toFixed(1)}s` : '—')}</strong></div><div class="fact"><span>Prompt size</span><strong>${phase ? `${Number(phase.prompt_chars || 0).toLocaleString()} chars` : '—'}</strong></div><div class="fact"><span>Resulting commit</span><span class="code">${esc((step.resulting_commit || '—').slice(0, 12))}</span></div></div></article></div>`;
+  const stale = step.stale_warning ? `<p class="stale-warning">${icon('alert')}${esc(step.stale_warning)}</p>` : '';
+  const command = Array.isArray(step.commands?.at(-1)?.argv) ? step.commands.at(-1).argv.join(' ') : '';
+  return `<div class="section-head"><div class="section-title"><h2>Current step</h2><small>Live implementation and quality evidence</small></div>${badge(step.status)}</div>${stale}<div class="step-summary"><article class="card"><span class="kicker">OBJECTIVE</span><h3>${esc(step.title)}</h3><p>${esc(step.objective)}</p><h4>Acceptance criteria</h4><ul class="criteria">${(step.acceptance_criteria || []).map(item => `<li>${esc(item)}</li>`).join('') || '<li>No criteria recorded</li>'}</ul><h4>Changed files</h4><div class="chips">${(step.files_changed || []).map(item => `<span class="chip">${esc(item)}</span>`).join('') || '<span class="muted">No changed files recorded</span>'}</div>${issues.length ? `<h4>Reviewer issues</h4><ul class="criteria">${issues.map(issue => `<li><strong>${esc(issue.severity)}</strong> · ${esc(issue.problem)}</li>`).join('')}</ul>` : ''}</article><article class="card"><span class="kicker">EXECUTION EVIDENCE</span><div class="facts"><div class="fact"><span>Attempt</span><strong>${Number(step.attempt_count || 0)}</strong></div><div class="fact"><span>Elapsed</span><strong>${age(step.started_at)}</strong></div><div class="fact"><span>Lease owner</span><strong>${esc(step.lease_owner || 'Unleased')}</strong></div><div class="fact"><span>Lease</span><strong>${step.stale ? 'Expired' : age(step.lease_expires_at || step.review_lease_expires_at || step.orchestrator_lease_expires_at)}</strong></div><div class="fact"><span>Worker heartbeat</span><strong>${step.heartbeat_at ? age(step.heartbeat_at) : '—'}</strong></div><div class="fact"><span>Model route</span><strong>${esc(route?.model || step.model_used || '—')} · ${esc(route?.provider || '—')}</strong></div><div class="fact"><span>Last model call</span><strong>${esc(age(route?.created_at))}</strong></div><div class="fact"><span>Reviewer</span>${badge(review?.verdict || 'waiting')}</div><div class="fact"><span>Verification</span>${badge(verification?.status || 'waiting')}</div><div class="fact"><span>Commands / tests</span><strong>${(step.commands || []).length}</strong></div><div class="fact"><span>Current command</span><span class="code">${esc(command || '—')}</span></div><div class="fact"><span>Last phase</span><strong>${esc(phase ? `${phase.phase} · ${Number(phase.duration_seconds || 0).toFixed(1)}s` : '—')}</strong></div><div class="fact"><span>Prompt size</span><strong>${phase ? `${Number(phase.prompt_chars || 0).toLocaleString()} chars` : '—'}</strong></div><div class="fact"><span>Resulting commit</span><span class="code">${esc((step.resulting_commit || '—').slice(0, 12))}</span></div></div></article></div>`;
 }
 
 function stepTimeline(step) {
@@ -519,8 +535,8 @@ async function jobAction(action, button) {
   setBusy(button, true);
   try {
     await api(`/api/jobs/${jobId}/${action}`, {method: 'POST', body: JSON.stringify({confirm: ['cancel', 'remove'].includes(action)})});
-    const labels = {pause: 'paused', resume: 'resumed', cancel: 'cancelled', remove: 'removed'};
-    toast(`Job ${labels[action]}`, `Job #${jobId} was updated.`);
+    const labels = {pause: 'paused', resume: 'resumed', cancel: 'cancelled', remove: 'removed', retry: 'requeued', 'recover-lease': 'recovered', 'rerun-verification': 'sent to verification', 'refresh-planning': 'returned to planning'};
+    toast(`Job ${labels[action] || action}`, `Job #${jobId} was updated.`);
     state.overview = await api('/api/overview');
     state.humanDraft = '';
     if (action === 'remove') {
@@ -597,8 +613,21 @@ document.addEventListener('click', event => {
     return void jobAction(target.dataset.jobAction, target);
   }
   if (action === 'answer-job') return answerJob(Number(target.dataset.jobId), target);
+  if (action === 'worktree-cleanup') return cleanupWorktrees(target);
 });
 document.addEventListener('input', event => { if (event.target.id === 'humanAnswer') state.humanDraft = event.target.value; });
+
+async function cleanupWorktrees(button) {
+  if (!confirm('Remove only worktrees that are no longer referenced by active packages?')) return;
+  setBusy(button, true, 'Cleaning…');
+  try {
+    const result = await api('/api/worktrees/cleanup', {method: 'POST', body: JSON.stringify({confirm: true})});
+    toast('Worktrees reconciled', `${(result.detail?.removed || []).length} orphaned worktrees removed.`);
+    state.overview = await api('/api/overview');
+    render();
+  } catch (error) { toast('Worktree cleanup failed', error.message, true); }
+  finally { setBusy(button, false); }
+}
 
 $('#connect').addEventListener('click', connect);
 $('#disconnect').addEventListener('click', disconnect);

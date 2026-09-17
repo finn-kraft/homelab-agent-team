@@ -125,3 +125,44 @@ def test_checkpoint_marker_recovers_after_commit_before_persistence(tmp_path):
     assert first.success
     assert second.success and second.recovered
     assert second.commit_sha == first.commit_sha
+
+
+def test_checkpoint_staging_failure_is_safe_and_recoverable(tmp_path):
+    root, start = _repository(tmp_path)
+    (root / "feature.py").write_text("value = 2\n")
+
+    class FailingStage(CheckpointService):
+        def _run(self, root, argv, *, redact_output=True):
+            if tuple(argv[:2]) == ("git", "add"):
+                return subprocess.CompletedProcess(list(argv), 1, "", "injected staging failure")
+            return super()._run(root, argv, redact_output=redact_output)
+
+    result = FailingStage().checkpoint(
+        repository=root, branch="agents/autonomous-align", starting_commit=start,
+        approved_files=["feature.py"], job_id=1, step_id=8, title="staging fault",
+    )
+    assert not result.success and result.failure_code == "checkpoint_refused"
+    assert _run(root, "git", "rev-parse", "HEAD") == start
+    assert not _run(root, "git", "diff", "--cached", "--name-only")
+
+
+def test_checkpoint_push_failure_keeps_local_commit_and_evidence(tmp_path):
+    root, start = _repository(tmp_path)
+    (root / "feature.py").write_text("value = 2\n")
+
+    class FailingPush(CheckpointService):
+        def _run(self, root, argv, *, redact_output=True):
+            if tuple(argv) == ("git", "push"):
+                return subprocess.CompletedProcess(list(argv), 1, "", "injected push failure")
+            return super()._run(root, argv, redact_output=redact_output)
+
+    result = FailingPush().checkpoint(
+        repository=root, branch="agents/autonomous-align", starting_commit=start,
+        approved_files=["feature.py"], job_id=1, step_id=9, title="push fault",
+        auto_push=True,
+    )
+    assert result.success
+    assert result.details["push_attempted"] is True
+    assert result.details["push_exit_code"] == 1
+    assert "push failed" in result.message
+    assert _run(root, "git", "rev-parse", "HEAD") != start
