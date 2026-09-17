@@ -157,6 +157,8 @@ CREATE TABLE IF NOT EXISTS work_packages (
   constraints JSONB NOT NULL DEFAULT '[]',
   roadmap_reference TEXT,
   dependencies JSONB NOT NULL DEFAULT '[]',
+  job_id BIGINT REFERENCES jobs(id),
+  step_id BIGINT REFERENCES steps(id),
   repository TEXT NOT NULL,
   branch TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'ready',
@@ -333,12 +335,26 @@ class OrchestratorStore:
                             constraints: list[str] | None = None, roadmap_reference: str | None = None,
                             dependencies: list[int] | None = None) -> int:
         with self.connect() as connection:
+            mission = connection.execute("SELECT goal,branch FROM missions WHERE id=%s", (mission_id,)).fetchone()
+            if not mission:
+                raise KeyError(mission_id)
+            job = connection.execute("""INSERT INTO jobs(goal,repository,branch,priority,max_iterations)
+                VALUES(%s,%s,%s,0,100) RETURNING id""", (mission["goal"], repository, branch)).fetchone()
+            job_id = job["id"]
             row = connection.execute("""INSERT INTO work_packages
                 (mission_id,objective,acceptance_criteria,constraints,roadmap_reference,dependencies,repository,branch)
                 VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
                 (mission_id, objective, json.dumps(acceptance_criteria), json.dumps(constraints or []),
                  roadmap_reference, json.dumps(dependencies or []), repository, branch)).fetchone()
-            return row["id"]
+            package_id = row["id"]
+            step = connection.execute("""INSERT INTO steps(job_id,sequence,repository,branch,title,objective,
+                rationale,acceptance_criteria,constraints,suggested_files,dependencies,assigned_agent)
+                VALUES(%s,1,%s,%s,%s,%s,'V2 Work Package',%s,%s,'[]',%s,'coder-agent') RETURNING id""",
+                (job_id, repository, branch, objective[:200], objective, json.dumps(acceptance_criteria),
+                 json.dumps(constraints or []), json.dumps(dependencies or []))).fetchone()
+            connection.execute("UPDATE work_packages SET job_id=%s,step_id=%s WHERE id=%s",
+                               (job_id, step["id"], package_id))
+            return package_id
 
     def list_work_packages(self, mission_id: int | None = None) -> list[dict[str, Any]]:
         with self.connect() as connection:
