@@ -17,7 +17,7 @@ from typing import Any, Iterable
 from coder_agent.models import Status, Task
 
 
-MIGRATION_VERSION = "orchestrator-0002"
+MIGRATION_VERSION = "orchestrator-0003"
 
 MIGRATION_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -105,6 +105,37 @@ CREATE TABLE IF NOT EXISTS control_center_credentials (
   id SMALLINT PRIMARY KEY CHECK (id = 1),
   password_hash TEXT NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS engineering_sessions (
+  id BIGSERIAL PRIMARY KEY,
+  job_id BIGINT NOT NULL REFERENCES jobs(id),
+  step_id BIGINT REFERENCES steps(id),
+  worker_id TEXT NOT NULL,
+  starting_commit TEXT,
+  current_model_tier TEXT NOT NULL DEFAULT 'local',
+  current_problem TEXT,
+  progress_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+  stagnation_count INTEGER NOT NULL DEFAULT 0,
+  turn_count INTEGER NOT NULL DEFAULT 0,
+  last_successful_action TEXT,
+  last_test_result JSONB,
+  lease_expires_at TIMESTAMPTZ,
+  started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS engineering_actions (
+  id BIGSERIAL PRIMARY KEY,
+  session_id BIGINT NOT NULL REFERENCES engineering_sessions(id),
+  sequence INTEGER NOT NULL,
+  model TEXT,
+  action TEXT NOT NULL,
+  observation TEXT,
+  progress_classification TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(session_id, sequence)
 );
 
 CREATE INDEX IF NOT EXISTS steps_orchestrator_claim_idx

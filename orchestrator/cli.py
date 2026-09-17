@@ -88,7 +88,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "init-db":
             store.migrate()
-            print(json.dumps({"status": "ok", "migration": "orchestrator-0001"}))
+            print(json.dumps({"status": "ok", "migration": "orchestrator-0003"}))
             return 0
         if args.command == "run":
             orchestrator = build_orchestrator(config)
