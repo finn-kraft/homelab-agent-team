@@ -86,6 +86,10 @@ class CoderAgent:
             runner = CommandRunner(workspace)
             git = GitRepository(runner)
             starting_commit = git.head()
+            session_id = None
+            start_session = getattr(self.store, "start_engineering_session", None)
+            if start_session:
+                session_id = start_session(task.job_id, task.step_id, self.worker_id, starting_commit)
             current_branch = git.branch()
             if current_branch != task.branch:
                 raise RuntimeError(
@@ -150,6 +154,12 @@ class CoderAgent:
                         "no_progress"
                     ),
                 })
+                if session_id is not None:
+                    record_action = getattr(self.store, "record_engineering_action", None)
+                    if record_action:
+                        record_action(session_id, turn + 1, action.get("action", "invalid"),
+                                      self._redact(observation), response.model,
+                                      "invalid_action" if action.get("action") == "invalid" else None)
                 if observation == previous_observation or action.get("action") == "invalid":
                     stagnation += 1
                 else:

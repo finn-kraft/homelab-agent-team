@@ -117,3 +117,22 @@ class Store:
                 VALUES(%s,%s,'coder-agent',%s,%s)""",
                 (task.job_id, task.step_id, kind, json.dumps(payload)),
             )
+
+    def start_engineering_session(self, job_id, step_id, worker_id, starting_commit=None):
+        with self.connect() as connection:
+            row = connection.execute("""INSERT INTO engineering_sessions
+                (job_id,step_id,worker_id,starting_commit) VALUES(%s,%s,%s,%s) RETURNING id""",
+                (job_id, step_id, worker_id, starting_commit)).fetchone()
+            return row["id"]
+
+    def record_engineering_action(self, session_id, sequence, action, observation="",
+                                  model=None, progress_classification=None):
+        with self.connect() as connection:
+            connection.execute("""INSERT INTO engineering_actions
+                (session_id,sequence,model,action,observation,progress_classification)
+                VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(session_id,sequence) DO UPDATE SET
+                model=EXCLUDED.model, action=EXCLUDED.action, observation=EXCLUDED.observation,
+                progress_classification=EXCLUDED.progress_classification""",
+                (session_id, sequence, model, action, observation[:30000], progress_classification))
+            connection.execute("UPDATE engineering_sessions SET turn_count=%s,updated_at=now() WHERE id=%s",
+                               (sequence, session_id))

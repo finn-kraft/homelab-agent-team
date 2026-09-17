@@ -289,6 +289,28 @@ class OrchestratorStore:
                                        "ids": [row[0] for row in rows[:50]]})
         return violations
 
+    def start_engineering_session(self, job_id: int, step_id: int | None,
+                                  worker_id: str, starting_commit: str | None = None) -> int:
+        with self.connect() as connection:
+            row = connection.execute("""INSERT INTO engineering_sessions
+                (job_id,step_id,worker_id,starting_commit) VALUES(%s,%s,%s,%s)
+                RETURNING id""", (job_id, step_id, worker_id, starting_commit)).fetchone()
+            return row["id"]
+
+    def record_engineering_action(self, session_id: int, sequence: int, action: str,
+                                  observation: str = "", model: str | None = None,
+                                  progress_classification: str | None = None) -> None:
+        with self.connect() as connection:
+            connection.execute("""INSERT INTO engineering_actions
+                (session_id,sequence,model,action,observation,progress_classification)
+                VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(session_id,sequence) DO UPDATE SET
+                model=EXCLUDED.model,action=EXCLUDED.action,observation=EXCLUDED.observation,
+                progress_classification=EXCLUDED.progress_classification""",
+                (session_id, sequence, model, action, observation[:30000], progress_classification))
+            connection.execute("""UPDATE engineering_sessions SET turn_count=%s,
+                last_successful_action=CASE WHEN %s NOT IN ('invalid','no_progress') THEN %s ELSE last_successful_action END,
+                updated_at=now() WHERE id=%s""", (sequence, action, action, session_id))
+
     # ------------------------------------------------------------------
     # Repository mutation lease
     # ------------------------------------------------------------------
