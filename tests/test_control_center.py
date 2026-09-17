@@ -46,6 +46,7 @@ def test_static_dashboard_contains_primary_operator_workflow():
     assert "/api/stream" in script and "Needs attention" in script
     assert "/api/login" in script and "Control Center password" in html
     assert "Remove from queue" in script and "data-job-action=\"remove\"" in script
+    assert "engineering-agent-v3-controls" in html
 
 def test_dashboard_uses_accessible_delegated_controls():
     from importlib.resources import files
@@ -54,6 +55,7 @@ def test_dashboard_uses_accessible_delegated_controls():
     assert "aria-label=\"Primary navigation\"" in html
     assert "onclick=" not in html and "onclick=\"" not in script
     assert "data-action=\"job-action\"" in script
+    assert "event.preventDefault()" in script and "event.stopPropagation()" in script
     assert "/api/login" in script and "credentials: 'same-origin'" in script
 
 

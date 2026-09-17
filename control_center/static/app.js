@@ -40,7 +40,10 @@ async function api(path, options = {}) {
   const response = await fetch(path, {...options, headers, credentials: 'same-origin'});
   if (!response.ok) {
     let message = `Request failed (${response.status})`;
-    try { message = (await response.json()).error || message; } catch (_) { /* no JSON body */ }
+    try {
+      const payload = await response.json();
+      message = payload.detail || payload.error || message;
+    } catch (_) { /* no JSON body */ }
     throw new Error(message.replaceAll('_', ' '));
   }
   return response.json();
@@ -576,7 +579,9 @@ function updateClock() {
 }
 
 document.addEventListener('click', event => {
-  const target = event.target.closest('[data-action], nav button, [data-close]');
+  const source = event.target;
+  const target = source && typeof source.closest === 'function'
+    ? source.closest('[data-action], nav button, [data-close]') : null;
   if (!target) return;
   if (target.matches('nav button')) return showView(target.dataset.view);
   if (target.hasAttribute('data-close')) return $('#jobDialog').close();
@@ -586,7 +591,11 @@ document.addEventListener('click', event => {
   if (action === 'open-mission') return openMission(target.dataset.missionId);
   if (action === 'back-missions') return renderMissions();
   if (action === 'event-filter') { state.eventFilter = target.dataset.filter; return loadEvents(); }
-  if (action === 'job-action') return jobAction(target.dataset.jobAction, target);
+  if (action === 'job-action') {
+    event.preventDefault();
+    event.stopPropagation();
+    return void jobAction(target.dataset.jobAction, target);
+  }
   if (action === 'answer-job') return answerJob(Number(target.dataset.jobId), target);
 });
 document.addEventListener('input', event => { if (event.target.id === 'humanAnswer') state.humanDraft = event.target.value; });
