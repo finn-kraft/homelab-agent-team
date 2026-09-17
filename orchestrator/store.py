@@ -138,6 +138,35 @@ CREATE TABLE IF NOT EXISTS engineering_actions (
   UNIQUE(session_id, sequence)
 );
 
+CREATE TABLE IF NOT EXISTS missions (
+  id BIGSERIAL PRIMARY KEY,
+  goal TEXT NOT NULL,
+  repository TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  cloud_budget NUMERIC(14,6),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS work_packages (
+  id BIGSERIAL PRIMARY KEY,
+  mission_id BIGINT NOT NULL REFERENCES missions(id),
+  objective TEXT NOT NULL,
+  acceptance_criteria JSONB NOT NULL DEFAULT '[]',
+  constraints JSONB NOT NULL DEFAULT '[]',
+  roadmap_reference TEXT,
+  dependencies JSONB NOT NULL DEFAULT '[]',
+  repository TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'ready',
+  starting_commit TEXT,
+  worktree TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS work_packages_claim_idx ON work_packages(status, mission_id, id);
+
 CREATE INDEX IF NOT EXISTS steps_orchestrator_claim_idx
   ON steps (status, orchestrator_lease_expires_at, id);
 CREATE INDEX IF NOT EXISTS verification_runs_step_idx
@@ -288,6 +317,34 @@ class OrchestratorStore:
                     violations.append({"invariant": name, "count": len(rows),
                                        "ids": [row[0] for row in rows[:50]]})
         return violations
+
+    def create_mission(self, goal: str, repository: str, branch: str,
+                       cloud_budget: float | None = None) -> int:
+        with self.connect() as connection:
+            row = connection.execute("""INSERT INTO missions(goal,repository,branch,cloud_budget)
+                VALUES(%s,%s,%s,%s) RETURNING id""", (goal, repository, branch, cloud_budget)).fetchone()
+            return row["id"]
+
+    def create_work_package(self, mission_id: int, objective: str, repository: str,
+                            branch: str, acceptance_criteria: list[str],
+                            constraints: list[str] | None = None, roadmap_reference: str | None = None,
+                            dependencies: list[int] | None = None) -> int:
+        with self.connect() as connection:
+            row = connection.execute("""INSERT INTO work_packages
+                (mission_id,objective,acceptance_criteria,constraints,roadmap_reference,dependencies,repository,branch)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (mission_id, objective, json.dumps(acceptance_criteria), json.dumps(constraints or []),
+                 roadmap_reference, json.dumps(dependencies or []), repository, branch)).fetchone()
+            return row["id"]
+
+    def list_work_packages(self, mission_id: int | None = None) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            query = "SELECT * FROM work_packages"
+            params: tuple[Any, ...] = ()
+            if mission_id is not None:
+                query += " WHERE mission_id=%s"; params = (mission_id,)
+            query += " ORDER BY id"
+            return [dict(row) for row in connection.execute(query, params).fetchall()]
 
     def start_engineering_session(self, job_id: int, step_id: int | None,
                                   worker_id: str, starting_commit: str | None = None) -> int:

@@ -48,6 +48,10 @@ def _parser() -> argparse.ArgumentParser:
     subcommands.add_parser("once", help="advance at most one durable workflow action")
     subcommands.add_parser("status", help="show durable job summaries")
     subcommands.add_parser("audit", help="report read-only workflow invariant violations")
+    mission = subcommands.add_parser("create-mission", help="create a durable V2 mission")
+    mission.add_argument("goal"); mission.add_argument("--repository", required=True); mission.add_argument("--branch", required=True)
+    packages = subcommands.add_parser("packages", help="list durable V2 work packages")
+    packages.add_argument("--mission-id", type=int)
     inspect = subcommands.add_parser("inspect", help="show a job, its steps, and recent events")
     inspect.add_argument("job_id", type=int)
     for name in ("pause", "resume", "cancel"):
@@ -108,6 +112,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "audit":
             print(json.dumps({"violations": store.invariant_report()}, default=str, indent=2))
+            return 0
+        if args.command == "create-mission":
+            print(json.dumps({"mission_id": store.create_mission(args.goal, args.repository, args.branch)}))
+            return 0
+        if args.command == "packages":
+            print(json.dumps(store.list_work_packages(args.mission_id), default=str, indent=2))
             return 0
         if args.command == "inspect":
             print(json.dumps(store.inspect(args.job_id), default=str, indent=2))
