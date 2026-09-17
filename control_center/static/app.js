@@ -390,7 +390,27 @@ async function renderJob(id) {
     const stage = stageFor(current?.status || job.status);
     const stages = ['planner', 'coder', 'reviewer', 'verification', 'commit'];
     const activeIndex = stages.indexOf(stage);
-    $('#jobView').innerHTML = `
+    const activeHumanAnswer = document.activeElement?.id === 'humanAnswer';
+    const humanAnswer = $('#humanAnswer');
+    const humanSelection = humanAnswer ? {
+	start: humanAnswer.selectionStart,
+  	end: humanAnswer.selectionEnd
+    } : null;
+      $('#jobView').innerHTML = `
+    if (activeHumanAnswer) {
+    const restored = $('#humanAnswer');
+
+    if (restored) {
+    	restored.focus({ preventScroll: true });
+
+    if (humanSelection) {
+      restored.setSelectionRange(
+        humanSelection.start,
+        humanSelection.end
+      );
+    }
+  }
+}
       ${detail.needs_attention ? attentionCard(id, detail.needs_attention) : ''}
       <article class="card job-hero"><div class="section-head tight"><div><span class="kicker">JOB #${Number(job.id)}</span><h2>${esc(job.goal)}</h2><span>${badge(job.status)} <span class="muted">· ${esc(projectFor(job.repository)?.name || job.repository)} · ${esc(job.branch)}</span></span></div><div class="job-actions">${jobControls(job)}</div></div><div class="job-flow"><div class="flow">${stages.map((item, index) => `${index ? '<span class="arrow">›</span>' : ''}<span class="stage ${item === stage ? 'active' : ''} ${index < activeIndex || job.status === 'complete' ? 'done' : ''}"><i>${index + 1}</i>${item[0].toUpperCase() + item.slice(1)}</span>${item === 'reviewer' && current?.status === 'changes_requested' ? '<span class="loop">↩ revision</span>' : ''}`).join('')}</div></div></article>
       ${current ? stepCard(current) : ''}

@@ -42,9 +42,17 @@ def test_12_rejection_routes_same_step_revision():assert parse_review(json.dumps
 def test_13_needs_human_requires_question():
  p=approval();p.update(verdict='needs_human',recommended_next_state='blocked')
  with pytest.raises(InvalidReview):parse_review(json.dumps(p),CRITERIA)
-def test_14_valid_human_question():
- p=approval();p.update(verdict='needs_human',recommended_next_state='blocked',human_question='Approve destructive migration?')
- assert parse_review(json.dumps(p),CRITERIA).verdict=='needs_human'
+def test_14_needs_human_is_not_a_reviewer_verdict():
+    p = approval()
+    p.update(
+        verdict="needs_human",
+        recommended_next_state="blocked",
+        human_question="Approve destructive migration?",
+    )
+    with pytest.raises(InvalidReview):
+        parse_review(json.dumps(p), CRITERIA)
+
+
 def test_15_invalid_severity_rejected():
  p=rejection();p['blocking_issues'][0]['severity']='huge'
  with pytest.raises(InvalidReview):parse_review(json.dumps(p),CRITERIA)

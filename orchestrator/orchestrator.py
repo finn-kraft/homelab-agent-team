@@ -88,7 +88,7 @@ class AgentOrchestrator:
         exhausted = enforce_limit() if enforce_limit is not None else None
         if exhausted is not None:
             return AdvanceResult(
-                "needs_human", exhausted, detail="maximum planning iterations reached"
+                "blocked", exhausted, detail="maximum planning iterations reached"
             )
 
         verification = self.store.claim_verification(

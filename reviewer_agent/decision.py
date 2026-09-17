@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-VERDICTS = {"approved", "changes_requested", "needs_human", "blocked"}
+VERDICTS = {"approved", "changes_requested", "blocked"}
 SEVERITIES = {"critical", "high", "medium", "low", "info"}
 CRITERION_STATUSES = {"satisfied", "not_satisfied", "uncertain", "not_applicable"}
 
