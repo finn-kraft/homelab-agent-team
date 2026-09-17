@@ -17,7 +17,7 @@ from typing import Any, Iterable
 from coder_agent.models import Status, Task
 
 
-MIGRATION_VERSION = "orchestrator-0004"
+MIGRATION_VERSION = "orchestrator-0005"
 
 MIGRATION_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -197,6 +197,44 @@ CREATE TABLE IF NOT EXISTS phase_metrics (
 );
 CREATE INDEX IF NOT EXISTS phase_metrics_job_idx
   ON phase_metrics (job_id, completed_at DESC);
+
+CREATE TABLE IF NOT EXISTS human_queue (
+  id BIGSERIAL PRIMARY KEY,
+  mission_id BIGINT REFERENCES missions(id) ON DELETE CASCADE,
+  job_id BIGINT REFERENCES jobs(id) ON DELETE CASCADE,
+  step_id BIGINT REFERENCES steps(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  question TEXT NOT NULL,
+  context JSONB NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'open',
+  answer TEXT,
+  answered_by TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  answered_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (status IN ('open','answered','cancelled'))
+);
+CREATE INDEX IF NOT EXISTS human_queue_status_idx ON human_queue(status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS human_queue_open_request_idx
+  ON human_queue(job_id, step_id, kind) WHERE status='open';
+
+CREATE TABLE IF NOT EXISTS mission_integrations (
+  id BIGSERIAL PRIMARY KEY,
+  mission_id BIGINT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+  package_id BIGINT NOT NULL REFERENCES work_packages(id) ON DELETE CASCADE,
+  source_branch TEXT NOT NULL,
+  target_branch TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  commit_sha TEXT,
+  error TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at TIMESTAMPTZ,
+  CHECK (status IN ('pending','integrating','complete','conflict','failed')),
+  UNIQUE(package_id)
+);
+CREATE INDEX IF NOT EXISTS mission_integrations_mission_idx
+  ON mission_integrations(mission_id, status, updated_at DESC);
 """
 
 
@@ -347,6 +385,133 @@ class OrchestratorStore:
                 VALUES(%s,%s,%s,%s) RETURNING id""", (goal, repository, branch, cloud_budget)).fetchone()
             return row["id"]
 
+    def list_missions(self) -> list[dict[str, Any]]:
+        """Return missions with package counts for operators and the UI."""
+        with self.connect() as connection:
+            rows = connection.execute("""
+                SELECT m.*, count(p.id)::integer AS package_count,
+                  count(p.id) FILTER (WHERE p.status='complete')::integer AS completed_packages,
+                  count(p.id) FILTER (WHERE p.status IN ('ready','engineering','review','verifying'))::integer AS active_packages,
+                  count(p.id) FILTER (WHERE p.status IN ('blocked','failed'))::integer AS blocked_packages,
+                  count(h.id) FILTER (WHERE h.status='open')::integer AS open_human_requests
+                FROM missions m LEFT JOIN work_packages p ON p.mission_id=m.id
+                LEFT JOIN human_queue h ON h.mission_id=m.id
+                GROUP BY m.id ORDER BY m.updated_at DESC, m.id DESC
+            """).fetchall()
+            return [dict(row) for row in rows]
+
+    def mission_detail(self, mission_id: int) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            mission = connection.execute("SELECT * FROM missions WHERE id=%s", (mission_id,)).fetchone()
+            if not mission:
+                return None
+            packages = connection.execute(
+                "SELECT * FROM work_packages WHERE mission_id=%s ORDER BY id", (mission_id,)
+            ).fetchall()
+            integrations = connection.execute(
+                "SELECT * FROM mission_integrations WHERE mission_id=%s ORDER BY id", (mission_id,)
+            ).fetchall()
+            requests = connection.execute(
+                "SELECT * FROM human_queue WHERE mission_id=%s ORDER BY created_at DESC", (mission_id,)
+            ).fetchall()
+            result = dict(mission)
+            result["packages"] = [dict(row) for row in packages]
+            result["integrations"] = [dict(row) for row in integrations]
+            result["human_queue"] = [dict(row) for row in requests]
+            return result
+
+    def update_mission_status(self, mission_id: int, status: str) -> None:
+        if status not in {"active", "paused", "blocked", "complete", "cancelled"}:
+            raise ValueError("invalid mission status")
+        with self.connect() as connection:
+            result = connection.execute(
+                "UPDATE missions SET status=%s,updated_at=now() WHERE id=%s", (status, mission_id)
+            )
+            if result.rowcount != 1:
+                raise KeyError(mission_id)
+
+    def enqueue_human_request(self, *, job_id: int | None, step_id: int | None,
+                              question: str, kind: str = "workflow",
+                              context: dict[str, Any] | None = None,
+                              mission_id: int | None = None) -> int:
+        question = str(question).strip()
+        if not question or len(question) > 12000:
+            raise ValueError("question must be 1-12000 characters")
+        with self.connect() as connection:
+            row = connection.execute("""
+                INSERT INTO human_queue(mission_id,job_id,step_id,kind,question,context)
+                VALUES(%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (job_id,step_id,kind) WHERE status='open' DO UPDATE SET
+                  question=EXCLUDED.question, context=EXCLUDED.context, updated_at=now()
+                RETURNING id
+            """, (mission_id, job_id, step_id, kind, question,
+                   json.dumps(context or {}, default=str))).fetchone()
+            return int(row["id"])
+
+    def list_human_queue(self, status: str = "open") -> list[dict[str, Any]]:
+        if status not in {"open", "answered", "cancelled", "all"}:
+            raise ValueError("invalid human queue status")
+        with self.connect() as connection:
+            if status == "all":
+                rows = connection.execute(
+                    "SELECT * FROM human_queue ORDER BY created_at DESC"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM human_queue WHERE status=%s ORDER BY created_at DESC", (status,)
+                ).fetchall()
+            return [dict(row) for row in rows]
+
+    def answer_human_request(self, request_id: int, answer: str,
+                             answered_by: str = "control-center") -> None:
+        answer = str(answer).strip()
+        if not answer or len(answer) > 12000:
+            raise ValueError("answer must be 1-12000 characters")
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM human_queue WHERE id=%s FOR UPDATE", (request_id,)
+            ).fetchone()
+            if not row:
+                raise KeyError(request_id)
+            if row["status"] != "open":
+                raise ValueError("human request is already resolved")
+            connection.execute("""
+                UPDATE human_queue SET status='answered',answer=%s,answered_by=%s,
+                  answered_at=now(),updated_at=now() WHERE id=%s
+            """, (answer, answered_by, request_id))
+            if row.get("job_id"):
+                connection.execute("""
+                    UPDATE jobs SET status='running', human_notes=concat_ws(E'\\n', human_notes, %s::text),
+                      planner_worker_id=NULL, planner_lease_expires_at=NULL, updated_at=now()
+                    WHERE id=%s AND status='needs_human'
+                """, (answer, row["job_id"]))
+                connection.execute("""
+                    UPDATE steps SET status='changes_requested', blocker=NULL, updated_at=now()
+                    WHERE id=%s AND status='needs_human'
+                """, (row.get("step_id"),))
+                self._event(connection, row["job_id"], row.get("step_id"),
+                            "human_response_received", {"answer": answer}, agent=answered_by)
+
+    def upsert_integration(self, *, mission_id: int, package_id: int,
+                           source_branch: str, target_branch: str,
+                           status: str = "pending", commit_sha: str | None = None,
+                           error: str | None = None) -> int:
+        if status not in {"pending", "integrating", "complete", "conflict", "failed"}:
+            raise ValueError("invalid integration status")
+        with self.connect() as connection:
+            row = connection.execute("""
+              INSERT INTO mission_integrations(mission_id,package_id,source_branch,target_branch,status,commit_sha,error,completed_at)
+              VALUES(%s,%s,%s,%s,%s,%s,%s,CASE WHEN %s IN ('complete','conflict','failed') THEN now() END)
+              ON CONFLICT(package_id) DO UPDATE SET status=EXCLUDED.status,
+                source_branch=EXCLUDED.source_branch,target_branch=EXCLUDED.target_branch,
+                commit_sha=COALESCE(EXCLUDED.commit_sha,mission_integrations.commit_sha),
+                error=EXCLUDED.error,updated_at=now(),
+                completed_at=CASE WHEN EXCLUDED.status IN ('complete','conflict','failed') THEN now() ELSE NULL END
+              RETURNING id
+            """, (mission_id, package_id, source_branch, target_branch, status, commit_sha,
+                   error, status)).fetchone()
+            return int(row["id"])
+
     def create_work_package(self, mission_id: int, objective: str, repository: str,
                             branch: str, acceptance_criteria: list[str],
                             constraints: list[str] | None = None, roadmap_reference: str | None = None,
@@ -366,7 +531,7 @@ class OrchestratorStore:
             package_id = row["id"]
             step = connection.execute("""INSERT INTO steps(job_id,sequence,repository,branch,title,objective,
                 rationale,acceptance_criteria,constraints,suggested_files,dependencies,assigned_agent)
-                VALUES(%s,1,%s,%s,%s,%s,'V2 Work Package',%s,%s,'[]',%s,'coder-agent') RETURNING id""",
+                VALUES(%s,1,%s,%s,%s,%s,'V2 Work Package',%s,%s,'[]',%s,'engineering-agent') RETURNING id""",
                 (job_id, repository, branch, objective[:200], objective, json.dumps(acceptance_criteria),
                  json.dumps(constraints or []), json.dumps(dependencies or []))).fetchone()
             connection.execute("UPDATE work_packages SET job_id=%s,step_id=%s WHERE id=%s",
@@ -418,6 +583,19 @@ class OrchestratorStore:
                                    (str(worktree.path), worktree.branch, package.get("step_id")))
                 package.update(worktree=str(worktree.path), starting_commit=worktree.starting_commit,
                                branch=worktree.branch)
+            # A package is a complete admission decision. Move its linked V1
+            # row into the running coding state so the next coordinator pass
+            # claims Engineering directly instead of handing the package back
+            # to Planner because the synthetic job is still pending.
+            if package.get("job_id") and package.get("step_id"):
+                connection.execute("""
+                    UPDATE jobs SET status='running',current_phase='coding',current_step=%s,updated_at=now()
+                    WHERE id=%s AND status IN ('pending','planning')
+                """, (package["step_id"], package["job_id"]))
+                self._event(connection, package["job_id"], package["step_id"], "package_claimed", {
+                    "package_id": package["id"], "worker_id": worker_id,
+                    "worktree": package.get("worktree"),
+                })
             return package
 
     def resume_engineering_session(self, job_id: int, step_id: int | None = None) -> dict[str, Any] | None:

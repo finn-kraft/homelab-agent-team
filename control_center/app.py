@@ -144,6 +144,16 @@ class ControlCenter:
                         return self.send_json(200, app.snapshot())
                     if parsed.path == "/api/projects":
                         return self.send_json(200, app.store.project_list())
+                    if parsed.path == "/api/missions":
+                        return self.send_json(200, app.store.missions())
+                    if parsed.path == "/api/work-packages":
+                        mission_id = parse_qs(parsed.query).get("mission_id", [None])[0]
+                        return self.send_json(200, app.store.work_packages(mission_id))
+                    if parsed.path == "/api/human-queue":
+                        status = parse_qs(parsed.query).get("status", ["open"])[0]
+                        return self.send_json(200, app.store.human_queue(status))
+                    if parsed.path.startswith("/api/missions/"):
+                        return self.send_json(200, app.store.mission(int(parsed.path.rsplit("/", 1)[1])))
                     if parsed.path == "/api/stream":
                         return self.send_stream(session)
                     if parsed.path == "/api/events":
@@ -205,6 +215,9 @@ class ControlCenter:
                         except PermissionError:
                             return self.send_json(409, {"error": "confirmation_required"})
                         return self.send_json(200, result)
+                    if len(parts) == 4 and parts[:2] == ["api", "human-queue"] and parts[3] == "answer":
+                        app.store.answer_human_request(int(parts[2]), data["answer"])
+                        return self.send_json(200, {"status": "answered"})
                     return self.send_json(404, {"error": "not_found"})
                 except (KeyError, ValueError, json.JSONDecodeError):
                     return self.send_json(400, {"error": "invalid_request"})

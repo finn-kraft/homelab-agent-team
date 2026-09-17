@@ -112,7 +112,15 @@ class ReviewerStore:
             c.execute("""UPDATE steps SET status=%s,reviewer_feedback=%s,reviewer_worker_id=NULL,
             review_lease_expires_at=NULL,updated_at=now() WHERE id=%s""",
             (step_status,json.dumps({'verdict':verdict,'issues':decision.blocking_issues}),item['id']))
-            if verdict=='needs_human':c.execute("UPDATE jobs SET status='needs_human',updated_at=now() WHERE id=%s",(item['job_id'],))
+            if verdict=='needs_human':
+                c.execute("UPDATE jobs SET status='needs_human',updated_at=now() WHERE id=%s",(item['job_id'],))
+                c.execute("""INSERT INTO human_queue(mission_id,job_id,step_id,kind,question,context)
+                    SELECT p.mission_id,%s,%s,'review',%s,%s
+                    FROM work_packages p WHERE p.step_id=%s
+                    ON CONFLICT (job_id,step_id,kind) WHERE status='open' DO UPDATE SET
+                      question=EXCLUDED.question,context=EXCLUDED.context,updated_at=now()""",
+                    (item['job_id'], item['id'], getattr(decision, 'human_question', None) or decision.summary,
+                     json.dumps({'summary': decision.summary, 'verdict': verdict}), item['id']))
             self._event(c,item['job_id'],item['id'],'review_approved' if verdict=='approved' else verdict,
                         {'review_id':item['review_id'],'verdict':verdict,'next':decision.recommended_next_state})
 

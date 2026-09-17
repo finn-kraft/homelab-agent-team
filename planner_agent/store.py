@@ -172,6 +172,13 @@ class PlannerStore:
                 WHERE id=%s""", (status, job.id),
             )
             self._event(connection, job.id, None, f"job_{decision.decision}", decision.as_dict())
+            if decision.decision == "needs_human":
+                connection.execute("""INSERT INTO human_queue(job_id,kind,question,context)
+                    VALUES(%s,'planning',%s,%s)
+                    ON CONFLICT (job_id,step_id,kind) WHERE status='open' DO UPDATE SET
+                      question=EXCLUDED.question,context=EXCLUDED.context,updated_at=now()""",
+                    (job.id, decision.human_question or decision.reasoning_summary,
+                     json.dumps(decision.as_dict(), default=str)))
             return None
 
     def defer(self, job_id: int, worker_id: str, failure_kind: str, detail: str,

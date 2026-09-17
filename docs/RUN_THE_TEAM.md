@@ -111,7 +111,8 @@ is reachable from the agent server.
 ## 4. Initialize the workflow database
 
 Run this once after first install and again after pulling a release that contains an
-additive migration (including the Control Center credential table):
+additive migration (including the Control Center credential, mission, integration,
+and human-queue tables):
 
 ```bash
 cd /home/finn/homelab-ai/dev-team
@@ -120,6 +121,22 @@ set -a
 set +a
 .venv/bin/agent-orchestrator init-db
 ```
+
+For a roadmap-driven V2 mission, create it once and let the coordinator materialize
+the next bounded items automatically:
+
+```bash
+.venv/bin/agent-orchestrator create-mission "Follow the Align roadmap" \
+  --repository /home/finn/work/align --branch agents/autonomous-align
+.venv/bin/agent-orchestrator expand-mission 1 --limit 3
+.venv/bin/agent-orchestrator missions
+.venv/bin/agent-orchestrator packages --mission-id 1
+```
+
+The coordinator continues through Engineering → Reviewer → Verification →
+Checkpoint. Integration is deliberately an explicit, protected-branch-aware
+operation until you opt into `AUTO_INTEGRATE=true`; conflicts are recorded for
+the Human Queue rather than silently rewriting history.
 
 Use a migration-capable database identity for this step. The normal services should
 run with the restricted application identity.

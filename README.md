@@ -288,6 +288,13 @@ See [`.env.example`](.env.example). The principal values are:
 | `PROTECTED_BRANCHES` | Comma-separated autonomous-commit deny list |
 | `AUTO_COMMIT` | Enables reviewer-approved local checkpoints |
 | `AUTO_PUSH` | Off by default; no force/history rewrite is ever permitted |
+| `MISSION_PACKAGE_LIMIT` | Maximum unchecked roadmap items materialized per mission pass (default `3`) |
+| `AUTO_INTEGRATE` | Opt-in integration of verified package commits into a non-protected mission branch |
+
+V2 operations are also available from the orchestrator CLI: `missions`,
+`expand-mission`, `packages`, `human-queue`, `answer-human`, and
+`integrate-package`. The Control Center exposes the same mission/package and human
+queue read models after running the additive `orchestrator-0005` migration.
 
 ## Tests
 

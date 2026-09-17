@@ -22,6 +22,8 @@ from typing import Any
 from coder_agent.models import WorkPackage
 
 from .config import OrchestratorConfig
+from .integration import IntegrationManager
+from .mission import MissionManager
 from .worktrees import WorktreeManager
 
 
@@ -62,6 +64,9 @@ class AgentOrchestrator:
         self.verifier = verifier
         self.checkpoint = checkpoint
         self.config = config
+        self.mission_manager = MissionManager(
+            self.store, max_packages=getattr(config, "mission_package_limit", 3)
+        )
         self._stop_requested = threading.Event()
 
     def request_stop(self) -> None:
@@ -91,6 +96,7 @@ class AgentOrchestrator:
 
     def once(self) -> AdvanceResult:
         """Perform one deterministic advancement, suitable for tests and cron-like use."""
+        self._populate_mission_queue()
         # V2 packages are admitted into the existing durable Step pipeline.
         # Keep this additive and safe for databases that have not migrated yet.
         claim_package = getattr(self.store, "claim_work_package", None)
@@ -146,6 +152,22 @@ class AgentOrchestrator:
             return self._code(task)
 
         return self._plan()
+
+    def _populate_mission_queue(self) -> None:
+        """Materialize the next bounded roadmap packages before claiming work."""
+        list_missions = getattr(self.store, "list_missions", None)
+        if not list_missions:
+            return
+        try:
+            for mission in list_missions():
+                if mission.get("status") != "active":
+                    continue
+                if int(mission.get("active_packages") or 0) >= self.mission_manager.max_packages:
+                    continue
+                self.mission_manager.ensure_packages(int(mission["id"]), limit=self.mission_manager.max_packages)
+        except Exception:
+            # A missing roadmap or an un-migrated database must not stop V1 jobs.
+            LOG.debug("mission_queue_materialization_unavailable", exc_info=True)
 
     # ------------------------------------------------------------------
     # State machine actions
@@ -317,6 +339,8 @@ class AgentOrchestrator:
             sync_package = getattr(self.store, "sync_package_for_step", None)
             if sync_package and next_state == "complete":
                 sync_package(work["id"], "complete", getattr(result, "commit_sha", None))
+            if next_state == "complete" and self.config.auto_integrate:
+                self._integrate_completed_package(work, getattr(result, "commit_sha", None))
             self._log("checkpoint_finished", job_id=work["job_id"], step_id=work["id"],
                       commit_sha=getattr(result, "commit_sha", None), next_state=next_state)
             phase_status = str(next_state)
@@ -326,6 +350,33 @@ class AgentOrchestrator:
             self._record_phase_metric(self.checkpoint, "checkpoint", started, phase_status,
                                       work["job_id"], work["id"], phase_detail)
             self.store.release_repository_lock(work["repository"], owner)
+
+    def _integrate_completed_package(self, work: dict[str, Any], commit_sha: str | None) -> None:
+        """Opt-in branch integration after a durable checkpoint.
+
+        Checkpoint success remains authoritative even if integration conflicts;
+        the conflict is persisted for an operator to resolve and retry.
+        """
+        getter = getattr(self.store, "work_package_for_step", None)
+        if not getter:
+            return
+        package = getter(work["id"])
+        if not package:
+            return
+        mission = getattr(self.store, "mission_detail", lambda _id: None)(package.get("mission_id"))
+        if not mission:
+            return
+        try:
+            result = IntegrationManager(
+                self.store, protected_branches=self.config.protected_branches
+            ).integrate(
+                {**package, "resulting_commit": commit_sha or package.get("resulting_commit")},
+                mission["repository"], target_branch=mission["branch"],
+            )
+            self._log("package_integrated", job_id=work["job_id"], step_id=work["id"], **result)
+        except Exception as exc:
+            self._log("package_integration_failed", job_id=work["job_id"], step_id=work["id"],
+                      error=str(exc), level=logging.ERROR)
 
     def _plan(self) -> AdvanceResult:
         started = time.monotonic()

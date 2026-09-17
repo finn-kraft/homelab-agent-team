@@ -114,6 +114,7 @@ function showView(name) {
     projects: ['Projects', 'Repositories the team is authorized to change.'],
     agents: ['Agents', 'Live assignments backed by durable workflow evidence.'],
     jobs: ['Jobs', 'Track and manage every workflow in one place.'],
+    missions: ['Missions', 'Roadmap packages, human gates, and integration status.'],
     events: ['Events', 'Technical workflow history, routes, and recovery evidence.'],
     job: ['Job detail', 'Progress, decisions, verification, and human gates.'],
   };
@@ -207,6 +208,7 @@ function render() {
   if (state.view === 'projects') renderProjects();
   if (state.view === 'agents') renderAgents();
   if (state.view === 'jobs') $('#jobsView').innerHTML = `<div class="section-head"><div class="section-title"><h2>All jobs</h2><small>Running, waiting, blocked, and completed work</small></div></div>${jobsTable(state.overview.jobs || [])}`;
+  if (state.view === 'missions') renderMissions();
   if (state.view === 'events') renderEventView();
   if (state.view === 'job' && state.jobId) renderJob(state.jobId);
 }
@@ -254,7 +256,7 @@ function renderDashboard() {
       ${metricCard('Cloud spend', `$${cloudSpend.toFixed(3)}`, `${overview.inference?.cloud_requests || 0} routed requests`, 'cloud')}
       ${metricCard('Slowest phase', slowestPhase ? `${Number(slowestPhase.max_seconds).toFixed(1)}s` : '—', slowestPhase ? `${slowestPhase.phase} · ${Number(slowestPhase.max_prompt_chars || 0).toLocaleString()} prompt chars` : 'Telemetry begins after migration', 'activity')}
     </div>
-    ${attention.length ? `<div class="section-head"><div class="section-title"><h2>Needs your attention</h2><small>Jobs paused at a decision or technical gate</small></div></div>${attentionPanel(attention)}` : ''}
+    ${attention.length || (overview.human_queue || []).length ? `<div class="section-head"><div class="section-title"><h2>Needs your attention</h2><small>Jobs and durable decisions waiting for you</small></div></div>${attentionPanel(attention)}${humanQueuePanel(overview.human_queue || [])}` : ''}
     <div class="section-head"><div class="section-title"><h2>Active jobs</h2><small>Work currently moving through the delivery loop</small></div><span>${active.length} running</span></div>
     ${jobsTable(active)}
     <div class="section-head"><div class="section-title"><h2>System health</h2><small>Live service and model availability</small></div><span>Updated just now</span></div>
@@ -273,6 +275,24 @@ function renderDashboard() {
     </div>
     <div class="section-head"><div class="section-title"><h2>Recent autonomous commits</h2><small>Reviewer-approved checkpoints produced by the team</small></div></div>
     ${commitsList(overview.recent_commits || [])}`;
+}
+
+function humanQueuePanel(items) {
+  if (!items.length) return '';
+  return `<div class="card attention"><div class="attention-head">${icon('alert')}<h3>Human queue</h3></div>${items.map(item => `<button class="attention-row" data-action="open-job" data-job-id="${Number(item.job_id || 0)}"><span>${badge(item.kind)}</span><strong>${esc(item.question)}</strong><small>${item.job_id ? `Job #${Number(item.job_id)}` : 'Mission decision'} · ${age(item.created_at)}</small><b>Review →</b></button>`).join('')}</div>`;
+}
+
+function renderMissions() {
+  const missions = state.overview.missions || [];
+  $('#missionsView').innerHTML = `<div class="section-head"><div class="section-title"><h2>Mission control</h2><small>Roadmap work is materialized into bounded packages before engineering starts.</small></div><span>${missions.length} mission${missions.length === 1 ? '' : 's'}</span></div>${missions.length ? `<div class="project-list">${missions.map(mission => `<article class="card project-card"><div class="section-head tight"><div><span class="kicker">MISSION #${Number(mission.id)}</span><h3>${esc(mission.goal)}</h3></div>${badge(mission.status)}</div><p class="path">${esc(mission.repository)} · ${esc(mission.branch)}</p><div class="project-meta"><div><span>Packages</span><b>${Number(mission.completed_packages || 0)} / ${Number(mission.package_count || 0)} complete</b></div><div><span>Blocked</span><b>${Number(mission.blocked_packages || 0)}</b></div><div><span>Human queue</span><b>${Number(mission.open_human_requests || 0)}</b></div><div><span>Updated</span><b>${esc(age(mission.updated_at))}</b></div></div><button class="primary" data-action="open-mission" data-mission-id="${Number(mission.id)}">Open mission →</button></article>`).join('')}</div>` : '<div class="card empty"><div><strong>No V2 missions yet</strong>Create one with the orchestrator mission command, then let the roadmap manager populate packages.</div></div>'}`;
+}
+
+async function openMission(id) {
+  try {
+    const mission = await api(`/api/missions/${Number(id)}`);
+    const packageRows = (mission.packages || []).map(pkg => `<div class="commit-row"><span>${badge(pkg.status)}</span><div class="commit-main"><strong>${esc(pkg.objective)}</strong><small>${esc(pkg.roadmap_reference || 'manual package')} · ${esc(pkg.branch)}</small></div><span class="code">${esc((pkg.resulting_commit || 'not committed').slice(0, 10))}</span></div>`).join('');
+    $('#missionsView').innerHTML = `<div class="section-head"><div class="section-title"><h2>${esc(mission.goal)}</h2><small>${esc(mission.repository)} · ${esc(mission.branch)}</small></div><button data-action="back-missions">← All missions</button></div><div class="card commit-list">${packageRows || '<div class="empty"><div><strong>No packages yet</strong>The roadmap manager will materialize the next bounded items.</div></div>'}</div>${(mission.integrations || []).length ? `<div class="section-head"><div class="section-title"><h2>Integration</h2><small>Verified package commits and branch updates</small></div></div><div class="card commit-list">${mission.integrations.map(item => `<div class="commit-row">${badge(item.status)}<div class="commit-main"><strong>${esc(item.source_branch)} → ${esc(item.target_branch)}</strong><small>${esc(item.error || item.commit_sha || 'Pending')}</small></div></div>`).join('')}</div>` : ''}`;
+  } catch (error) { toast('Could not load mission', error.message, true); }
 }
 
 function attentionPanel(jobs) {
@@ -337,7 +357,7 @@ function derivedAgents() {
   const active = work[0];
   return [
     {name: 'Planner', role: 'Strategy & decomposition', icon: 'brain', state: active?.current_phase === 'planning' ? 'planning' : 'idle', detail: events['planner-agent']?.event_type, meta: active?.provider ? `${active.provider} / ${active.model}` : 'Ready for the next roadmap decision'},
-    {name: 'Coder', role: 'Implementation', icon: 'code', state: active?.status === 'running' ? 'coding' : 'idle', detail: active?.status === 'running' ? active.title : events['coder-agent']?.event_type, meta: active?.files_changed?.length ? `${active.files_changed.length} files · ${active.command_count} recorded commands` : 'No implementation currently claimed'},
+    {name: 'Engineer', role: 'Implementation & debugging', icon: 'code', state: active?.status === 'running' ? 'engineering' : 'idle', detail: active?.status === 'running' ? active.title : (events['engineering-agent']?.event_type || events['coder-agent']?.event_type), meta: active?.files_changed?.length ? `${active.files_changed.length} files · ${active.command_count} recorded commands` : 'No implementation currently claimed'},
     {name: 'Reviewer', role: 'Independent quality gate', icon: 'review', state: active?.status === 'review' ? 'reviewing' : 'idle', detail: active?.verdict || events['reviewer-agent']?.event_type, meta: active?.open_issue_count ? `${active.open_issue_count} open review issues` : 'Waiting for reviewable work'},
     {name: 'Orchestrator', role: 'Deterministic coordination', icon: 'route', state: orchestrator?.online ? 'running' : 'stopped', detail: orchestrator?.current_action, meta: orchestrator?.started_at ? `Started ${age(orchestrator.started_at)} · heartbeat ${age(orchestrator.heartbeat_at)}` : 'No durable heartbeat'},
   ];
@@ -512,6 +532,8 @@ document.addEventListener('click', event => {
   const action = target.dataset.action;
   if (action === 'new-job') return newJob(target.dataset.projectId);
   if (action === 'open-job') return openJob(target.dataset.jobId);
+  if (action === 'open-mission') return openMission(target.dataset.missionId);
+  if (action === 'back-missions') return renderMissions();
   if (action === 'event-filter') { state.eventFilter = target.dataset.filter; return loadEvents(); }
   if (action === 'job-action') return jobAction(target.dataset.jobAction, target);
   if (action === 'answer-job') return answerJob(Number(target.dataset.jobId), target);
