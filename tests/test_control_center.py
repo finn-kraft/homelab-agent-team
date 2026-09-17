@@ -70,3 +70,33 @@ def test_blocked_attention_prefers_durable_step_reason():
     attention = ControlStore._attention(result)
     assert attention["reason"] == "pytest is not installed"
     assert attention["can_answer"] is False
+
+
+def test_health_exposes_schema_migration_state():
+    from control_center.store import ControlStore
+
+    class Workflow:
+        def schema_readiness(self):
+            return {"ready": False, "migration_required": True,
+                    "missing_tables": ["jobs"], "missing_columns": {}}
+
+    value = ControlStore.__new__(ControlStore)
+    value.workflow = Workflow()
+    report = value.health()
+    assert report["ready"] is False
+    assert report["migration_required"] is True
+    assert value.healthy() is False
+
+
+def test_health_marks_database_unavailable_when_readiness_cannot_connect():
+    from control_center.store import ControlStore
+
+    class Workflow:
+        def schema_readiness(self):
+            return {"ready": False, "migration_required": True,
+                    "missing_tables": [], "missing_columns": {},
+                    "error": "connection refused"}
+
+    value = ControlStore.__new__(ControlStore)
+    value.workflow = Workflow()
+    assert value.health()["database"] == "unavailable"

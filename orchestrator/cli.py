@@ -26,7 +26,7 @@ def build_orchestrator(config: OrchestratorConfig | None = None) -> AgentOrchest
     config = config or OrchestratorConfig.from_env()
     engineer = build_engineer()
     reviewer = build_reviewer()
-    engineer.max_attempts = config.max_coder_attempts
+    engineer.max_attempts = config.engineering_attempt_limit
     reviewer.max_attempts = config.max_review_attempts
     return AgentOrchestrator(
         store=OrchestratorStore(config.database_url),

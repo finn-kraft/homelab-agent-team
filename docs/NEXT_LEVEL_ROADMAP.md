@@ -21,7 +21,7 @@ The first five reliability slices are now implemented alongside V1:
   checkpoint commit for each package.
 - EngineeringAgent command execution polls at safe boundaries, terminates the
   complete process group on pause/cancel, and persists `cancelled` evidence in
-  `command_runs` (migration `orchestrator-0008`).
+  `command_runs` (migration `orchestrator-0009`).
 - `engineering-agent` is the canonical installed entry point and durable event
   identity; the old Coder names remain only as compatibility shims during the
   migration.
@@ -29,6 +29,12 @@ The first five reliability slices are now implemented alongside V1:
 The remaining part of item 2 is the operator-run soak against the real
 PostgreSQL/Ollama/systemd deployment. The fixture proves the transition logic
 without pretending that a sandbox run is a production-host acceptance test.
+
+The next five slices (items 6–10) are now implemented as well: schema readiness
+is exposed by `/health`, Engineering is the canonical durable hand-off with V1
+aliases, sessions restore their last action/model/tier/test state, reviewer
+revisions emit a same-session hand-off, and stagnation tracks semantic worktree
+changes, repeated failures, missing verification, and action oscillation.
 
 ## P0 — reliability before unattended operation
 

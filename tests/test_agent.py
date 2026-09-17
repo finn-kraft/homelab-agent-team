@@ -105,6 +105,25 @@ def test_engineering_baseline_recovers_original_human_changes(monkeypatch):
     }
 
 
+def test_engineering_session_state_restores_last_action(monkeypatch):
+    store = Store("postgresql://unused")
+    connection = _FakeConnection([(
+        17, 4, 2, "standard", "pytest failed", {"passed": False},
+        "qwen", "openrouter", "run", '{"exit_code": 1}', "repeated_failure",
+    )])
+
+    @contextmanager
+    def connect():
+        yield connection
+
+    monkeypatch.setattr(store, "connect", connect)
+    state = store.engineering_session_state(1, 2)
+    assert state["id"] == 17
+    assert state["turn_count"] == 4
+    assert state["last_action"] == "run"
+    assert state["last_progress"] == "repeated_failure"
+
+
 class _AgentStore:
     def __init__(self, status="running"):
         self.status = status
@@ -122,6 +141,29 @@ class _AgentStore:
 
     def update_step(self, step_id, worker_id, status, **fields):
         self.updates.append((step_id, worker_id, status, fields))
+
+
+class _ResumableStore(_AgentStore):
+    def __init__(self):
+        super().__init__("running")
+        self.actions = []
+
+    def resume_engineering_session(self, _job_id, _step_id):
+        return 17
+
+    def engineering_session_state(self, _job_id, _step_id):
+        return {
+            "id": 17, "turn_count": 1, "stagnation_count": 0,
+            "current_model_tier": "local", "last_model": "local-test",
+            "last_action": "inspect", "last_observation": "clean",
+            "last_progress": "inspection_progress", "last_test_result": {},
+        }
+
+    def engineering_baseline(self, _job_id, _step_id):
+        return {"starting_commit": "a" * 40, "preexisting_changes": []}
+
+    def record_engineering_action(self, *args, **kwargs):
+        self.actions.append((args, kwargs))
 
 
 class _AgentWorkspace:
@@ -228,6 +270,21 @@ def test_model_failure_is_persisted_with_a_recovery_category(monkeypatch, tmp_pa
         "failure_class": "model",
         "error": "backend circuit open; retry window has not elapsed",
     })
+
+
+def test_resumed_session_continues_sequence_and_includes_last_observation(monkeypatch, tmp_path):
+    store = _ResumableStore()
+    backend = _AgentBackend('{"action":"inspect","kind":"status"}')
+    monkeypatch.setattr("coder_agent.agent.Workspace", _AgentWorkspace)
+    monkeypatch.setattr("coder_agent.agent.CommandRunner", _AgentRunner)
+    monkeypatch.setattr("coder_agent.agent.GitRepository", _AgentGit)
+    agent = CoderAgent(store, _AgentRouter(backend), "engineering-1", [str(tmp_path)], max_turns=2)
+
+    result = agent.run_task(_task(tmp_path))
+
+    assert result.status is Status.BLOCKED
+    assert store.actions and store.actions[0][0][1] == 2
+    assert store.actions[0][1]["model_tier"] == "local"
 
 
 def test_progress_mode_has_no_overall_turn_cutoff_and_stops_only_on_stagnation(monkeypatch, tmp_path):
