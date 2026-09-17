@@ -17,9 +17,10 @@ coder-agent = "coder_agent.cli:main"
 planner-agent = "planner_agent.cli:main"
 reviewer-agent = "reviewer_agent.cli:main"
 agent-orchestrator = "orchestrator.cli:main"
+agent-control-center = "control_center.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["agent_core*", "coder_agent*", "planner_agent*", "reviewer_agent*", "orchestrator*"]
+include = ["agent_core*", "coder_agent*", "planner_agent*", "reviewer_agent*", "orchestrator*", "control_center*"]
 
 [tool.setuptools.package-data]
 agent_core = ["schema.sql"]
