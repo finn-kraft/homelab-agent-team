@@ -158,6 +158,24 @@ class PlannerStore:
             self._event(connection, job.id, None, f"job_{decision.decision}", decision.as_dict())
             return None
 
+    def defer(self, job_id: int, worker_id: str, failure_kind: str, detail: str,
+              retry_seconds: int = 20) -> None:
+        """Release a transient planning failure without permanently blocking the job."""
+        with self.connect() as connection:
+            row = connection.execute(
+                """UPDATE jobs SET status='running',planner_worker_id=NULL,
+                planner_lease_expires_at=now()+(%s*interval '1 second'),updated_at=now()
+                WHERE id=%s AND planner_worker_id=%s RETURNING id""",
+                (retry_seconds, job_id, worker_id),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("planning lease is no longer owned")
+            self._event(connection, job_id, None, "planning_retry_scheduled", {
+                "failure_kind": failure_kind,
+                "detail": detail[:30_000],
+                "retry_seconds": retry_seconds,
+            })
+
     def pause(self, job_id: int) -> None:
         self._set_control_status(job_id, "paused", "job_paused")
 

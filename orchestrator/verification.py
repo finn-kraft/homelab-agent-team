@@ -10,7 +10,9 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -375,10 +377,13 @@ class VerificationService:
         redact_output: bool = True,
     ) -> VerificationCommandResult:
         argv_list = list(argv)
+        execution_argv = argv_list
+        if argv_list and argv_list[0] == "python" and shutil.which("python") is None:
+            execution_argv = [sys.executable, *argv_list[1:]]
         started = time.monotonic()
         try:
             done = subprocess.run(
-                argv_list,
+                execution_argv,
                 cwd=root,
                 env=self._safe_environment(),
                 text=True,

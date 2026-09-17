@@ -30,6 +30,11 @@ def parse_decision(text: str) -> PlannerDecision:
         raise InvalidDecision("planner response is not valid JSON") from exc
     if not isinstance(payload, dict) or payload.get("decision") not in VALID_DECISIONS:
         raise InvalidDecision("planner returned an unknown decision")
+    if payload.get("decision") in {"create_step", "replace_step"}:
+        required_top = {"decision", "job_status", "reasoning_summary", "step",
+                        "evidence", "human_question", "blocker"}
+        if set(payload) != required_top:
+            raise InvalidDecision("step decision does not match the exact output contract")
     decision = PlannerDecision(
         decision=payload["decision"],
         job_status=str(payload.get("job_status", "running")),
@@ -62,6 +67,14 @@ def validate_decision(decision: PlannerDecision) -> None:
         raise InvalidDecision("overall completion requires multiple evidence items")
     if decision.decision == "needs_human" and not decision.human_question:
         raise InvalidDecision("needs_human requires a specific question")
+    if decision.decision == "needs_human":
+        hard_gate_terms = (
+            "destructive", "irreversible", "credential", "secret", "contradict",
+            "production", "deploy", "merge", "exhausted", "financial data",
+        )
+        basis = f"{decision.reasoning_summary} {decision.human_question}".lower()
+        if not any(term in basis for term in hard_gate_terms):
+            raise InvalidDecision("needs_human is reserved for a concrete hard gate")
 
 
 def completion_is_supported(decision: PlannerDecision, steps: list[dict[str, Any]]) -> bool:
@@ -73,4 +86,3 @@ def completion_is_supported(decision: PlannerDecision, steps: list[dict[str, Any
         and (step.get("reviewer_feedback") or {}).get("verdict") == "approved"
         for step in steps
     )
-

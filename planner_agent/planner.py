@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from agent_core.models import PlannerDecision
+from agent_core.llm import BackendError
 from .decision import InvalidDecision, completion_is_supported, parse_decision
 from .inspector import InspectionError, ReadOnlyRepositoryInspector
 from .prompt import SYSTEM_PROMPT
@@ -11,7 +12,7 @@ from .prompt import SYSTEM_PROMPT
 
 class PlannerAgent:
     def __init__(self, store, router, inspector: ReadOnlyRepositoryInspector,
-                 worker_id: str, lease_seconds: int = 300, decision_retries: int = 2,
+                 worker_id: str, lease_seconds: int = 300, decision_retries: int = 3,
                  escalation_attempt: int = 4):
         self.store, self.router, self.inspector = store, router, inspector
         self.worker_id, self.lease_seconds = worker_id, lease_seconds
@@ -52,14 +53,24 @@ class PlannerAgent:
                 (int(step.get("attempt_count", 0)) for step in steps
                  if step.get("status") in {"failed", "blocked"}), default=0
             )
-            backend = self.router.choose(failed_attempts,
-                                         failed_attempts >= self.escalation_attempt)
             messages = [{"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": json.dumps(context, default=str)}]
             decision = None
-            for _ in range(self.decision_retries + 1):
+            backend_errors = []
+            for repair_attempt in range(self.decision_retries + 1):
                 self.store.heartbeat(job.id, self.worker_id, self.lease_seconds)
-                response = backend.complete(messages)
+                try:
+                    route_attempt = failed_attempts + repair_attempt + 1
+                    backend = self.router.choose(
+                        route_attempt, route_attempt >= self.escalation_attempt)
+                    response = backend.complete(messages)
+                except BackendError as exc:
+                    backend_errors.append(str(exc))
+                    messages.append({
+                        "role": "user",
+                        "content": "Inference failed transiently. Retry the same JSON contract.",
+                    })
+                    continue
                 try:
                     candidate = parse_decision(response.text)
                     if candidate.decision == "complete" and not completion_is_supported(candidate, steps):
@@ -76,16 +87,26 @@ class PlannerAgent:
                         {"role": "user", "content": f"Decision rejected: {exc}. Return corrected JSON."},
                     ])
             if decision is None:
-                decision = PlannerDecision("blocked", "blocked",
-                                           "The planning model repeatedly returned an unsafe or invalid decision.",
-                                           blocker="invalid model decisions")
+                reason = "inference_unavailable" if backend_errors else "invalid_model_output"
+                self.store.defer(
+                    job.id, self.worker_id, reason,
+                    backend_errors[-1] if backend_errors else "structured repair exhausted",
+                )
+                return PlannerDecision(
+                    "blocked", "running",
+                    "Planning retry scheduled; the persistent job remains recoverable.",
+                    blocker=reason,
+                )
             self.store.apply_decision(job, self.worker_id, decision)
             return decision
-        except (InspectionError, RuntimeError, ValueError) as exc:
-            decision = PlannerDecision("blocked", "blocked",
-                                       "Planning could not safely continue.", blocker=str(exc))
-            self.store.apply_decision(job, self.worker_id, decision)
-            return decision
+        except InspectionError as exc:
+            self.store.defer(job.id, self.worker_id, "repository_conflict", str(exc))
+            return PlannerDecision("blocked", "running", "Repository inspection will retry.",
+                                   blocker=str(exc))
+        except (RuntimeError, ValueError) as exc:
+            self.store.defer(job.id, self.worker_id, "planner_internal_error", str(exc))
+            return PlannerDecision("blocked", "running", "Planner failure will retry.",
+                                   blocker=str(exc))
 
     @staticmethod
     def _serializable(job) -> dict[str, Any]:

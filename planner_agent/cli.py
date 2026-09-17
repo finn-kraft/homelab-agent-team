@@ -42,7 +42,7 @@ def build_planner() -> PlannerAgent:
         ReadOnlyRepositoryInspector(roots),
         os.getenv("PLANNER_WORKER_ID", "planner-1"),
         int(os.getenv("PLANNER_LEASE_SECONDS", "300")),
-        int(os.getenv("PLANNER_DECISION_RETRIES", "2")),
+        int(os.getenv("PLANNER_DECISION_RETRIES", "3")),
         escalation_attempt,
     )
 
