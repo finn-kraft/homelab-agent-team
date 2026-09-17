@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import urllib.error
 
-from agent_core.llm import BackendError, InferenceRouter, LLMResponse, Router
+from agent_core.llm import BackendError, HTTPBackend, InferenceRouter, LLMResponse, Router
 
 
 class Backend:
@@ -100,3 +101,17 @@ def test_normal_agent_route_uses_supported_medium_complexity(monkeypatch):
 
     assert router._route_request(1, False)["execution_target"] == "ollama"
     assert captured["complexity"] == "medium"
+
+
+def test_paid_backend_http_402_opens_circuit(monkeypatch):
+    backend = HTTPBackend("https://example.invalid", "model", "secret", retries=0)
+    def rejected(*_args, **_kwargs):
+        raise urllib.error.HTTPError("https://example.invalid", 402, "payment", {}, None)
+    monkeypatch.setattr("urllib.request.urlopen", rejected)
+    try:
+        backend._post("https://example.invalid", {})
+    except BackendError as exc:
+        assert "circuit" in str(exc)
+    else:
+        raise AssertionError("expected circuit-opening backend error")
+    assert backend.circuit_open and backend.circuit_retry_seconds > 0

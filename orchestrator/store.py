@@ -227,6 +227,7 @@ class OrchestratorStore:
             rows = connection.execute(
                 """SELECT j.id,j.goal,j.repository,j.branch,j.status,j.current_phase,
                 j.current_step,j.iteration_count,j.max_iterations,j.updated_at,
+                j.planner_worker_id,j.planner_lease_expires_at,
                 COUNT(s.id) FILTER (WHERE s.status <> 'complete') AS open_steps,
                 COUNT(s.id) FILTER (WHERE s.status = 'complete') AS completed_steps,
                 (SELECT s2.blocker FROM steps s2 WHERE s2.job_id=j.id
@@ -236,6 +237,23 @@ class OrchestratorStore:
                 GROUP BY j.id ORDER BY j.priority DESC,j.id"""
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def invariant_report(self) -> list[dict[str, Any]]:
+        """Return read-only workflow invariant violations for operators."""
+        checks = {
+            "planning_without_lease": "SELECT id FROM jobs WHERE status='planning' AND planner_worker_id IS NULL",
+            "multiple_active_steps": "SELECT job_id FROM steps WHERE status IN ('queued','running','review','changes_requested','verification') GROUP BY job_id HAVING count(*) > 1",
+            "completed_without_commit": "SELECT id FROM steps WHERE status='complete' AND (resulting_commit IS NULL OR resulting_commit='')",
+            "checkpoint_without_verification": "SELECT id FROM steps WHERE status='checkpoint' AND verification_result IS NULL",
+        }
+        violations = []
+        with self.connect() as connection:
+            for name, query in checks.items():
+                rows = connection.execute(query).fetchall()
+                if rows:
+                    violations.append({"invariant": name, "count": len(rows),
+                                       "ids": [row[0] for row in rows[:50]]})
+        return violations
 
     # ------------------------------------------------------------------
     # Repository mutation lease

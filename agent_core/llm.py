@@ -38,6 +38,15 @@ class HTTPBackend:
         self.api_key = api_key
         self.timeout = timeout
         self.retries = retries
+        self._circuit_open_until = 0.0
+
+    @property
+    def circuit_open(self) -> bool:
+        return self._circuit_open_until > time.time()
+
+    @property
+    def circuit_retry_seconds(self) -> int:
+        return max(0, int(self._circuit_open_until - time.time()))
 
     def _post(self, url: str, payload: dict) -> tuple[dict, float]:
         if self._circuit_open_until > time.time():
@@ -68,6 +77,15 @@ class HTTPBackend:
                         time.monotonic() - started,
                     )
 
+            except urllib.error.HTTPError as exc:
+                last = exc
+                if self.api_key and exc.code in {401, 402, 403}:
+                    self._circuit_open_until = time.time() + 900
+                    raise BackendError(
+                        f"paid backend circuit opened after HTTP {exc.code}"
+                    ) from exc
+                if attempt < self.retries:
+                    time.sleep(2 ** attempt)
             except (urllib.error.URLError, TimeoutError) as exc:
                 last = exc
 
@@ -493,6 +511,16 @@ class InferenceRouter(Router):
             )
 
         # First scheduled cloud tier.
+        if self.cloud is not None and getattr(self.cloud, "circuit_open", False):
+            primary = self.local
+            self._set_route(
+                provider="ollama", model=primary.model, location="local",
+                reason=("Standard cloud circuit is open; continuing with local "
+                        f"Ollama for {getattr(self.cloud, 'circuit_retry_seconds', 0)}s."),
+                attempt=attempt, fallback=True,
+            )
+            return _FailoverBackend(primary, None, on_response=self._record_response)
+
         if (
             attempt == self.escalate_after
             and self.cloud is not None
