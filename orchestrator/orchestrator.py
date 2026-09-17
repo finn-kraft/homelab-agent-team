@@ -11,6 +11,7 @@ import logging
 import subprocess
 import threading
 import os
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -146,6 +147,9 @@ class AgentOrchestrator:
         # Orchestrator process identity.  These are commonly different under
         # systemd and must match exactly for release.
         owner = f"{self.coder.worker_id}:coder:{task.step_id}"
+        started = time.monotonic()
+        phase_status = "crashed"
+        phase_detail = ""
         try:
             self._clear_route(self.coder)
             with self._lease_heartbeat(
@@ -155,10 +159,13 @@ class AgentOrchestrator:
             status = self.store.finish_coding_handoff(task.step_id, self.coder.worker_id)
             self._record_route(self.coder, task.job_id, task.step_id, task.attempt)
             detail = getattr(result, "summary", "")
+            phase_status = str(getattr(result, "status", status))
+            phase_detail = detail
             self._log("coding_finished", job_id=task.job_id, step_id=task.step_id,
                       attempt=task.attempt, status=status)
             return AdvanceResult("coding", task.job_id, task.step_id, detail)
         except Exception as exc:
+            phase_detail = str(exc)
             # The Coder agent normally persists its own errors.  If it crashes
             # before doing so, the short lease plus recovery path protects us.
             self._log("coding_crashed", job_id=task.job_id, step_id=task.step_id,
@@ -173,9 +180,15 @@ class AgentOrchestrator:
                 )
             return AdvanceResult("coding_crashed", task.job_id, task.step_id, str(exc))
         finally:
+            self._record_phase_metric(self.coder, "coding", started, phase_status,
+                                      task.job_id, task.step_id, phase_detail)
             self.store.release_repository_lock(task.repository, owner)
 
     def _review(self, step_id: int) -> AdvanceResult:
+        started = time.monotonic()
+        phase_status = "crashed"
+        phase_detail = ""
+        work: dict[str, Any] = {}
         try:
             self._clear_route(self.reviewer)
             decision = self.reviewer.review_once(step_id)
@@ -191,10 +204,13 @@ class AgentOrchestrator:
                 int(work.get("attempt_count") or 0),
             )
             verdict = getattr(decision, "verdict", status or "review_not_claimed")
+            phase_status = str(verdict)
+            phase_detail = str(verdict)
             self._log("review_finished", job_id=work.get("job_id"), step_id=step_id,
                       verdict=verdict)
             return AdvanceResult("review", work.get("job_id"), step_id, str(verdict))
         except Exception as exc:
+            phase_detail = str(exc)
             work = self.store.step(step_id) or {}
             abandon = getattr(self.reviewer, "abandon", None)
             if abandon is not None:
@@ -205,9 +221,15 @@ class AgentOrchestrator:
             self._log("review_crashed", job_id=work.get("job_id"), step_id=step_id,
                       error=str(exc), level=logging.ERROR)
             return AdvanceResult("review_crashed", work.get("job_id"), step_id, str(exc))
+        finally:
+            self._record_phase_metric(self.reviewer, "review", started, phase_status,
+                                      work.get("job_id"), step_id, phase_detail)
 
     def _verify(self, work: dict[str, Any]) -> AdvanceResult:
         owner = self._lock_owner("verify", work["id"])
+        started = time.monotonic()
+        phase_status = "crashed"
+        phase_detail = ""
         try:
             with self._lease_heartbeat(
                 work["repository"], owner, work["id"], "orchestrator", self.config.worker_id
@@ -234,12 +256,19 @@ class AgentOrchestrator:
                 sync_package(work["id"], package_status, getattr(result, "commit_sha", None))
             self._log("verification_finished", job_id=work["job_id"], step_id=work["id"],
                       passed=bool(getattr(result, "passed", False)), next_state=next_state)
+            phase_status = str(next_state)
+            phase_detail = getattr(result, "summary", "")
             return AdvanceResult("verification", work["job_id"], work["id"], next_state)
         finally:
+            self._record_phase_metric(self.verifier, "verification", started, phase_status,
+                                      work["job_id"], work["id"], phase_detail)
             self.store.release_repository_lock(work["repository"], owner)
 
     def _checkpoint(self, work: dict[str, Any]) -> AdvanceResult:
         owner = self._lock_owner("checkpoint", work["id"])
+        started = time.monotonic()
+        phase_status = "crashed"
+        phase_detail = ""
         try:
             if not self.config.auto_commit:
                 result = SimpleNamespace(
@@ -273,18 +302,36 @@ class AgentOrchestrator:
                 sync_package(work["id"], "complete", getattr(result, "commit_sha", None))
             self._log("checkpoint_finished", job_id=work["job_id"], step_id=work["id"],
                       commit_sha=getattr(result, "commit_sha", None), next_state=next_state)
+            phase_status = str(next_state)
+            phase_detail = getattr(result, "error", None) or ""
             return AdvanceResult("checkpoint", work["job_id"], work["id"], next_state)
         finally:
+            self._record_phase_metric(self.checkpoint, "checkpoint", started, phase_status,
+                                      work["job_id"], work["id"], phase_detail)
             self.store.release_repository_lock(work["repository"], owner)
 
     def _plan(self) -> AdvanceResult:
+        started = time.monotonic()
+        phase_status = "crashed"
+        phase_detail = ""
         try:
             self._clear_route(self.planner)
             decision = self.planner.plan_once()
+            if decision is None:
+                phase_status = "idle"
         except Exception as exc:
+            phase_detail = str(exc)
             self._log("planning_crashed", error=str(exc), level=logging.ERROR)
             return AdvanceResult("planning_crashed", detail=str(exc))
+        finally:
+            job_id = getattr(self.planner, "last_job_id", None)
+            if "decision" in locals() and decision is not None:
+                phase_status = str(getattr(decision, "decision", "finished"))
+                phase_detail = str(getattr(decision, "reasoning_summary", ""))
+            self._record_phase_metric(self.planner, "planning", started, phase_status,
+                                      job_id, None, phase_detail)
         if decision is None:
+            phase_status = "idle"
             return AdvanceResult("idle")
         job_id = getattr(self.planner, "last_job_id", None)
         self._record_route(self.planner, job_id, None, None)
@@ -354,6 +401,35 @@ class AgentOrchestrator:
             estimated_cloud_cost=getattr(route, "estimated_cloud_cost", None),
             fallback=bool(getattr(route, "fallback", False)),
         )
+
+    def _record_phase_metric(self, agent: Any, phase: str, started: float,
+                             status: str, job_id: int | None = None,
+                             step_id: int | None = None, detail: str = "") -> None:
+        duration = time.monotonic() - started
+        prompt_chars = int(getattr(agent, "last_prompt_chars", 0) or 0)
+        route = getattr(getattr(agent, "router", None), "last_route", None)
+        provider = getattr(route, "provider", None)
+        model = getattr(route, "model", None) or getattr(agent, "last_model", None)
+        recorder = getattr(self.store, "record_phase_metric", None)
+        if recorder is not None:
+            try:
+                recorder(
+                    job_id=job_id,
+                    step_id=step_id,
+                    phase=phase,
+                    status=status,
+                    duration_seconds=duration,
+                    prompt_chars=prompt_chars,
+                    provider=provider,
+                    model=model,
+                    detail={"detail": detail[:4_000]} if detail else {},
+                )
+            except Exception:
+                LOG.exception("phase_metric_record_failed phase=%s job_id=%s step_id=%s",
+                              phase, job_id, step_id)
+        self._log("phase_finished", phase=phase, status=status, job_id=job_id,
+                  step_id=step_id, duration_seconds=round(duration, 3),
+                  prompt_chars=prompt_chars, provider=provider, model=model)
 
     @staticmethod
     def _clear_route(agent: Any) -> None:

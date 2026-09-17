@@ -9,6 +9,7 @@ from agent_core.models import PlannerDecision
 
 VALID_DECISIONS = {"create_step", "retry_step", "replace_step", "wait_for_review",
                    "blocked", "complete"}
+MAX_BATCH_STEPS = 5
 FORBIDDEN_INSTRUCTIONS = (
     "force push", "force-push", "git reset --hard", "bypass review",
     "ignore failing tests", "disable security", "push to main", "push to master",
@@ -34,13 +35,14 @@ def parse_decision(text: str) -> PlannerDecision:
     if decision_name in {"create_step", "replace_step"}:
         required_top = {"decision", "job_status", "reasoning_summary", "step",
                         "evidence", "human_question", "blocker"}
-        if set(payload) != required_top:
+        if not required_top.issubset(payload) or set(payload) - required_top - {"steps"}:
             raise InvalidDecision("step decision does not match the exact output contract")
     decision = PlannerDecision(
         decision=payload["decision"],
         job_status=str(payload.get("job_status", "running")),
         reasoning_summary=str(payload.get("reasoning_summary", "")),
-        step=payload.get("step"), evidence=list(payload.get("evidence", [])),
+        step=payload.get("step"),
+        steps=list(payload.get("steps") or []), evidence=list(payload.get("evidence", [])),
         human_question=payload.get("human_question"), blocker=payload.get("blocker"),
     )
     validate_decision(decision)
@@ -54,16 +56,20 @@ def validate_decision(decision: PlannerDecision) -> None:
     if decision.decision in {"create_step", "replace_step"}:
         if not isinstance(decision.step, dict):
             raise InvalidDecision("step-producing decision has no structured step")
+        batch = decision.steps or [decision.step]
+        if len(batch) > MAX_BATCH_STEPS:
+            raise InvalidDecision(f"a bounded package may contain at most {MAX_BATCH_STEPS} steps")
         required = ("title", "objective", "acceptance_criteria", "constraints",
                     "suggested_files", "assigned_agent")
-        if any(key not in decision.step for key in required):
-            raise InvalidDecision("step contract is incomplete")
-        criteria = decision.step["acceptance_criteria"]
-        if not isinstance(criteria, list) or not criteria or not all(
-                isinstance(item, str) and len(item.strip()) >= 8 for item in criteria):
-            raise InvalidDecision("acceptance criteria must be concrete strings")
-        if decision.step["assigned_agent"] != "coder-agent":
-            raise InvalidDecision("MVP only assigns implementation to coder-agent")
+        for step in batch:
+            if not isinstance(step, dict) or any(key not in step for key in required):
+                raise InvalidDecision("step contract is incomplete")
+            criteria = step["acceptance_criteria"]
+            if not isinstance(criteria, list) or not criteria or not all(
+                    isinstance(item, str) and len(item.strip()) >= 8 for item in criteria):
+                raise InvalidDecision("acceptance criteria must be concrete strings")
+            if step["assigned_agent"] != "coder-agent":
+                raise InvalidDecision("MVP only assigns implementation to coder-agent")
     if decision.decision == "complete" and len(decision.evidence) < 2:
         raise InvalidDecision("overall completion requires multiple evidence items")
     if decision.decision == "needs_human" and not decision.human_question:

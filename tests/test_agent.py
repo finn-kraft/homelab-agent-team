@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from agent_core.llm import LLMResponse
+from agent_core.prompt_budget import bounded_json, bounded_messages, bounded_text, message_chars
 from coder_agent.agent import CoderAgent
 from coder_agent.db import Store
 from coder_agent.models import Status, Task
@@ -23,6 +24,26 @@ def test_redacts_credentials():
     text = CoderAgent._redact(f"{assignment} {token}")
     assert "super-secret-value" not in text
     assert "gh" + "p_" not in text
+
+
+def test_prompt_history_keeps_system_and_newest_turns_within_budget():
+    messages = [
+        {"role": "system", "content": "system rules"},
+        {"role": "user", "content": "old" * 10_000},
+        {"role": "assistant", "content": "new" * 10_000},
+    ]
+
+    bounded = bounded_messages(messages, 1_024)
+
+    assert message_chars(bounded) <= 1_024
+    assert bounded[0]["role"] == "system"
+    assert "new" in bounded[-1]["content"]
+
+
+def test_prompt_budget_truncation_includes_marker_without_exceeding_limit():
+    assert len(bounded_text("x" * 100, 8)) <= 8
+    assert len(bounded_text("x" * 100, 1)) <= 1
+    assert len(bounded_json({"payload": "x" * 100}, 32)) <= 32
 
 
 class _FakeCursor:

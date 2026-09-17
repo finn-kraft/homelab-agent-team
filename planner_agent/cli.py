@@ -17,11 +17,15 @@ def build_planner() -> PlannerAgent:
     store = PlannerStore(os.environ["DATABASE_URL"])
     roots = [value for value in os.environ["PLANNER_ALLOWED_REPOSITORIES"].split(os.pathsep)
              if value]
-    llm_timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "90"))
-    llm_retries = int(os.getenv("LLM_RETRIES", "1"))
+    llm_timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+    llm_retries = int(os.getenv("LLM_RETRIES", "0"))
+    ollama_timeout = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", str(llm_timeout)))
+    ollama_retries = int(os.getenv("OLLAMA_RETRIES", str(llm_retries)))
+    cloud_timeout = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "90"))
+    cloud_retries = int(os.getenv("OPENROUTER_RETRIES", "1"))
     local = OllamaBackend(os.getenv("OLLAMA_URL", "http://localhost:11434"),
                           os.getenv("PLANNER_MODEL", "qwen2.5-coder:14b"),
-                          timeout=llm_timeout, retries=llm_retries)
+                          timeout=ollama_timeout, retries=ollama_retries)
     standard_cloud = None
     premium_cloud = None
     api_key = os.getenv("OPENROUTER_API_KEY")
@@ -34,8 +38,8 @@ def build_planner() -> PlannerAgent:
                 "qwen/qwen3-coder-flash",
             ),
             api_key,
-            timeout=llm_timeout,
-            retries=llm_retries,
+            timeout=cloud_timeout,
+            retries=cloud_retries,
         )
         premium_cloud = OpenRouterBackend(
             "https://openrouter.ai/api/v1",
@@ -44,8 +48,8 @@ def build_planner() -> PlannerAgent:
                 "anthropic/claude-sonnet-4.6",
             ),
             api_key,
-            timeout=llm_timeout,
-            retries=llm_retries,
+            timeout=cloud_timeout,
+            retries=cloud_retries,
         )
     escalation_attempt = int(os.getenv(
         "PLANNER_ESCALATE_AFTER", os.getenv("INFERENCE_ESCALATE_AFTER", "4")
@@ -61,12 +65,17 @@ def build_planner() -> PlannerAgent:
             privacy_sensitive=os.getenv("INFERENCE_PRIVACY_SENSITIVE", "false").lower()
             in {"1", "true", "yes", "on"},
         ),
-        ReadOnlyRepositoryInspector(roots),
+        ReadOnlyRepositoryInspector(
+            roots,
+            int(os.getenv("PLANNER_MAX_DOCUMENT_BYTES", "50000")),
+            int(os.getenv("PLANNER_MAX_TREE_ENTRIES", "500")),
+        ),
         os.getenv("PLANNER_WORKER_ID", "planner-1"),
         int(os.getenv("PLANNER_LEASE_SECONDS", "300")),
         int(os.getenv("PLANNER_DECISION_RETRIES", "3")),
         escalation_attempt,
         int(os.getenv("PLANNER_MAX_CONTEXT_CHARS", "120000")),
+        int(os.getenv("PLANNER_PACKAGE_STEPS", "3")),
     )
 
 

@@ -17,7 +17,7 @@ from typing import Any, Iterable
 from coder_agent.models import Status, Task
 
 
-MIGRATION_VERSION = "orchestrator-0003"
+MIGRATION_VERSION = "orchestrator-0004"
 
 MIGRATION_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -180,6 +180,23 @@ CREATE INDEX IF NOT EXISTS llm_invocations_job_idx
   ON llm_invocations (job_id, step_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS command_runs_step_source_attempt_idx
   ON command_runs (step_id, source, attempt, id);
+
+CREATE TABLE IF NOT EXISTS phase_metrics (
+  id BIGSERIAL PRIMARY KEY,
+  job_id BIGINT REFERENCES jobs(id),
+  step_id BIGINT REFERENCES steps(id),
+  phase TEXT NOT NULL,
+  status TEXT NOT NULL,
+  duration_seconds DOUBLE PRECISION NOT NULL,
+  prompt_chars INTEGER NOT NULL DEFAULT 0,
+  provider TEXT,
+  model TEXT,
+  detail JSONB NOT NULL DEFAULT '{}',
+  started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS phase_metrics_job_idx
+  ON phase_metrics (job_id, completed_at DESC);
 """
 
 
@@ -1162,6 +1179,30 @@ class OrchestratorStore:
                     "fallback": fallback,
                     "estimated_cloud_cost": estimated_cloud_cost,
                 })
+
+    def record_phase_metric(
+        self,
+        *,
+        job_id: int | None,
+        step_id: int | None,
+        phase: str,
+        status: str,
+        duration_seconds: float,
+        prompt_chars: int = 0,
+        provider: str | None = None,
+        model: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist phase timing and prompt size, including crashed phases."""
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO phase_metrics
+                (job_id,step_id,phase,status,duration_seconds,prompt_chars,provider,model,detail)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (job_id, step_id, phase, status, max(0.0, float(duration_seconds)),
+                 max(0, int(prompt_chars or 0)), provider, model,
+                 json.dumps(detail or {}, default=str)),
+            )
 
     def heartbeat_worker(self, worker_id: str, component: str, status: str,
                          *, job_id: int | None = None, step_id: int | None = None,

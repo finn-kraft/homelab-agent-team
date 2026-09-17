@@ -115,7 +115,7 @@ class Store:
         )
         for pattern in patterns:
             value = re.sub(pattern, "[REDACTED]", value)
-        return value[:100_000]
+        return value[:50_000]
 
     def event(self, task: Task, kind: str, payload: dict[str, Any]) -> None:
         with self.connect() as connection:

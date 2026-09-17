@@ -10,6 +10,12 @@ from .db import Store
 from .git import GitRepository
 from .llm import BackendError, Router
 from .models import AgentResult, Status, Task, WorkPackage
+from agent_core.prompt_budget import (
+    DEFAULT_PROMPT_CHARS,
+    bounded_json,
+    bounded_messages,
+    message_chars,
+)
 from .workspace import Workspace, WorkspaceViolation
 
 
@@ -33,9 +39,12 @@ change branches, access secrets, or expand the assignment. Prefer small, reviewa
 
 class CoderAgent:
     def __init__(self, store: Store, router: Router, worker_id: str,
-                 allowed_roots: list[str], max_turns: int = 30, max_attempts: int = 4):
+                 allowed_roots: list[str], max_turns: int = 30, max_attempts: int = 4,
+                 max_prompt_chars: int = DEFAULT_PROMPT_CHARS):
         self.store, self.router, self.worker_id = store, router, worker_id
         self.allowed_roots, self.max_turns, self.max_attempts = allowed_roots, max_turns, max_attempts
+        self.max_prompt_chars = max(1_024, int(max_prompt_chars))
+        self.last_prompt_chars = 0
 
     def run_package(self, package: WorkPackage | Task, step_id: int | None = None,
                     attempt: int = 0) -> AgentResult:
@@ -73,6 +82,7 @@ class CoderAgent:
         return value[:30_000]
 
     def run_task(self, task: Task) -> AgentResult:
+        self.last_prompt_chars = 0
         if task.attempt > self.max_attempts:
             result = AgentResult(
                 Status.FAILED,
@@ -121,7 +131,9 @@ class CoderAgent:
                 "project_instructions": workspace.project_instructions(),
             }
             messages = [{"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": json.dumps(context)}]
+                        {"role": "user", "content": bounded_json(
+                            context, self.max_prompt_chars, "engineering context"
+                        )}]
             last_model = backend.model
             verified = False
             previous_observation = ""
@@ -140,7 +152,9 @@ class CoderAgent:
                     backend = self.router.choose(task.attempt + stagnation, True)
                     last_model = backend.model
                     stagnation = 0
-                response = backend.complete(messages)
+                request_messages = bounded_messages(messages, self.max_prompt_chars)
+                self.last_prompt_chars = message_chars(request_messages)
+                response = backend.complete(request_messages)
                 last_model = response.model
                 try:
                     action = self._parse_action(response.text)
@@ -299,8 +313,8 @@ class CoderAgent:
                 raise ValueError("argv must be a string list")
             result = runner.run(argv, min(int(action.get("timeout", 300)), 900))
             self.store.record_command(task.step_id, result, task.attempt)
-            return json.dumps({"stdout": self._redact(result.stdout),
-                               "stderr": self._redact(result.stderr),
+            return json.dumps({"stdout": self._redact(result.stdout)[:12_000],
+                               "stderr": self._redact(result.stderr)[:12_000],
                                "exit_code": result.exit_code,
                                "duration_seconds": result.duration_seconds,
                                "timed_out": result.timed_out})

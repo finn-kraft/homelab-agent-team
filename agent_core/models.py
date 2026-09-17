@@ -197,6 +197,9 @@ class PlannerDecision:
     provider: str | None = None
     latency_seconds: float | None = None
     usage: dict[str, Any] | None = None
+    # Optional bounded batch emitted by V2-aware planners. ``step`` remains
+    # the first item for V1 callers and older model responses.
+    steps: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

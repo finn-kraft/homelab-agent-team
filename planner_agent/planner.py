@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from agent_core.models import PlannerDecision
+from agent_core.prompt_budget import bounded_messages, bounded_text, message_chars
 from agent_core.llm import BackendError
 from .decision import InvalidDecision, completion_is_supported, parse_decision
 from .inspector import InspectionError, ReadOnlyRepositoryInspector
@@ -13,16 +14,21 @@ from .prompt import SYSTEM_PROMPT
 class PlannerAgent:
     def __init__(self, store, router, inspector: ReadOnlyRepositoryInspector,
                  worker_id: str, lease_seconds: int = 300, decision_retries: int = 3,
-                 escalation_attempt: int = 4, max_context_chars: int = 120_000):
+                 escalation_attempt: int = 4, max_context_chars: int = 120_000,
+                 max_package_steps: int = 3):
         self.store, self.router, self.inspector = store, router, inspector
         self.worker_id, self.lease_seconds = worker_id, lease_seconds
         self.decision_retries, self.escalation_attempt = decision_retries, escalation_attempt
         self.max_context_chars = max(16_000, int(max_context_chars))
+        self.max_package_steps = max(1, min(5, int(max_package_steps)))
+        self.last_prompt_chars = 0
         # Observability only: the deterministic Orchestrator uses this after a
         # bounded call to persist model-routing metadata without scraping logs.
         self.last_job_id: int | None = None
 
     def plan_once(self) -> PlannerDecision | None:
+        self.last_job_id = None
+        self.last_prompt_chars = 0
         job = self.store.claim_job(self.worker_id, self.lease_seconds)
         if not job:
             return None
@@ -48,7 +54,8 @@ class PlannerAgent:
                 "steps": self._bounded_steps(steps),
                 "recent_events": self._bounded_events(events),
                 "rules": {
-                    "one_active_step_maximum": True,
+                    "one_active_package_maximum": True,
+                    "bounded_package_max_steps": self.max_package_steps,
                     "planner_is_read_only": True,
                     "completion_requires_approved_commits_and_multiple_evidence_items": True,
                 },
@@ -67,7 +74,9 @@ class PlannerAgent:
                     route_attempt = failed_attempts + repair_attempt + 1
                     backend = self.router.choose(
                         route_attempt, route_attempt >= self.escalation_attempt)
-                    response = backend.complete(messages)
+                    request_messages = bounded_messages(messages, self.max_context_chars)
+                    self.last_prompt_chars = message_chars(request_messages)
+                    response = backend.complete(request_messages)
                 except BackendError as exc:
                     backend_errors.append(str(exc))
                     messages.append({
@@ -77,6 +86,10 @@ class PlannerAgent:
                     continue
                 try:
                     candidate = parse_decision(response.text)
+                    if len(candidate.steps or []) > self.max_package_steps:
+                        raise InvalidDecision(
+                            f"bounded package may contain at most {self.max_package_steps} steps"
+                        )
                     if candidate.decision == "complete" and not completion_is_supported(candidate, steps):
                         raise InvalidDecision(
                             "completion is unsupported: every step needs an approved review and commit"
@@ -166,8 +179,7 @@ class PlannerAgent:
 
     @staticmethod
     def _bounded_text(value: Any, limit: int) -> str:
-        text = str(value or "")
-        return text if len(text) <= limit else text[:limit] + "\n[TRUNCATED]"
+        return bounded_text(value, limit)
 
     @classmethod
     def _bounded_repository(cls, repository: dict[str, Any]) -> dict[str, Any]:

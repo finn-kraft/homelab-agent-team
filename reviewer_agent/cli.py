@@ -35,8 +35,12 @@ def build() -> ReviewerAgent:
         if value
     ]
 
-    llm_timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "90"))
-    llm_retries = int(os.getenv("LLM_RETRIES", "1"))
+    llm_timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+    llm_retries = int(os.getenv("LLM_RETRIES", "0"))
+    ollama_timeout = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", str(llm_timeout)))
+    ollama_retries = int(os.getenv("OLLAMA_RETRIES", str(llm_retries)))
+    cloud_timeout = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "90"))
+    cloud_retries = int(os.getenv("OPENROUTER_RETRIES", "1"))
 
     local = OllamaBackend(
         os.getenv(
@@ -47,8 +51,8 @@ def build() -> ReviewerAgent:
             "REVIEWER_MODEL",
             "qwen2.5-coder:14b",
         ),
-        timeout=llm_timeout,
-        retries=llm_retries,
+        timeout=ollama_timeout,
+        retries=ollama_retries,
     )
 
     standard_cloud = None
@@ -64,8 +68,8 @@ def build() -> ReviewerAgent:
                 "qwen/qwen3-coder-next",
             ),
             api_key,
-            timeout=llm_timeout,
-            retries=llm_retries,
+            timeout=cloud_timeout,
+            retries=cloud_retries,
         )
 
         premium_cloud = OpenRouterBackend(
@@ -75,15 +79,14 @@ def build() -> ReviewerAgent:
                 "anthropic/claude-sonnet-4.6",
             ),
             api_key,
-            timeout=llm_timeout,
-            retries=llm_retries,
+            timeout=cloud_timeout,
+            retries=cloud_retries,
         )
 
-    local_attempts = int(
-        os.getenv("INFERENCE_LOCAL_ATTEMPTS", "5")
-    )
-
-    escalation_attempt = local_attempts + 1
+    local_attempts = int(os.getenv("INFERENCE_LOCAL_ATTEMPTS", "3"))
+    escalation_attempt = int(os.getenv(
+        "INFERENCE_ESCALATE_AFTER", str(local_attempts + 1)
+    ))
 
     router = InferenceRouter(
         local,
@@ -120,6 +123,8 @@ def build() -> ReviewerAgent:
                     "300000",
                 )
             ),
+            int(os.getenv("REVIEWER_MAX_DOCUMENT_CHARS", "20000")),
+            int(os.getenv("REVIEWER_MAX_COMMAND_OUTPUT_CHARS", "50000")),
         ),
         os.getenv(
             "REVIEWER_WORKER_ID",

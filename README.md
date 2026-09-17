@@ -59,6 +59,12 @@ roadmap item or mark the overall goal complete with evidence.
   repeated local failures (default fourth attempt).
 - Pause, resume, cancel, inspection, events, structured logs, worker leases,
   and safe recovery of expired verification/checkpoint leases.
+- Hard-bounded planner, Engineer, and reviewer prompts with truncated historical
+  events, diffs, command output, and project documents. The planner can emit a
+  small ordered package (up to `PLANNER_PACKAGE_STEPS`) so the team can execute
+  several clear steps before another planning pass.
+- Durable `phase_metrics` telemetry records phase duration, prompt size, model,
+  provider, and crash status for operations and the Control Center.
 - An authenticated, loopback-only Control Center backed by structured PostgreSQL APIs,
   including job controls, durable events, model routes, repository locks, Ollama model
   state, and optional trusted GPU telemetry.
@@ -101,6 +107,12 @@ chmod 600 .env
 Edit `.env` through your normal secret-management process. It must contain a
 restricted PostgreSQL application URL, repository allow-roots, and worker
 identities. Do not use a database-owner account or commit `.env`.
+
+The default model transport budget is intentionally fail-fast (`OLLAMA_RETRIES=0`
+and a 60-second local timeout), with OpenRouter available as the immediate
+availability fallback. Adjust `OLLAMA_TIMEOUT_SECONDS`, `OLLAMA_RETRIES`,
+`OPENROUTER_TIMEOUT_SECONDS`, and `OPENROUTER_RETRIES` for your hardware and
+network.
 
 Apply the **additive** agent-team schema migration once with a migration-capable
 database role:
@@ -269,6 +281,10 @@ See [`.env.example`](.env.example). The principal values are:
 | `OLLAMA_URL` | Local Ollama endpoint |
 | `OPENROUTER_API_KEY` | Optional backup only; never commit it |
 | `INFERENCE_ESCALATE_AFTER` | First normal cloud-eligible attempt (default `4`) |
+| `OLLAMA_TIMEOUT_SECONDS` / `OLLAMA_RETRIES` | Local request timeout and retry budget (defaults `60` / `0`) |
+| `OPENROUTER_TIMEOUT_SECONDS` / `OPENROUTER_RETRIES` | Cloud request timeout and retry budget (defaults `90` / `1`) |
+| `CODER_MAX_CONTEXT_CHARS`, `PLANNER_MAX_CONTEXT_CHARS`, `REVIEWER_MAX_CONTEXT_CHARS` | Hard prompt character budgets |
+| `PLANNER_PACKAGE_STEPS` | Maximum ordered steps emitted before replanning (default `3`) |
 | `PROTECTED_BRANCHES` | Comma-separated autonomous-commit deny list |
 | `AUTO_COMMIT` | Enables reviewer-approved local checkpoints |
 | `AUTO_PUSH` | Off by default; no force/history rewrite is ever permitted |

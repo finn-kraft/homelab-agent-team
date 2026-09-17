@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from agent_core.prompt_budget import bounded_text
+
 
 class WorkspaceViolation(ValueError):
     pass
@@ -50,6 +52,8 @@ class Workspace:
         for name in ("WORKER.md", "AGENTS.md"):
             path = self.root / name
             if path.is_file():
-                return path.read_text(encoding="utf-8")
+                content = path.read_text(encoding="utf-8", errors="replace")
+                if len(content) > 100_000:
+                    return bounded_text(content, 100_000, "[PROJECT INSTRUCTIONS TRUNCATED]")
+                return content
         return ""
-

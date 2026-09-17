@@ -7,6 +7,7 @@ from contextlib import contextmanager
 
 from .decision import InvalidReview, parse_review
 from .prompt import SYSTEM_PROMPT
+from agent_core.prompt_budget import bounded_messages, bounded_text, message_chars
 
 
 LOG = logging.getLogger(__name__)
@@ -32,9 +33,11 @@ class ReviewerAgent:
         self.max_attempts = max_attempts
         self.large_diff_escalates = large_diff_escalates
         self.max_context_chars = max(16_000, int(max_context_chars))
+        self.last_prompt_chars = 0
 
     def review_once(self, step_id=None):
         """Review one item, optionally the exact step claimed by the coordinator."""
+        self.last_prompt_chars = 0
         item = self.store.claim(
             self.worker_id,
             self.lease_seconds,
@@ -232,8 +235,7 @@ class ReviewerAgent:
                 escalate,
             )
 
-            response = backend.complete(
-                [
+            request_messages = bounded_messages([
                     {
                         "role": "system",
                         "content": SYSTEM_PROMPT,
@@ -242,8 +244,9 @@ class ReviewerAgent:
                         "role": "user",
                         "content": self._context_json(context),
                     },
-                ]
-            )
+                ], self.max_context_chars)
+            self.last_prompt_chars = message_chars(request_messages)
+            response = backend.complete(request_messages)
 
             try:
                 decision = parse_review(
@@ -296,7 +299,7 @@ class ReviewerAgent:
         bounded = dict(context)
         implementation = dict(bounded.get("implementation") or {})
         implementation["command_results"] = [
-            self._bounded_mapping(result, 8_000)
+            self._bounded_value(result, 8_000)
             for result in list(implementation.get("command_results") or [])[-20:]
         ]
         bounded["implementation"] = implementation
@@ -307,9 +310,11 @@ class ReviewerAgent:
             str(name): self._bounded_text(value, 8_000)
             for name, value in dict(evidence.get("documents") or {}).items()
         }
+        evidence["checks"] = self._bounded_value(evidence.get("checks", {}), 8_000)
+        evidence["risk_flags"] = self._bounded_value(evidence.get("risk_flags", {}), 2_000)
         bounded["evidence"] = evidence
         bounded["prior_issues"] = [
-            self._bounded_mapping(issue, 4_000)
+            self._bounded_value(issue, 4_000)
             for issue in list(bounded.get("prior_issues") or [])[-20:]
         ]
         encoded = json.dumps(bounded, default=str)
@@ -351,15 +356,19 @@ class ReviewerAgent:
 
     @staticmethod
     def _bounded_text(value, limit):
-        text = str(value or "")
-        return text if len(text) <= limit else text[:limit] + "\n[TRUNCATED]"
+        return bounded_text(value, limit)
 
     @classmethod
-    def _bounded_mapping(cls, value, value_limit):
-        if not isinstance(value, dict):
+    def _bounded_value(cls, value, value_limit, depth=0):
+        if isinstance(value, (str, bytes)):
             return cls._bounded_text(value, value_limit)
-        return {
-            str(key): cls._bounded_text(item, value_limit)
-            if isinstance(item, (str, bytes)) else item
-            for key, item in value.items()
-        }
+        if depth >= 4:
+            return cls._bounded_text(value, value_limit)
+        if isinstance(value, dict):
+            return {
+                str(key): cls._bounded_value(item, value_limit, depth + 1)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [cls._bounded_value(item, value_limit, depth + 1) for item in list(value)[:20]]
+        return value

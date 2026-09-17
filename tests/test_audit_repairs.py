@@ -53,6 +53,9 @@ def test_reviewer_context_budget_remains_valid_json():
 
 
 class _ReviewCrashStore:
+    def __init__(self):
+        self.metrics = []
+
     def recover_expired(self): return []
     def enforce_iteration_limit(self): return None
     def claim_verification(self, *_args): return None
@@ -60,6 +63,7 @@ class _ReviewCrashStore:
     def claim_coding(self, *_args): return None
     def next_review_step(self): return 7
     def step(self, step_id): return {"id": step_id, "job_id": 1}
+    def record_phase_metric(self, **payload): self.metrics.append(payload)
 
 
 class _CrashingReviewer:
@@ -78,8 +82,9 @@ class _CrashingReviewer:
 
 def test_orchestrator_releases_review_after_reviewer_crash():
     reviewer = _CrashingReviewer()
+    store = _ReviewCrashStore()
     subject = AgentOrchestrator(
-        store=_ReviewCrashStore(), planner=SimpleNamespace(router=SimpleNamespace(last_route=None)),
+        store=store, planner=SimpleNamespace(router=SimpleNamespace(last_route=None)),
         coder=SimpleNamespace(worker_id="coder"), reviewer=reviewer,
         verifier=object(), checkpoint=object(),
         config=OrchestratorConfig(database_url="postgresql://unused", worker_id="orch"),
@@ -89,3 +94,5 @@ def test_orchestrator_releases_review_after_reviewer_crash():
 
     assert result.action == "review_crashed"
     assert reviewer.abandoned and reviewer.abandoned[0][0] == 7
+    assert store.metrics[0]["phase"] == "review"
+    assert store.metrics[0]["status"] == "crashed"
