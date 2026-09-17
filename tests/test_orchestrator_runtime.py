@@ -104,8 +104,8 @@ def test_coder_crash_releases_repository_lock(tmp_path):
 
     result = subject.once()
 
-    assert result.action == "coding_crashed"
-    assert store.released == [(str(tmp_path), "coder-crash:coder:7")]
+    assert result.action == "engineering_crashed"
+    assert store.released == [(str(tmp_path), "coder-crash:engineering:7")]
 
 
 class RecoveryStore(IdleStore):
@@ -115,6 +115,17 @@ class RecoveryStore(IdleStore):
         return value
     def safely_requeue_abandoned_coding(self, step_id, evidence): self.requeued.append(step_id)
     def block_abandoned_coding(self, step_id, evidence): self.blocked.append((step_id,evidence))
+
+
+class PlanningRecoveryStore(IdleStore):
+    def recover_expired_planning(self):
+        return [9]
+
+
+def test_expired_planner_lease_is_released_for_reclaim():
+    result = recovery_subject(PlanningRecoveryStore()).once()
+    assert result.action == "planning_recovered"
+    assert result.job_id == 9
 
 
 def git_repo(tmp_path: Path) -> Path:
@@ -140,7 +151,7 @@ def test_expired_clean_coder_lease_is_requeued(tmp_path):
     stale=[{"id":7,"job_id":1,"repository":str(root),"status":"running"}]
     store=RecoveryStore(stale)
 
-    assert recovery_subject(store).once().action == "coding_requeued"
+    assert recovery_subject(store).once().action == "engineering_requeued"
     assert store.requeued == [7]
 
 
@@ -149,5 +160,5 @@ def test_expired_dirty_coder_lease_blocks_for_safe_reconciliation(tmp_path):
     stale=[{"id":7,"job_id":1,"repository":str(root),"status":"running"}]
     store=RecoveryStore(stale)
 
-    assert recovery_subject(store).once().action == "coding_blocked"
+    assert recovery_subject(store).once().action == "engineering_blocked"
     assert store.blocked and "unclassified" in store.blocked[0][1]

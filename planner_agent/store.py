@@ -144,7 +144,7 @@ class PlannerStore:
                     created_ids.append(row["id"])
                 step_id = created_ids[0]
                 connection.execute(
-                    """UPDATE jobs SET status='running',current_step=%s,iteration_count=iteration_count+%s,
+                    """UPDATE jobs SET status='running',current_phase='engineering',current_step=%s,iteration_count=iteration_count+%s,
                     planner_worker_id=NULL,planner_lease_expires_at=NULL,updated_at=now() WHERE id=%s""",
                     (step_id, len(created_ids), job.id),
                 )
@@ -162,6 +162,13 @@ class PlannerStore:
             status = {"complete": "complete", "needs_human": "needs_human",
                       "blocked": "blocked", "wait_for_review": "reviewing",
                       "retry_step": "running"}.get(decision.decision, "running")
+            phase = {
+                "complete": "complete",
+                "needs_human": "needs_human",
+                "blocked": "blocked",
+                "wait_for_review": "review",
+                "retry_step": "engineering",
+            }.get(decision.decision, "planning")
             if decision.decision == "retry_step":
                 failed = connection.execute(
                     """SELECT id FROM steps WHERE job_id=%s AND status IN ('failed','blocked')
@@ -175,9 +182,9 @@ class PlannerStore:
                 )
             completed = ", completed_at=now()" if status == "complete" else ""
             connection.execute(
-                f"""UPDATE jobs SET status=%s,iteration_count=iteration_count+1,
+                f"""UPDATE jobs SET status=%s,current_phase=%s,iteration_count=iteration_count+1,
                 planner_worker_id=NULL,planner_lease_expires_at=NULL,updated_at=now(){completed}
-                WHERE id=%s""", (status, job.id),
+                WHERE id=%s""", (status, phase, job.id),
             )
             self._event(connection, job.id, None, f"job_{decision.decision}", decision.as_dict())
             if decision.decision == "needs_human":

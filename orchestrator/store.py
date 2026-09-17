@@ -17,7 +17,7 @@ from typing import Any, Iterable
 from engineering_agent.models import Status, Task
 
 
-MIGRATION_VERSION = "orchestrator-0007"
+MIGRATION_VERSION = "orchestrator-0008"
 
 MIGRATION_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -34,6 +34,7 @@ ALTER TABLE steps ADD COLUMN IF NOT EXISTS checkpoint_started_at TIMESTAMPTZ;
 ALTER TABLE steps ADD COLUMN IF NOT EXISTS approved_files JSONB NOT NULL DEFAULT '[]';
 ALTER TABLE command_runs ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'engineering-agent';
 ALTER TABLE command_runs ADD COLUMN IF NOT EXISTS attempt INTEGER;
+ALTER TABLE command_runs ADD COLUMN IF NOT EXISTS cancelled BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE steps ALTER COLUMN assigned_agent SET DEFAULT 'engineering-agent';
 ALTER TABLE command_runs ALTER COLUMN source SET DEFAULT 'engineering-agent';
 -- Existing V1 rows must use the durable V2 identity after migration. Keep
@@ -315,7 +316,7 @@ class OrchestratorStore:
             return dict(row) if row else None
 
     def preexisting_files(self, step_id: int) -> list[str]:
-        """Return the Coder's immutable baseline for a step's current attempt."""
+        """Return EngineeringAgent's immutable baseline for a step's attempt."""
         with self.connect() as connection:
             row = connection.execute(
                 """SELECT structured_payload FROM events
@@ -617,7 +618,7 @@ class OrchestratorStore:
             if not row:
                 return None
             row = dict(row)
-            owner = f"{worker_id}:coder:{row['id']}"
+            owner = f"{worker_id}:engineering:{row['id']}"
             if not self._acquire_repository_lock(connection, row["repository"], owner, repository_lock_seconds):
                 return None
             connection.execute("""UPDATE steps SET status='running',worker_id=%s,
@@ -625,7 +626,7 @@ class OrchestratorStore:
                 updated_at=now(),started_at=COALESCE(started_at,now()) WHERE id=%s""",
                 (worker_id, lease_seconds, row["id"]))
             attempt = int(row["attempt_count"]) + 1
-            self._event(connection, row["job_id"], row["id"], "coding_started", {
+            self._event(connection, row["job_id"], row["id"], "engineering_started", {
                 "worker_id": worker_id, "attempt": attempt, "package_step": True,
                 "repository_lock_owner": owner,
             })
@@ -836,7 +837,7 @@ class OrchestratorStore:
             if not row:
                 return None
             row = dict(row)
-            owner = f"{worker_id}:coder:{row['id']}"
+            owner = f"{worker_id}:engineering:{row['id']}"
             if not self._acquire_repository_lock(
                 connection, row["repository"], owner, repository_lock_seconds
             ):
@@ -849,7 +850,7 @@ class OrchestratorStore:
                 (worker_id, lease_seconds, row["id"]),
             )
             attempt = int(row["attempt_count"]) + 1
-            self._event(connection, row["job_id"], row["id"], "coding_started", {
+            self._event(connection, row["job_id"], row["id"], "engineering_started", {
                 "worker_id": worker_id, "attempt": attempt,
                 "repository_lock_owner": owner,
             })
@@ -883,7 +884,7 @@ class OrchestratorStore:
                         "UPDATE jobs SET status='reviewing',current_phase='review',updated_at=now() WHERE id=%s",
                         (row["job_id"],),
                     )
-                self._event(connection, row["job_id"], step_id, "coding_finished", {
+                self._event(connection, row["job_id"], step_id, "engineering_finished", {
                     "worker_id": worker_id, "attempt": row["attempt_count"],
                     "files_changed": self._json_list(row["files_changed"]),
                 })
@@ -894,7 +895,7 @@ class OrchestratorStore:
                         "UPDATE jobs SET status=%s,current_phase=%s,updated_at=now() WHERE id=%s",
                         (job_status, status, row["job_id"]),
                     )
-                self._event(connection, row["job_id"], step_id, f"coding_{status}", {
+                self._event(connection, row["job_id"], step_id, f"engineering_{status}", {
                     "worker_id": worker_id, "blocker": row.get("blocker"),
                 })
             elif status == "failed":
@@ -904,7 +905,7 @@ class OrchestratorStore:
                         "UPDATE jobs SET status='running',current_phase='planning',updated_at=now() WHERE id=%s",
                         (row["job_id"],),
                     )
-                self._event(connection, row["job_id"], step_id, "coding_failed", {
+                self._event(connection, row["job_id"], step_id, "engineering_failed", {
                     "worker_id": worker_id, "blocker": row.get("blocker"),
                 })
             return status
@@ -1034,10 +1035,12 @@ class OrchestratorStore:
             )
             for command in commands:
                 connection.execute(
-                    """INSERT INTO command_runs(step_id,argv,stdout,stderr,exit_code,duration_seconds,timed_out,source,attempt)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,'orchestrator-verification',%s)""",
+                    """INSERT INTO command_runs
+                    (step_id,argv,stdout,stderr,exit_code,duration_seconds,timed_out,cancelled,source,attempt)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'orchestrator-verification',%s)""",
                     (work["id"], json.dumps(command["argv"]), command["stdout"], command["stderr"],
-                     command["exit_code"], command["duration_seconds"], command["timed_out"], attempt),
+                     command["exit_code"], command["duration_seconds"], command["timed_out"],
+                     command["cancelled"], attempt),
                 )
             controlled = row["job_status"] in {"paused", "cancelled"}
             if service_error:
@@ -1229,6 +1232,7 @@ class OrchestratorStore:
             "exit_code": int(get("exit_code", 1)),
             "duration_seconds": float(get("duration_seconds", 0.0)),
             "timed_out": bool(get("timed_out", False)),
+            "cancelled": bool(get("cancelled", False)),
         }
 
     # ------------------------------------------------------------------
@@ -1295,6 +1299,34 @@ class OrchestratorStore:
                 })
             return [dict(row) for row in rows]
 
+    def recover_expired_planning(self) -> list[int]:
+        """Release planner leases abandoned by a crashed or wedged worker.
+
+        Planner leases are job-level leases, unlike the step leases handled by
+        :meth:`recover_expired`. Keeping this recovery explicit gives the
+        operator an audit event and lets the next coordinator tick reclaim the
+        job immediately instead of leaving it looking permanently stuck.
+        """
+        with self.connect() as connection:
+            rows = list(connection.execute(
+                """UPDATE jobs SET status='running',planner_worker_id=NULL,
+                   planner_lease_expires_at=NULL,updated_at=now()
+                   WHERE status='planning'
+                     AND planner_lease_expires_at IS NOT NULL
+                     AND planner_lease_expires_at < now()
+                     AND NOT EXISTS (
+                       SELECT 1 FROM steps s WHERE s.job_id=jobs.id
+                       AND s.status IN ('queued','running','review',
+                                        'changes_requested','verification','checkpoint')
+                     )
+                   RETURNING id"""
+            ).fetchall())
+            for row in rows:
+                self._event(connection, row["id"], None, "planning_lease_recovered", {
+                    "reason": "planner lease expired without an active implementation step",
+                })
+            return [int(row["id"]) for row in rows]
+
     def safely_requeue_abandoned_coding(self, step_id: int, evidence: str) -> None:
         with self.connect() as connection:
             row = connection.execute(
@@ -1311,7 +1343,7 @@ class OrchestratorStore:
                 "UPDATE jobs SET status='running',current_phase='coding',updated_at=now() WHERE id=%s",
                 (row["job_id"],),
             )
-            self._event(connection, row["job_id"], step_id, "coding_recovered", {"evidence": evidence})
+            self._event(connection, row["job_id"], step_id, "engineering_recovered", {"evidence": evidence})
 
     def block_abandoned_coding(self, step_id: int, evidence: str) -> None:
         with self.connect() as connection:

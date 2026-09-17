@@ -8,6 +8,9 @@ from agent_core.prompt_budget import bounded_json, bounded_messages, bounded_tex
 from coder_agent.agent import CoderAgent
 from coder_agent.cli import _engineering_turn_limit
 from coder_agent.db import Store
+from coder_agent.commands import CommandRejected
+from coder_agent.git import GitError
+from coder_agent.llm import BackendError
 from coder_agent.models import Status, Task
 
 
@@ -25,6 +28,12 @@ def test_redacts_credentials():
     text = CoderAgent._redact(f"{assignment} {token}")
     assert "super-secret-value" not in text
     assert "gh" + "p_" not in text
+
+
+def test_failure_categories_are_stable_for_operator_recovery():
+    assert CoderAgent._classify_failure(BackendError("backend circuit open")) == "model"
+    assert CoderAgent._classify_failure(CommandRejected("unsafe")) == "tool_policy"
+    assert CoderAgent._classify_failure(GitError("missing branch")) == "repository"
 
 
 def test_prompt_history_keeps_system_and_newest_turns_within_budget():
@@ -155,6 +164,11 @@ class _AgentBackend:
         return LLMResponse(self.text, self.model, "ollama")
 
 
+class _FailingBackend(_AgentBackend):
+    def complete(self, _messages):
+        raise BackendError("backend circuit open; retry window has not elapsed")
+
+
 class _AgentRouter:
     def __init__(self, backend):
         self.backend = backend
@@ -180,7 +194,7 @@ def test_running_coder_stops_and_requeues_when_job_is_paused(monkeypatch, tmp_pa
 
     assert result.status is Status.PAUSED
     assert store.updates[-1][2] is Status.QUEUED
-    assert store.events[-1][0] == "coding_paused"
+    assert store.events[-1][0] == "engineering_paused"
 
 
 def test_turn_budget_becomes_a_recoverable_blocker(monkeypatch, tmp_path):
@@ -196,6 +210,24 @@ def test_turn_budget_becomes_a_recoverable_blocker(monkeypatch, tmp_path):
     assert result.status is Status.BLOCKED
     assert "turn budget exhausted" in (result.blocker or "")
     assert store.updates[-1][2] is Status.BLOCKED
+
+
+def test_model_failure_is_persisted_with_a_recovery_category(monkeypatch, tmp_path):
+    store = _AgentStore("running")
+    monkeypatch.setattr("coder_agent.agent.Workspace", _AgentWorkspace)
+    monkeypatch.setattr("coder_agent.agent.CommandRunner", _AgentRunner)
+    monkeypatch.setattr("coder_agent.agent.GitRepository", _AgentGit)
+    agent = CoderAgent(store, _AgentRouter(_FailingBackend("unused")),
+                       "engineering-1", [str(tmp_path)], max_turns=2)
+
+    result = agent.run_task(_task(tmp_path))
+
+    assert result.status is Status.FAILED
+    assert result.failure_class == "model"
+    assert store.events[-1] == ("engineering_failed", {
+        "failure_class": "model",
+        "error": "backend circuit open; retry window has not elapsed",
+    })
 
 
 def test_progress_mode_has_no_overall_turn_cutoff_and_stops_only_on_stagnation(monkeypatch, tmp_path):

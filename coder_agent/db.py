@@ -19,7 +19,7 @@ class Store:
         try:
             import psycopg
         except ImportError as exc:
-            raise RuntimeError("install coder-agent to enable PostgreSQL support") from exc
+            raise RuntimeError("install EngineeringAgent to enable PostgreSQL support") from exc
         with psycopg.connect(self.database_url) as connection:
             yield connection
 
@@ -27,6 +27,12 @@ class Store:
         sql = Path(__file__).parent.parent.joinpath("agent_core", "schema.sql").read_text()
         with self.connect() as connection:
             connection.execute(sql)
+            # Existing V1 databases may already have command_runs without the
+            # cancellation evidence column. Keep the standalone EngineeringAgent
+            # migration additive as well as the orchestrator migration.
+            connection.execute(
+                "ALTER TABLE command_runs ADD COLUMN IF NOT EXISTS cancelled BOOLEAN NOT NULL DEFAULT false"
+            )
             # Keep the standalone EngineeringAgent CLI compatible with the
             # same durable session tables used by agent-orchestrator.
             connection.execute("""
@@ -130,11 +136,11 @@ class Store:
         with self.connect() as connection:
             connection.execute(
                 """INSERT INTO command_runs
-                (step_id, argv, stdout, stderr, exit_code, duration_seconds, timed_out, source, attempt)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,'engineering-agent',%s)""",
+                (step_id, argv, stdout, stderr, exit_code, duration_seconds, timed_out, cancelled, source, attempt)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'engineering-agent',%s)""",
                 (step_id, json.dumps(result.argv), self._redact_command_output(result.stdout),
                  self._redact_command_output(result.stderr),
-                 result.exit_code, result.duration_seconds, result.timed_out, attempt),
+                 result.exit_code, result.duration_seconds, result.timed_out, result.cancelled, attempt),
             )
 
     @staticmethod

@@ -55,7 +55,7 @@ class Planner:
     def __init__(self, store): self.store = store
     def plan_once(self):
         if any(s["status"] != "complete" for s in self.store.steps): return None
-        if len(self.store.steps) >= 2: return SimpleNamespace(decision="complete")
+        if len(self.store.steps) >= 3: return SimpleNamespace(decision="complete")
         number = len(self.store.steps) + 1
         self.store.steps.append({"id":number,"job_id":1,"title":f"Roadmap step {number}",
             "repository":self.store.repository,"branch":self.store.branch,"status":"queued",
@@ -74,8 +74,16 @@ class Coder:
 
 class Reviewer:
     router = SimpleNamespace(last_route=None)
-    def __init__(self, store): self.store = store
+    def __init__(self, store): self.store, self.review_counts = store, {}
     def review_once(self, step):
+        count = self.review_counts.get(step, 0) + 1
+        self.review_counts[step] = count
+        # Deliberately exercise the same-step Reviewer -> Engineering revision
+        # loop before approving the first package.
+        if step == 1 and count == 1:
+            self.store.steps[step - 1]["status"] = "changes_requested"
+            self.store.events.append(("changes_requested", step))
+            return SimpleNamespace(verdict="changes_requested")
         self.store.steps[step - 1]["status"] = "verification"
         self.store.events.append(("approved", step))
         return SimpleNamespace(verdict="approved")
@@ -84,7 +92,7 @@ def git(root, *args):
     done = subprocess.run(["git", *args], cwd=root, text=True, capture_output=True, check=True)
     return done.stdout
 
-def test_unattended_two_step_run_creates_two_distinct_reviewed_commits(tmp_path):
+def test_unattended_three_step_run_includes_revision_and_distinct_commits(tmp_path):
     root = tmp_path / "repo"; root.mkdir(); git(root, "init", "-q", "-b", "agents/two-step")
     git(root, "config", "user.name", "Agent Test"); git(root, "config", "user.email", "agent@example.invalid")
     (root / "WORKER.md").write_text('## Verification\n- Tests: `python3 -c "print(1)"`\n')
@@ -95,12 +103,13 @@ def test_unattended_two_step_run_creates_two_distinct_reviewed_commits(tmp_path)
                                 lease_seconds=60, repository_lock_seconds=60, auto_commit=True)
     subject = AgentOrchestrator(store=store, planner=Planner(store), coder=Coder(store),
         reviewer=Reviewer(store), verifier=VerificationService(), checkpoint=CheckpointService(), config=config)
-    for _ in range(20):
+    for _ in range(40):
         subject.once()
-        if len([s for s in store.steps if s["status"] == "complete"]) == 2: break
-    assert [s["status"] for s in store.steps] == ["complete", "complete"]
-    assert len({s["resulting_commit"] for s in store.steps}) == 2
-    assert [event[0] for event in store.events].count("approved") == 2
-    assert git(root, "log", "--format=%s", "-2").splitlines() == [
-        "agent: Roadmap step 2", "agent: Roadmap step 1"
+        if len([s for s in store.steps if s["status"] == "complete"]) == 3: break
+    assert [s["status"] for s in store.steps] == ["complete", "complete", "complete"]
+    assert len({s["resulting_commit"] for s in store.steps}) == 3
+    assert [event[0] for event in store.events].count("approved") == 3
+    assert [event[0] for event in store.events].count("changes_requested") == 1
+    assert git(root, "log", "--format=%s", "-3").splitlines() == [
+        "agent: Roadmap step 3", "agent: Roadmap step 2", "agent: Roadmap step 1"
     ]
