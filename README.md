@@ -239,10 +239,20 @@ agent-control-center --host 127.0.0.1 --port 8080
 GPU data must come from a trusted, bearer-authenticated read-only JSON endpoint on the
 Ollama host. The dashboard never accepts SSH details or arbitrary commands.
 
+For a persistent full stack, install the routing, orchestrator, and Control Center units
+plus [`deploy/agent-team.target.example`](deploy/agent-team.target.example). Then the
+entire team follows one lifecycle command:
+
+```bash
+sudo systemctl enable --now agent-team.target
+```
+
 See [`docs/STATE_MACHINE_AUDIT.md`](docs/STATE_MACHINE_AUDIT.md) for transition
 ownership, leases, recovery behavior, confirmed root causes, and remaining constraints.
 Complete project-catalog, authentication, SSE, human-response, telemetry, and deployment
 instructions are in [`docs/CONTROL_CENTER.md`](docs/CONTROL_CENTER.md).
+The copy-ready install, startup, systemd, health-check, and update commands are in
+[`docs/RUN_THE_TEAM.md`](docs/RUN_THE_TEAM.md).
 
 ## Configuration
 

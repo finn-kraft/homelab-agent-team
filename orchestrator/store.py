@@ -792,9 +792,16 @@ class OrchestratorStore:
         if action not in mapping:
             raise ValueError(f"unknown control action: {action}")
         with self.connect() as connection:
-            row = connection.execute("SELECT id FROM jobs WHERE id=%s FOR UPDATE", (job_id,)).fetchone()
+            row = connection.execute(
+                "SELECT id,status FROM jobs WHERE id=%s FOR UPDATE", (job_id,)
+            ).fetchone()
             if not row:
                 raise KeyError(f"job {job_id} does not exist")
+            allowed = self.allowed_control_actions(row["status"])
+            if action not in allowed:
+                raise ValueError(
+                    f"cannot {action} job {job_id} while status is {row['status']}"
+                )
             status = mapping[action]
             paused = "now()" if status == "paused" else "NULL"
             connection.execute(
@@ -805,6 +812,20 @@ class OrchestratorStore:
             self._event(connection, job_id, None, event, {
                 "status": status,
             })
+
+    @staticmethod
+    def allowed_control_actions(status: str) -> set[str]:
+        """Return safe operator actions for one durable job state."""
+        active = {"pending", "planning", "running", "reviewing", "verifying", "checkpointing"}
+        resumable = {"paused", "blocked", "failed"}
+        actions: set[str] = set()
+        if status in active:
+            actions.add("pause")
+        if status in resumable:
+            actions.add("resume")
+        if status not in {"complete", "cancelled"}:
+            actions.add("cancel")
+        return actions
 
     def record_model_invocation(
         self,

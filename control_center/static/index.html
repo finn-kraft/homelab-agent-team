@@ -1,11 +1,118 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Agent Team Control Center</title><link rel="stylesheet" href="/styles.css"></head>
-<body><aside><div class="brand"><span class="logo">A</span><div><strong>Agent Team</strong><small>Control Center</small></div></div>
-<nav><button data-view="dashboard" class="active">Overview</button><button data-view="projects">Projects</button><button data-view="agents">Agents</button><button data-view="events">Events</button></nav>
-<div class="connection"><span id="liveDot"></span><span id="liveText">Disconnected</span></div></aside>
-<main><header><div><h1 id="pageTitle">Overview</h1><p id="pageSubtitle">Your autonomous development team at a glance.</p></div><button class="primary" id="newJobButton">＋ New Job</button></header><div class="flow" aria-label="Autonomous workflow"><span class="stage">Planner</span><span class="arrow">→</span><span class="stage">Coder</span><span class="arrow">→</span><span class="stage">Reviewer</span><span class="arrow">→</span><span class="stage">Verification</span><span class="arrow">→</span><span class="stage">Commit</span></div>
-<section id="login" class="login card"><h2>Connect securely</h2><p>Enter the Control Center API token configured on this server.</p><input id="token" type="password" autocomplete="current-password" placeholder="API token"><button class="primary" id="connect">Connect</button><p id="loginError" class="error"></p></section>
-<div id="app" hidden><section id="dashboardView" class="view"></section><section id="projectsView" class="view" hidden></section><section id="agentsView" class="view" hidden></section><section id="eventsView" class="view" hidden></section><section id="jobView" class="view" hidden></section></div></main>
-<dialog id="jobDialog"><form id="jobForm"><div class="dialog-head"><h2>Start a new job</h2><button type="button" class="icon" data-close>×</button></div><label>Project<select id="project" required></select></label><label>Goal<textarea id="goal" required minlength="10" placeholder="Read the roadmap and continuously implement the next appropriate unfinished work."></textarea></label><details><summary>Advanced settings</summary><label>Priority<input id="priority" type="number" value="0"></label><label>Maximum iterations<input id="maxIterations" type="number" min="1" value="100"></label></details><div class="actions"><button type="button" data-close>Cancel</button><button class="primary" type="submit">Start job</button></div></form></dialog>
-<script src="/app.js"></script></body></html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#080b12">
+  <title>Agent Team Control Center</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><path d="M12 2 3.6 6.8v9.6L12 22l8.4-5.6V6.8L12 2Zm0 4.1 4.7 2.7-4.7 2.8-4.7-2.8L12 6.1Zm-5.2 5.6 3.4 2v4.1l-3.4-2.3v-3.8Zm6.9 6.1v-4.1l3.5-2v3.8l-3.5 2.3Z"/></svg>
+      </span>
+      <div><strong>Agent Team</strong><small>Control Center</small></div>
+    </div>
+
+    <div class="workspace-label"><span></span> Operations</div>
+    <nav aria-label="Primary navigation">
+      <button data-view="dashboard" class="active">
+        <svg viewBox="0 0 24 24"><path d="M4 4h6v7H4V4Zm10 0h6v4h-6V4ZM4 15h6v5H4v-5Zm10-3h6v8h-6v-8Z"/></svg><span>Overview</span>
+      </button>
+      <button data-view="projects">
+        <svg viewBox="0 0 24 24"><path d="M3 5.5A2.5 2.5 0 0 1 5.5 3H10l2 2h6.5A2.5 2.5 0 0 1 21 7.5v9a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 16.5v-11Z"/></svg><span>Projects</span>
+      </button>
+      <button data-view="agents">
+        <svg viewBox="0 0 24 24"><path d="M9 3h6l1 3h2a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-2.2L14 21h-4l-1.8-2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h2l1-3Zm.5 8a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Zm5 0a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Z"/></svg><span>Agents</span>
+      </button>
+      <button data-view="events">
+        <svg viewBox="0 0 24 24"><path d="M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Zm2 5v2h10V8H7Zm0 4v2h7v-2H7Zm0 4v2h9v-2H7Z"/></svg><span>Events</span>
+      </button>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="connection" aria-live="polite">
+        <span id="liveDot"></span>
+        <div><strong id="liveText">Disconnected</strong><small>Secure live feed</small></div>
+        <button id="disconnect" class="disconnect" title="Disconnect and clear token" aria-label="Disconnect">×</button>
+      </div>
+      <div class="local-first"><span>LOCAL FIRST</span><small>PostgreSQL + Ollama</small></div>
+    </div>
+  </aside>
+
+  <main class="workspace">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">Mission control <span>/</span> <b id="breadcrumb">Overview</b></div>
+        <h1 id="pageTitle">Overview</h1>
+        <p id="pageSubtitle">Your autonomous development team at a glance.</p>
+      </div>
+      <div class="header-actions">
+        <div class="clock" id="clock" aria-label="Current time"></div>
+        <button class="primary" id="newJobButton">
+          <svg viewBox="0 0 24 24"><path d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6V5Z"/></svg>
+          New job
+        </button>
+      </div>
+    </header>
+
+    <div class="workflow-ribbon" aria-label="Autonomous workflow">
+      <div class="workflow-copy"><span>WORKFLOW</span><small>Autonomous delivery loop</small></div>
+      <div class="flow compact">
+        <span class="stage"><i>1</i>Planner</span><span class="arrow">›</span>
+        <span class="stage"><i>2</i>Coder</span><span class="arrow">›</span>
+        <span class="stage"><i>3</i>Reviewer</span><span class="arrow">›</span>
+        <span class="stage"><i>4</i>Verification</span><span class="arrow">›</span>
+        <span class="stage"><i>5</i>Commit</span>
+      </div>
+    </div>
+
+    <section id="login" class="login-stage">
+      <div class="login-visual">
+        <div class="orbit orbit-one"><span></span></div>
+        <div class="orbit orbit-two"><span></span></div>
+        <div class="core"><span class="logo large"><svg viewBox="0 0 24 24"><path d="M12 2 3.6 6.8v9.6L12 22l8.4-5.6V6.8L12 2Zm0 4.1 4.7 2.7-4.7 2.8-4.7-2.8L12 6.1Zm-5.2 5.6 3.4 2v4.1l-3.4-2.3v-3.8Zm6.9 6.1v-4.1l3.5-2v3.8l-3.5 2.3Z"/></svg></span></div>
+      </div>
+      <div class="login card">
+        <span class="kicker">AUTHENTICATED ACCESS</span>
+        <h2>Connect to your agent team</h2>
+        <p>Use the Control Center token configured on this server. It stays only in this browser tab.</p>
+        <label class="token-field"><span>Control Center token</span><input id="token" type="password" autocomplete="current-password" placeholder="Paste your secure token"></label>
+        <button class="primary wide" id="connect">Connect securely <span>→</span></button>
+        <p id="loginError" class="error" role="alert"></p>
+        <div class="security-note"><span>◆</span> Bound to your private infrastructure</div>
+      </div>
+    </section>
+
+    <div id="app" hidden>
+      <section id="dashboardView" class="view"></section>
+      <section id="projectsView" class="view" hidden></section>
+      <section id="agentsView" class="view" hidden></section>
+      <section id="eventsView" class="view" hidden></section>
+      <section id="jobView" class="view" hidden></section>
+    </div>
+  </main>
+
+  <dialog id="jobDialog">
+    <form id="jobForm">
+      <div class="dialog-head">
+        <div><span class="kicker">NEW MISSION</span><h2>Start a new job</h2><p>Give the team a durable outcome to work toward.</p></div>
+        <button type="button" class="icon" data-close aria-label="Close">×</button>
+      </div>
+      <label>Project<select id="project" required></select></label>
+      <label>Goal<textarea id="goal" required minlength="10" placeholder="Read the roadmap and continuously implement the next appropriate unfinished work."></textarea></label>
+      <details class="advanced"><summary>Advanced settings</summary><div class="form-grid"><label>Priority<input id="priority" type="number" min="-100" max="100" value="0"></label><label>Maximum iterations<input id="maxIterations" type="number" min="1" max="10000" value="100"></label></div></details>
+      <div class="actions"><button type="button" data-close>Cancel</button><button class="primary" type="submit">Launch job <span>→</span></button></div>
+    </form>
+  </dialog>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

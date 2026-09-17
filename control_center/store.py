@@ -111,8 +111,11 @@ class ControlStore:
     def create(self, data):
         project = self.projects.get(data["project_id"]); goal = str(data["goal"]).strip()
         if len(goal) < 10 or len(goal) > 12_000: raise ValueError("goal must be 10-12000 characters")
+        priority, max_iterations = int(data.get("priority",0)), int(data.get("max_iterations",100))
+        if not -100 <= priority <= 100: raise ValueError("priority must be between -100 and 100")
+        if not 1 <= max_iterations <= 10_000: raise ValueError("max_iterations must be 1-10000")
         return self.planner.create_job(goal, project.repository, project.branch,
-                                       int(data.get("priority",0)), int(data.get("max_iterations",100)))
+                                       priority, max_iterations)
     def action(self, job_id, action): self.workflow.control(job_id, action)
     def answer(self, job_id, answer):
         answer = str(answer).strip()

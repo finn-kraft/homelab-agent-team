@@ -1,0 +1,7 @@
+[Unit]
+Description=Homelab Agent Development Team
+Wants=homelab-routing-agent.service agent-orchestrator.service agent-control-center.service
+After=network-online.target homelab-routing-agent.service
+
+[Install]
+WantedBy=multi-user.target
