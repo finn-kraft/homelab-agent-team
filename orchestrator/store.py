@@ -14,10 +14,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
-from coder_agent.models import Status, Task
+from engineering_agent.models import Status, Task
 
 
-MIGRATION_VERSION = "orchestrator-0005"
+MIGRATION_VERSION = "orchestrator-0007"
 
 MIGRATION_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -32,8 +32,14 @@ ALTER TABLE steps ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ;
 ALTER TABLE steps ADD COLUMN IF NOT EXISTS checkpoint_marker TEXT;
 ALTER TABLE steps ADD COLUMN IF NOT EXISTS checkpoint_started_at TIMESTAMPTZ;
 ALTER TABLE steps ADD COLUMN IF NOT EXISTS approved_files JSONB NOT NULL DEFAULT '[]';
-ALTER TABLE command_runs ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'coder-agent';
+ALTER TABLE command_runs ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'engineering-agent';
 ALTER TABLE command_runs ADD COLUMN IF NOT EXISTS attempt INTEGER;
+ALTER TABLE steps ALTER COLUMN assigned_agent SET DEFAULT 'engineering-agent';
+ALTER TABLE command_runs ALTER COLUMN source SET DEFAULT 'engineering-agent';
+-- Existing V1 rows must use the durable V2 identity after migration. Keep
+-- historical event.agent values untouched because they are an audit record.
+UPDATE steps SET assigned_agent='engineering-agent' WHERE assigned_agent='coder-agent';
+UPDATE command_runs SET source='engineering-agent' WHERE source='coder-agent';
 
 CREATE TABLE IF NOT EXISTS repository_locks (
   repository TEXT PRIMARY KEY,
@@ -313,7 +319,7 @@ class OrchestratorStore:
         with self.connect() as connection:
             row = connection.execute(
                 """SELECT structured_payload FROM events
-                WHERE step_id=%s AND agent='coder-agent' AND event_type='started'
+                WHERE step_id=%s AND agent IN ('engineering-agent','coder-agent') AND event_type='started'
                 ORDER BY id DESC LIMIT 1""", (step_id,)
             ).fetchone()
             if not row:
@@ -799,6 +805,10 @@ class OrchestratorStore:
             )
             return result.rowcount == 1
 
+    def heartbeat_engineering(self, step_id: int, worker_id: str, lease_seconds: int) -> bool:
+        """Preferred V2 name for the mutation-worker lease heartbeat."""
+        return self.heartbeat_coding(step_id, worker_id, lease_seconds)
+
     def heartbeat_orchestration(self, step_id: int, worker_id: str,
                                 lease_seconds: int) -> bool:
         with self.connect() as connection:
@@ -850,6 +860,11 @@ class OrchestratorStore:
                 row.get("reviewer_feedback"),
             )
 
+    def claim_engineering(self, worker_id: str, lease_seconds: int,
+                          repository_lock_seconds: int) -> Task | None:
+        """Preferred V2 name for claiming one Engineering step."""
+        return self.claim_coding(worker_id, lease_seconds, repository_lock_seconds)
+
     def finish_coding_handoff(self, step_id: int, worker_id: str) -> str | None:
         """Synchronize a bounded Coder call with job-level workflow state."""
         with self.connect() as connection:
@@ -893,6 +908,10 @@ class OrchestratorStore:
                     "worker_id": worker_id, "blocker": row.get("blocker"),
                 })
             return status
+
+    def finish_engineering_handoff(self, step_id: int, worker_id: str) -> str | None:
+        """Preferred V2 name for completing the Engineering hand-off."""
+        return self.finish_coding_handoff(step_id, worker_id)
 
     def next_review_step(self) -> int | None:
         """Mark one ready step as reviewing, then let Reviewer claim that exact ID."""
@@ -1329,24 +1348,81 @@ class OrchestratorStore:
                 )
             status = mapping[action]
             paused = "now()" if status == "paused" else "NULL"
+            phase = "'cancelled'" if status == "cancelled" else "current_phase"
+            requeued_step = None
+            requeued_steps = 0
+            if action == "resume" and row["status"] in {"blocked", "failed"}:
+                candidate = connection.execute(
+                    """SELECT id FROM steps WHERE job_id=%s AND status IN ('blocked','failed')
+                       ORDER BY sequence,id LIMIT 1""",
+                    (job_id,),
+                ).fetchone()
+                if candidate:
+                    requeued_step = candidate["id"]
+                if requeued_step is not None:
+                    result = connection.execute(
+                        """UPDATE steps SET status='queued',blocker=NULL,worker_id=NULL,
+                           lease_expires_at=NULL,orchestrator_worker_id=NULL,
+                           orchestrator_lease_expires_at=NULL,reviewer_worker_id=NULL,
+                           review_lease_expires_at=NULL,updated_at=now()
+                           WHERE id=%s AND status IN ('blocked','failed')""",
+                        (requeued_step,),
+                    )
+                    requeued_steps = result.rowcount
+                    connection.execute(
+                        """UPDATE work_packages SET status='ready',worker_id=NULL,
+                           lease_expires_at=NULL,updated_at=now()
+                           WHERE step_id=%s AND status IN ('blocked','failed')""",
+                        (requeued_step,),
+                    )
+                phase = "'coding'" if requeued_step else "'planning'"
             connection.execute(
-                f"""UPDATE jobs SET status=%s,planner_worker_id=NULL,planner_lease_expires_at=NULL,
-                paused_at={paused},updated_at=now() WHERE id=%s""", (status, job_id)
+                f"""UPDATE jobs SET status=%s,current_phase={phase},
+                current_step=COALESCE(%s,current_step),
+                planner_worker_id=NULL,planner_lease_expires_at=NULL,
+                paused_at={paused},updated_at=now() WHERE id=%s""", (status, requeued_step, job_id)
             )
+            if status == "cancelled":
+                # Cancellation is a durable stop, not just a job-label change.
+                # Release every specialist lease and mark unfinished steps
+                # cancelled so the detail page cannot look runnable after the
+                # operator has stopped it.
+                connection.execute(
+                    """UPDATE steps SET status='cancelled',worker_id=NULL,
+                       lease_expires_at=NULL,orchestrator_worker_id=NULL,
+                       orchestrator_lease_expires_at=NULL,reviewer_worker_id=NULL,
+                       review_lease_expires_at=NULL,blocker=NULL,updated_at=now()
+                       WHERE job_id=%s AND status NOT IN ('complete','cancelled')""",
+                    (job_id,),
+                )
+                connection.execute(
+                    """UPDATE human_queue SET status='cancelled',updated_at=now()
+                       WHERE job_id=%s AND status='open'""",
+                    (job_id,),
+                )
+                connection.execute(
+                    """UPDATE work_packages SET status='cancelled',worker_id=NULL,
+                       lease_expires_at=NULL,updated_at=now()
+                       WHERE job_id=%s AND status NOT IN ('complete','cancelled')""",
+                    (job_id,),
+                )
             event = {"pause": "job_paused", "resume": "job_resumed", "cancel": "job_cancelled"}[action]
             self._event(connection, job_id, None, event, {
                 "status": status,
+                "requeued_steps": requeued_steps,
             })
 
     def remove_queued_job(self, job_id: int) -> None:
-        """Permanently remove a job that has not entered the workflow yet.
+        """Backward-compatible alias for the Control Center clear action."""
+        self.remove_job(job_id)
 
-        A queued job is represented by the ``pending`` job state and has no
-        steps.  Refusing every other state prevents an operator action from
-        deleting work that may already have changed a repository or acquired
-        a worker lease.  Its creation event is removed with the job because
-        the events table references the job and queued jobs have no durable
-        execution history to preserve.
+    def remove_job(self, job_id: int) -> None:
+        """Clear a job from the active queue without destroying its audit trail.
+
+        A removed job is durably cancelled rather than deleted. This is safe
+        while workers are in flight and keeps steps, reviews, commands, and
+        events available for inspection. Stale blockers and open human
+        requests are cleared so old errors do not keep appearing in the queue.
         """
         with self.connect() as connection:
             row = connection.execute(
@@ -1354,24 +1430,37 @@ class OrchestratorStore:
             ).fetchone()
             if not row:
                 raise KeyError(f"job {job_id} does not exist")
-            if row["status"] != "pending":
-                raise ValueError("only queued jobs can be removed")
-            step = connection.execute(
-                "SELECT 1 FROM steps WHERE job_id=%s LIMIT 1", (job_id,)
-            ).fetchone()
-            if step:
-                raise ValueError("queued job already has workflow steps")
-            package = connection.execute(
-                "SELECT 1 FROM work_packages WHERE job_id=%s LIMIT 1", (job_id,)
-            ).fetchone()
-            if package:
-                raise ValueError("queued job is linked to a work package")
-            connection.execute("DELETE FROM events WHERE job_id=%s", (job_id,))
-            deleted = connection.execute(
-                "DELETE FROM jobs WHERE id=%s AND status='pending'", (job_id,)
+            if row["status"] == "cancelled":
+                return
+            connection.execute(
+                """UPDATE jobs SET status='cancelled',current_phase='cancelled',
+                   planner_worker_id=NULL,planner_lease_expires_at=NULL,
+                   paused_at=NULL,updated_at=now() WHERE id=%s""",
+                (job_id,),
             )
-            if deleted.rowcount != 1:
-                raise RuntimeError("queued job changed before it could be removed")
+            connection.execute(
+                """UPDATE steps SET status='cancelled',worker_id=NULL,lease_expires_at=NULL,
+                   orchestrator_worker_id=NULL,orchestrator_lease_expires_at=NULL,
+                   reviewer_worker_id=NULL,review_lease_expires_at=NULL,
+                   blocker=NULL,updated_at=now()
+                   WHERE job_id=%s AND status NOT IN ('complete','cancelled')""",
+                (job_id,),
+            )
+            connection.execute(
+                """UPDATE human_queue SET status='cancelled',updated_at=now()
+                   WHERE job_id=%s AND status='open'""",
+                (job_id,),
+            )
+            connection.execute(
+                """UPDATE work_packages SET status='cancelled',worker_id=NULL,
+                   lease_expires_at=NULL,updated_at=now()
+                   WHERE job_id=%s AND status NOT IN ('complete','cancelled')""",
+                (job_id,),
+            )
+            self._event(connection, job_id, None, "job_removed", {
+                "previous_status": row["status"],
+                "reason": "operator cleared job from the Control Center queue",
+            })
 
     @staticmethod
     def allowed_control_actions(status: str) -> set[str]:

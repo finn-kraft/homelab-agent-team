@@ -24,12 +24,15 @@ Inspect the repository and project instructions first, form and revise your impl
 plan internally, then implement, test, debug, and prepare a reviewable candidate. The
 reviewer owns approval, but reviewer feedback returns to this same package session.
 Work only within the package objective and constraints.
+Repository paths are relative to the repository root. The `repository` value is an
+absolute label, not a file path. Use the provided `repository_files` inventory or
+`inspect` with `kind:"tree"` before choosing a path; never guess a filename.
 Return exactly one JSON object per turn, with one action:
 {"action":"read","path":"relative/path"}
 {"action":"write","path":"relative/path","content":"complete file content"}
 {"action":"delete","path":"relative/path","justification":"specific reason"}
 {"action":"run","argv":["pytest","-q"],"timeout":300}
-{"action":"inspect","kind":"status|diff|instructions"}
+{"action":"inspect","kind":"status|diff|instructions|tree"}
 {"action":"finish","summary":"...","verification":["..."]}
 {"action":"blocked","reason":"..."}
 Never claim a command passed unless its recorded exit code is zero. Do not commit, push,
@@ -141,6 +144,14 @@ class EngineeringAgent:
                 "preexisting_changes": sorted(initial_changes),
                 "session_id": session_id,
             })
+            list_files = getattr(git, "files", None)
+            inventory = getattr(workspace, "list_files", None)
+            if list_files:
+                repository_files = list_files()
+            elif inventory:
+                repository_files = inventory()
+            else:
+                repository_files = []
             backend = self.router.choose(task.attempt)
             context = {
                 "task": {
@@ -151,6 +162,7 @@ class EngineeringAgent:
                     "reviewer_feedback": task.reviewer_feedback,
                 },
                 "repository": str(workspace.root), "branch": current_branch,
+                "repository_files": repository_files,
                 "starting_commit": starting_commit,
                 "preexisting_changes": sorted(initial_changes),
                 "project_instructions": workspace.project_instructions(),
@@ -360,24 +372,26 @@ class EngineeringAgent:
                  runner: CommandRunner, git: GitRepository, task: Task,
                  protected_changes: set[str]) -> str:
         kind = action["action"]
+        canonical = getattr(workspace, "relative_path", None)
+        normalize = canonical if callable(canonical) else str
         if kind == "read":
-            return workspace.read_text(str(action["path"]))
+            return workspace.read_text(normalize(str(action["path"])))
         if kind == "write":
-            path = str(action["path"])
+            path = normalize(str(action["path"]))
             if path in protected_changes:
                 raise WorkspaceViolation(
                     f"refusing to overwrite pre-existing human change: {path}"
                 )
             workspace.write_text(path, str(action["content"]))
-            return f"wrote {action['path']}"
+            return f"wrote {path}"
         if kind == "delete":
-            path = str(action["path"])
+            path = normalize(str(action["path"]))
             if path in protected_changes:
                 raise WorkspaceViolation(
                     f"refusing to delete pre-existing human change: {path}"
                 )
             workspace.delete(path, str(action.get("justification", "")))
-            return f"deleted {action['path']}"
+            return f"deleted {path}"
         if kind == "run":
             argv = action.get("argv")
             if not isinstance(argv, list) or not all(isinstance(v, str) for v in argv):
@@ -397,6 +411,8 @@ class EngineeringAgent:
                 return git.diff()
             if inspect_kind == "instructions":
                 return workspace.project_instructions()
+            if inspect_kind == "tree":
+                return "\n".join(git.files()) or "(repository has no tracked or standard untracked files)"
             raise ValueError(f"unknown inspection: {inspect_kind}")
         if kind in {"finish", "blocked"}:
             return kind

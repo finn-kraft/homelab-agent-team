@@ -7,7 +7,7 @@ import signal
 import sys
 from typing import Sequence
 
-from coder_agent.cli import build_engineer
+from engineering_agent.cli import build_engineer
 from planner_agent.cli import build_planner
 from planner_agent.store import PlannerStore
 from reviewer_agent.cli import build as build_reviewer
@@ -17,7 +17,7 @@ from .config import OrchestratorConfig
 from .integration import IntegrationManager
 from .mission import MissionManager
 from .orchestrator import AgentOrchestrator
-from .store import OrchestratorStore
+from .store import MIGRATION_VERSION, OrchestratorStore
 from .verification import VerificationService
 
 
@@ -115,7 +115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "init-db":
             store.migrate()
-            print(json.dumps({"status": "ok", "migration": "orchestrator-0005"}))
+            print(json.dumps({"status": "ok", "migration": MIGRATION_VERSION}))
             return 0
         if args.command == "run":
             orchestrator = build_orchestrator(config)

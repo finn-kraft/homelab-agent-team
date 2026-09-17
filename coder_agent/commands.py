@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import importlib.util
+import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 
@@ -47,10 +50,18 @@ class CommandRunner:
             "DATABASE_URL", "ALIGN_DATABASE_URL", "OPENROUTER_API_KEY", "GITHUB_TOKEN",
             "GH_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "PGPASSWORD",
         }}
+        # Systemd often launches the editable entry point with a minimal PATH.
+        # Put the interpreter's virtualenv first so pytest/ruff/etc. resolve to
+        # the same environment that runs the EngineeringAgent.
+        interpreter_bin = os.path.dirname(sys.executable)
+        env["PATH"] = os.pathsep.join(
+            part for part in (interpreter_bin, env.get("PATH", "")) if part
+        )
+        execution_argv = self._resolve_python_tool(argv, env)
         started = time.monotonic()
         try:
             done = subprocess.run(
-                argv, cwd=self.workspace.root, env=env, text=True,
+                execution_argv, cwd=self.workspace.root, env=env, text=True,
                 capture_output=True, timeout=timeout, shell=False,
             )
             return CommandResult(argv, done.stdout, done.stderr, done.returncode,
@@ -58,3 +69,30 @@ class CommandRunner:
         except subprocess.TimeoutExpired as exc:
             return CommandResult(argv, exc.stdout or "", exc.stderr or "", 124,
                                  time.monotonic() - started, True)
+        except FileNotFoundError:
+            command = argv[0] if argv else "command"
+            return CommandResult(
+                argv,
+                "",
+                f"{command} is not installed in the agent environment; "
+                "install the repository test tools in the service virtualenv "
+                "(for example: .venv/bin/python -m pip install -e '.[test]')",
+                127,
+                time.monotonic() - started,
+            )
+
+    @staticmethod
+    def _resolve_python_tool(argv: list[str], env: dict[str, str]) -> list[str]:
+        """Run Python-based tools through the service interpreter when needed."""
+        if not argv:
+            return argv
+        command = argv[0]
+        modules = {"pytest": "pytest", "ruff": "ruff", "mypy": "mypy"}
+        # Prefer the module attached to the service interpreter even when a
+        # different global executable happens to be earlier on PATH. A
+        # systemd service must not silently run another environment's pytest.
+        if command in modules and importlib.util.find_spec(modules[command]) is not None:
+            return [sys.executable, "-m", modules[command], *argv[1:]]
+        if command in {"python", "python3"} and shutil.which(command, path=env.get("PATH")) is None:
+            return [sys.executable, *argv[1:]]
+        return argv

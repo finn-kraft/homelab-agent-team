@@ -56,11 +56,15 @@ def parse_review(text: str, criteria: list[str]) -> ReviewDecision:
     if verdict == "changes_requested" and not issues: raise InvalidReview("rejection needs blocking issues")
     if verdict == "needs_human" and not data.get("human_question"):
         raise InvalidReview("human review needs a specific question")
-    expected = "verification" if verdict == "approved" else "coder_revision"
-    if verdict in {"approved", "changes_requested"} and data.get("recommended_next_state") != expected:
+    expected = {"verification"} if verdict == "approved" else {
+        "coder_revision", "engineering_revision"
+    }
+    next_state = data.get("recommended_next_state")
+    if verdict in {"approved", "changes_requested"} and next_state not in expected:
         raise InvalidReview("unsafe next state")
+    if verdict == "changes_requested" and next_state == "engineering_revision":
+        next_state = "coder_revision"  # durable V1 value retained for compatibility
     return ReviewDecision(verdict, str(data.get("summary", "")), issues,
                           list(data.get("non_blocking_suggestions", [])), matrix,
-                          str(data.get("risk", "medium")), data.get("recommended_next_state", "blocked"),
+                          str(data.get("risk", "medium")), next_state or "blocked",
                           str(data.get("confidence", "medium")), data.get("human_question"))
-

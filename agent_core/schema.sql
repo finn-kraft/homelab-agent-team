@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS steps (
   constraints JSONB NOT NULL DEFAULT '[]',
   suggested_files JSONB NOT NULL DEFAULT '[]',
   dependencies JSONB NOT NULL DEFAULT '[]',
-  assigned_agent TEXT NOT NULL DEFAULT 'coder-agent',
+  assigned_agent TEXT NOT NULL DEFAULT 'engineering-agent',
   status TEXT NOT NULL DEFAULT 'queued',
   attempt_count INTEGER NOT NULL DEFAULT 0,
   worker_id TEXT,
@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS command_runs (
   exit_code INTEGER NOT NULL,
   duration_seconds DOUBLE PRECISION NOT NULL,
   timed_out BOOLEAN NOT NULL DEFAULT false,
-  source TEXT NOT NULL DEFAULT 'coder-agent',
+  source TEXT NOT NULL DEFAULT 'engineering-agent',
   attempt INTEGER,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

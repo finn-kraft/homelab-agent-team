@@ -1,4 +1,4 @@
-"""EngineeringAgent CLI, backed by the preserved coder command implementation."""
+"""EngineeringAgent CLI, backed by the preserved workspace/tooling implementation."""
 
 from coder_agent.cli import build_agent, build_engineer, main
 

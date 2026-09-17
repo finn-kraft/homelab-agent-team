@@ -24,16 +24,45 @@ class Workspace:
     def resolve(self, relative: str | Path, *, must_exist: bool = False) -> Path:
         candidate = self.root / relative
         # resolve(strict=False) still resolves every existing symlink component.
-        resolved = candidate.resolve(strict=must_exist)
+        try:
+            resolved = candidate.resolve(strict=must_exist)
+        except FileNotFoundError as exc:
+            raise WorkspaceViolation(
+                f"path {str(relative)!r} does not exist in the repository; "
+                "inspect the repository tree before reading it"
+            ) from exc
         if resolved != self.root and not resolved.is_relative_to(self.root):
             raise WorkspaceViolation(f"path escapes repository: {relative}")
         return resolved
 
+    def relative_path(self, relative: str | Path) -> str:
+        """Return a canonical repository-relative path for an agent action.
+
+        Git reports paths without a leading ``./`` while models sometimes
+        return ``./file.py`` or use redundant ``..`` segments. Canonicalizing
+        at the workspace boundary keeps the human-change safety check aligned
+        with Git and prevents an alternate spelling from bypassing it.
+        """
+        resolved = self.resolve(relative)
+        if resolved == self.root:
+            raise WorkspaceViolation("repository root is not a file path")
+        return resolved.relative_to(self.root).as_posix()
+
     def read_text(self, relative: str, max_bytes: int = 200_000) -> str:
         path = self.resolve(relative, must_exist=True)
+        if not path.is_file():
+            raise WorkspaceViolation(
+                f"path {relative!r} is not a file in the repository; "
+                "inspect the repository tree and read a file path"
+            )
         if path.stat().st_size > max_bytes:
             raise ValueError(f"file exceeds {max_bytes} byte read limit")
-        return path.read_text(encoding="utf-8")
+        try:
+            return path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise WorkspaceViolation(
+                f"path {relative!r} is not a UTF-8 text file; use an inspection command"
+            ) from exc
 
     def write_text(self, relative: str, content: str) -> None:
         path = self.resolve(relative)
@@ -57,3 +86,19 @@ class Workspace:
                     return bounded_text(content, 100_000, "[PROJECT INSTRUCTIONS TRUNCATED]")
                 return content
         return ""
+
+    def list_files(self, max_entries: int = 1_000) -> list[str]:
+        """Return a bounded, relative file list for model path selection.
+
+        The EngineeringAgent must not guess paths from the absolute repository
+        label. This read-only inventory gives it concrete names before its
+        first ``read`` action while keeping prompts bounded.
+        """
+        entries: list[str] = []
+        for path in sorted(self.root.rglob("*")):
+            if len(entries) >= max_entries:
+                break
+            if not path.is_file() or ".git" in path.parts:
+                continue
+            entries.append(path.relative_to(self.root).as_posix())
+        return entries

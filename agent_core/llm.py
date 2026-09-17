@@ -32,12 +32,14 @@ class HTTPBackend:
         api_key: str | None = None,
         timeout: int = 120,
         retries: int = 2,
+        circuit_seconds: float = 900,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.timeout = max(0.1, float(timeout))
         self.retries = max(0, int(retries))
+        self.circuit_seconds = max(1.0, float(circuit_seconds))
         self._circuit_open_until = 0.0
 
     @property
@@ -80,7 +82,7 @@ class HTTPBackend:
             except urllib.error.HTTPError as exc:
                 last = exc
                 if self.api_key and exc.code in {401, 402, 403}:
-                    self._circuit_open_until = time.time() + 900
+                    self._circuit_open_until = time.time() + self.circuit_seconds
                     raise BackendError(
                         f"paid backend circuit opened after HTTP {exc.code}"
                     ) from exc
@@ -215,6 +217,20 @@ class _FailoverBackend:
         self,
         messages: list[dict[str, str]],
     ) -> LLMResponse:
+        # A paid backend may have opened its breaker after this failover chain
+        # was built. Skip it at call time instead of surfacing the stale
+        # ``backend circuit open`` error to the workflow.
+        if getattr(self.primary, "circuit_open", False):
+            if self.fallback is None:
+                raise BackendError(
+                    f"{self.primary.model} circuit is open and no fallback is available"
+                )
+            if self._on_fallback:
+                self._on_fallback(self.fallback)
+            response = self.fallback.complete(messages)
+            if self._on_response:
+                self._on_response(response)
+            return response
         try:
             response = self.primary.complete(messages)
 
@@ -385,7 +401,26 @@ class InferenceRouter(Router):
             backend.api_key,
             backend.timeout,
             backend.retries,
+            backend.circuit_seconds,
         )
+
+    @staticmethod
+    def _available(backend: HTTPBackend | None) -> bool:
+        """Return whether a backend can be attempted without tripping its breaker."""
+        return backend is not None and not getattr(backend, "circuit_open", False)
+
+    def _first_available(self, *backends: HTTPBackend | None) -> HTTPBackend | None:
+        return next((backend for backend in backends if self._available(backend)), None)
+
+    def _fallback_chain(self, *backends: HTTPBackend | None):
+        """Build an availability chain ending at the local backend when supplied."""
+        chain = None
+        for backend in reversed(backends):
+            if self._available(backend):
+                chain = _FailoverBackend(
+                    backend, chain, on_response=self._record_response
+                )
+        return chain
 
     def _set_route(
         self,
@@ -485,7 +520,10 @@ class InferenceRouter(Router):
             # Availability failure is different from poor model
             # output. If Ollama cannot be reached, immediately use
             # the inexpensive cloud backend.
-            fallback = self.cloud
+            # Never hand an open paid backend to the failover path. The local
+            # request should remain useful even while an OpenRouter key or
+            # billing problem is cooling down.
+            fallback = self._fallback_chain(self.cloud, self.premium_cloud)
 
             def note_local_failover(
                 backend: HTTPBackend,
@@ -556,7 +594,7 @@ class InferenceRouter(Router):
 
             return _FailoverBackend(
                 primary,
-                self.premium_cloud,
+                self._fallback_chain(self.premium_cloud, self.local),
                 note_standard_failover,
                 self._record_response,
             )
@@ -581,7 +619,7 @@ class InferenceRouter(Router):
 
             return _FailoverBackend(
                 primary,
-                None,
+                self._fallback_chain(self.cloud, self.local),
                 on_response=self._record_response,
             )
 
@@ -602,7 +640,7 @@ class InferenceRouter(Router):
 
             return _FailoverBackend(
                 primary,
-                None,
+                self._fallback_chain(self.local),
                 on_response=self._record_response,
             )
 

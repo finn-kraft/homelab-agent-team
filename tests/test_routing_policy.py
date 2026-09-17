@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 
 from agent_core.llm import BackendError, HTTPBackend, InferenceRouter, LLMResponse, Router
@@ -115,3 +116,48 @@ def test_paid_backend_http_402_opens_circuit(monkeypatch):
     else:
         raise AssertionError("expected circuit-opening backend error")
     assert backend.circuit_open and backend.circuit_retry_seconds > 0
+
+
+def test_open_cloud_circuits_fall_back_to_local_without_repeating_error():
+    local = Backend("ollama")
+    standard = HTTPBackend("https://example.invalid", "standard", "secret")
+    premium = HTTPBackend("https://example.invalid", "premium", "secret")
+    standard._circuit_open_until = time.time() + 60
+    premium._circuit_open_until = time.time() + 60
+    router = InferenceRouter(
+        local, standard, premium, caller_agent="engineering-agent",
+        task_type="code_implementation", router_url=None, escalate_after=4,
+    )
+
+    response = router.choose(7).complete([])
+
+    assert response.backend == "ollama"
+    assert router.last_route.fallback is True
+
+
+def test_paid_tier_failure_walks_all_the_way_back_to_local():
+    local = Backend("ollama")
+    standard = Backend("openrouter-standard", fail=True)
+    premium = Backend("openrouter-premium", fail=True)
+    router = InferenceRouter(
+        local, standard, premium, caller_agent="engineering-agent",
+        task_type="code_implementation", router_url=None, escalate_after=4,
+    )
+
+    response = router.choose(4).complete([])
+
+    assert response.backend == "ollama"
+
+
+def test_open_circuit_is_skipped_if_it_opens_after_chain_creation():
+    local = Backend("ollama")
+    standard = HTTPBackend("https://example.invalid", "standard", "secret")
+    router = InferenceRouter(
+        local, standard, caller_agent="engineering-agent",
+        task_type="code_implementation", router_url=None, escalate_after=4,
+    )
+
+    backend = router.choose(4)
+    # Simulate a breaker opening between route selection and model execution.
+    standard._circuit_open_until = time.time() + 60
+    assert backend.complete([]).backend == "ollama"

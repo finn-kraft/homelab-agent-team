@@ -7,7 +7,13 @@ name = "homelab-agent-team"
 version = "0.2.0"
 description = "Persistent planner, EngineeringAgent, reviewer, and deterministic workflow orchestration for local development"
 requires-python = ">=3.11"
-dependencies = ["psycopg[binary]>=3.1,<4", "bcrypt>=4,<6"]
+dependencies = [
+    "psycopg[binary]>=3.1,<4",
+    "bcrypt>=4,<6",
+    # Verification executes the project's explicit pytest commands through
+    # the same virtualenv as the orchestrator.
+    "pytest>=8,<9",
+]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<9"]
@@ -22,6 +28,9 @@ agent-control-center = "control_center.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["agent_core*", "coder_agent*", "engineering_agent*", "planner_agent*", "reviewer_agent*", "orchestrator*", "control_center*"]
+
+[tool.setuptools]
+py-modules = ["transaction_manager", "components", "plugins"]
 
 [tool.setuptools.package-data]
 agent_core = ["schema.sql"]
