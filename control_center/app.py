@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -8,6 +9,13 @@ from importlib.resources import files
 from urllib.parse import parse_qs, urlparse
 
 from .auth import AuthManager, AuthenticationError, CSRF_HEADER, RateLimitError, SESSION_COOKIE
+
+
+LOGGER = logging.getLogger(__name__)
+WORKFLOW_ACTION_ERROR = (
+    "The workflow database is not ready for this action. "
+    "Run agent-orchestrator init-db, then restart the Control Center."
+)
 
 
 class ControlCenter:
@@ -167,6 +175,12 @@ class ControlCenter:
                     return self.send_json(404, {"error": "not_found"})
                 except (KeyError, ValueError):
                     return self.send_json(400, {"error": "invalid_request"})
+                except Exception:
+                    LOGGER.exception("control_center_read_failed path=%s", parsed.path)
+                    return self.send_json(503, {
+                        "error": "workflow_unavailable",
+                        "detail": WORKFLOW_ACTION_ERROR,
+                    })
 
             def body(self):
                 size = int(self.headers.get("Content-Length", "0"))
@@ -223,6 +237,12 @@ class ControlCenter:
                     return self.send_json(404, {"error": "not_found"})
                 except (KeyError, ValueError, json.JSONDecodeError):
                     return self.send_json(400, {"error": "invalid_request"})
+                except Exception:
+                    LOGGER.exception("control_center_write_failed path=%s", parsed.path)
+                    return self.send_json(503, {
+                        "error": "workflow_action_failed",
+                        "detail": WORKFLOW_ACTION_ERROR,
+                    })
 
         return Handler
 
