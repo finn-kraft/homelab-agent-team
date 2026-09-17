@@ -884,3 +884,17 @@ class OrchestratorStore:
             heartbeat_at=now(),metadata=EXCLUDED.metadata""",
             (worker_id, component, status, job_id, step_id, action,
              json.dumps(metadata or {}, default=str)))
+
+    def answer(self, job_id: int, answer: str) -> None:
+        note = str(answer).strip()
+        if not note:
+            raise ValueError("answer is required")
+        with self.connect() as connection:
+            row = connection.execute("SELECT id FROM jobs WHERE id=%s FOR UPDATE", (job_id,)).fetchone()
+            if not row:
+                raise KeyError(job_id)
+            connection.execute("""UPDATE jobs SET status='running', current_phase='planning',
+                planner_worker_id=NULL, planner_lease_expires_at=NULL,
+                human_notes=COALESCE(human_notes || E'\\n','') || %s, updated_at=now() WHERE id=%s""",
+                (note, job_id))
+            self._event(connection, job_id, None, "human_answer_recorded", {"answer": note[:2000]})
