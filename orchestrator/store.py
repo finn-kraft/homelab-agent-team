@@ -227,6 +227,7 @@ class OrchestratorStore:
             rows = connection.execute(
                 """SELECT j.id,j.goal,j.repository,j.branch,j.status,j.current_phase,
                 j.current_step,j.iteration_count,j.max_iterations,j.updated_at,
+                j.planner_worker_id,j.planner_lease_expires_at,
                 COUNT(s.id) FILTER (WHERE s.status <> 'complete') AS open_steps,
                 COUNT(s.id) FILTER (WHERE s.status = 'complete') AS completed_steps,
                 (SELECT s2.blocker FROM steps s2 WHERE s2.job_id=j.id
