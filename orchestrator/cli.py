@@ -52,6 +52,10 @@ def _parser() -> argparse.ArgumentParser:
     mission.add_argument("goal"); mission.add_argument("--repository", required=True); mission.add_argument("--branch", required=True)
     packages = subcommands.add_parser("packages", help="list durable V2 work packages")
     packages.add_argument("--mission-id", type=int)
+    package = subcommands.add_parser("create-package", help="create a V2 package and linked V1 step")
+    package.add_argument("objective"); package.add_argument("--mission-id", type=int, required=True)
+    package.add_argument("--repository", required=True); package.add_argument("--branch", required=True)
+    package.add_argument("--acceptance", action="append", required=True)
     claim = subcommands.add_parser("claim-package", help="claim one ready V2 package")
     claim.add_argument("--worker-id", default="engineering-1"); claim.add_argument("--lease-seconds", type=int, default=900)
     subcommands.add_parser("recover-packages", help="return expired V2 package leases to ready")
@@ -124,6 +128,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "packages":
             print(json.dumps(store.list_work_packages(args.mission_id), default=str, indent=2))
+            return 0
+        if args.command == "create-package":
+            package_id = store.create_work_package(args.mission_id, args.objective, args.repository,
+                args.branch, args.acceptance)
+            print(json.dumps({"package_id": package_id}))
             return 0
         if args.command == "claim-package":
             print(json.dumps(store.claim_work_package(args.worker_id, args.lease_seconds), default=str))
