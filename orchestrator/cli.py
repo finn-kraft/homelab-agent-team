@@ -48,6 +48,20 @@ def _parser() -> argparse.ArgumentParser:
     subcommands.add_parser("once", help="advance at most one durable workflow action")
     subcommands.add_parser("status", help="show durable job summaries")
     subcommands.add_parser("audit", help="report read-only workflow invariant violations")
+    mission = subcommands.add_parser("create-mission", help="create a durable V2 mission")
+    mission.add_argument("goal"); mission.add_argument("--repository", required=True); mission.add_argument("--branch", required=True)
+    packages = subcommands.add_parser("packages", help="list durable V2 work packages")
+    packages.add_argument("--mission-id", type=int)
+    package = subcommands.add_parser("create-package", help="create a V2 package and linked V1 step")
+    package.add_argument("objective"); package.add_argument("--mission-id", type=int, required=True)
+    package.add_argument("--repository", required=True); package.add_argument("--branch", required=True)
+    package.add_argument("--acceptance", action="append", required=True)
+    claim = subcommands.add_parser("claim-package", help="claim one ready V2 package")
+    claim.add_argument("--worker-id", default="engineering-1"); claim.add_argument("--lease-seconds", type=int, default=900)
+    subcommands.add_parser("recover-packages", help="return expired V2 package leases to ready")
+    advance = subcommands.add_parser("advance-package", help="advance a leased V2 package lifecycle state")
+    advance.add_argument("package_id", type=int); advance.add_argument("current"); advance.add_argument("next_status")
+    advance.add_argument("--worker-id", default="engineering-1"); advance.add_argument("--commit")
     inspect = subcommands.add_parser("inspect", help="show a job, its steps, and recent events")
     inspect.add_argument("job_id", type=int)
     for name in ("pause", "resume", "cancel"):
@@ -108,6 +122,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "audit":
             print(json.dumps({"violations": store.invariant_report()}, default=str, indent=2))
+            return 0
+        if args.command == "create-mission":
+            print(json.dumps({"mission_id": store.create_mission(args.goal, args.repository, args.branch)}))
+            return 0
+        if args.command == "packages":
+            print(json.dumps(store.list_work_packages(args.mission_id), default=str, indent=2))
+            return 0
+        if args.command == "create-package":
+            package_id = store.create_work_package(args.mission_id, args.objective, args.repository,
+                args.branch, args.acceptance)
+            print(json.dumps({"package_id": package_id}))
+            return 0
+        if args.command == "claim-package":
+            print(json.dumps(store.claim_work_package(args.worker_id, args.lease_seconds), default=str))
+            return 0
+        if args.command == "recover-packages":
+            print(json.dumps({"recovered": store.recover_work_packages()}))
+            return 0
+        if args.command == "advance-package":
+            store.advance_work_package(args.package_id, args.worker_id, args.current,
+                                       args.next_status, args.commit)
+            print(json.dumps({"status": args.next_status, "package_id": args.package_id}))
             return 0
         if args.command == "inspect":
             print(json.dumps(store.inspect(args.job_id), default=str, indent=2))

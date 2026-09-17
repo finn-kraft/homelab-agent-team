@@ -9,7 +9,7 @@ from .commands import CommandRejected, CommandRunner
 from .db import Store
 from .git import GitRepository
 from .llm import BackendError, Router
-from .models import AgentResult, Status, Task
+from .models import AgentResult, Status, Task, WorkPackage
 from .workspace import Workspace, WorkspaceViolation
 
 
@@ -37,7 +37,8 @@ class CoderAgent:
         self.store, self.router, self.worker_id = store, router, worker_id
         self.allowed_roots, self.max_turns, self.max_attempts = allowed_roots, max_turns, max_attempts
 
-    def run_package(self, package: Task) -> AgentResult:
+    def run_package(self, package: WorkPackage | Task, step_id: int | None = None,
+                    attempt: int = 0) -> AgentResult:
         """Run one Work Package using the preserved workspace/tooling loop.
 
         ``Task`` remains the V1-compatible transport while V2 introduces a
@@ -45,6 +46,10 @@ class CoderAgent:
         same object and the package worktree remains the source of truth across
         retries and restarts.
         """
+        if isinstance(package, WorkPackage):
+            if step_id is None:
+                raise ValueError("a V2 WorkPackage requires its durable step_id")
+            package = package.as_task(step_id, attempt)
         return self.run_task(package)
 
     @staticmethod
@@ -86,6 +91,10 @@ class CoderAgent:
             runner = CommandRunner(workspace)
             git = GitRepository(runner)
             starting_commit = git.head()
+            session_id = None
+            start_session = getattr(self.store, "start_engineering_session", None)
+            if start_session:
+                session_id = start_session(task.job_id, task.step_id, self.worker_id, starting_commit)
             current_branch = git.branch()
             if current_branch != task.branch:
                 raise RuntimeError(
@@ -150,6 +159,12 @@ class CoderAgent:
                         "no_progress"
                     ),
                 })
+                if session_id is not None:
+                    record_action = getattr(self.store, "record_engineering_action", None)
+                    if record_action:
+                        record_action(session_id, turn + 1, action.get("action", "invalid"),
+                                      self._redact(observation), response.model,
+                                      "invalid_action" if action.get("action") == "invalid" else None)
                 if observation == previous_observation or action.get("action") == "invalid":
                     stagnation += 1
                 else:

@@ -138,6 +138,40 @@ CREATE TABLE IF NOT EXISTS engineering_actions (
   UNIQUE(session_id, sequence)
 );
 
+CREATE TABLE IF NOT EXISTS missions (
+  id BIGSERIAL PRIMARY KEY,
+  goal TEXT NOT NULL,
+  repository TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  cloud_budget NUMERIC(14,6),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS work_packages (
+  id BIGSERIAL PRIMARY KEY,
+  mission_id BIGINT NOT NULL REFERENCES missions(id),
+  objective TEXT NOT NULL,
+  acceptance_criteria JSONB NOT NULL DEFAULT '[]',
+  constraints JSONB NOT NULL DEFAULT '[]',
+  roadmap_reference TEXT,
+  dependencies JSONB NOT NULL DEFAULT '[]',
+  job_id BIGINT REFERENCES jobs(id),
+  step_id BIGINT REFERENCES steps(id),
+  repository TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'ready',
+  starting_commit TEXT,
+  worktree TEXT,
+  worker_id TEXT,
+  lease_expires_at TIMESTAMPTZ,
+  resulting_commit TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS work_packages_claim_idx ON work_packages(status, mission_id, id);
+
 CREATE INDEX IF NOT EXISTS steps_orchestrator_claim_idx
   ON steps (status, orchestrator_lease_expires_at, id);
 CREATE INDEX IF NOT EXISTS verification_runs_step_idx
@@ -288,6 +322,161 @@ class OrchestratorStore:
                     violations.append({"invariant": name, "count": len(rows),
                                        "ids": [row[0] for row in rows[:50]]})
         return violations
+
+    def create_mission(self, goal: str, repository: str, branch: str,
+                       cloud_budget: float | None = None) -> int:
+        with self.connect() as connection:
+            row = connection.execute("""INSERT INTO missions(goal,repository,branch,cloud_budget)
+                VALUES(%s,%s,%s,%s) RETURNING id""", (goal, repository, branch, cloud_budget)).fetchone()
+            return row["id"]
+
+    def create_work_package(self, mission_id: int, objective: str, repository: str,
+                            branch: str, acceptance_criteria: list[str],
+                            constraints: list[str] | None = None, roadmap_reference: str | None = None,
+                            dependencies: list[int] | None = None) -> int:
+        with self.connect() as connection:
+            mission = connection.execute("SELECT goal,branch FROM missions WHERE id=%s", (mission_id,)).fetchone()
+            if not mission:
+                raise KeyError(mission_id)
+            job = connection.execute("""INSERT INTO jobs(goal,repository,branch,priority,max_iterations)
+                VALUES(%s,%s,%s,0,100) RETURNING id""", (mission["goal"], repository, branch)).fetchone()
+            job_id = job["id"]
+            row = connection.execute("""INSERT INTO work_packages
+                (mission_id,objective,acceptance_criteria,constraints,roadmap_reference,dependencies,repository,branch)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (mission_id, objective, json.dumps(acceptance_criteria), json.dumps(constraints or []),
+                 roadmap_reference, json.dumps(dependencies or []), repository, branch)).fetchone()
+            package_id = row["id"]
+            step = connection.execute("""INSERT INTO steps(job_id,sequence,repository,branch,title,objective,
+                rationale,acceptance_criteria,constraints,suggested_files,dependencies,assigned_agent)
+                VALUES(%s,1,%s,%s,%s,%s,'V2 Work Package',%s,%s,'[]',%s,'coder-agent') RETURNING id""",
+                (job_id, repository, branch, objective[:200], objective, json.dumps(acceptance_criteria),
+                 json.dumps(constraints or []), json.dumps(dependencies or []))).fetchone()
+            connection.execute("UPDATE work_packages SET job_id=%s,step_id=%s WHERE id=%s",
+                               (job_id, step["id"], package_id))
+            return package_id
+
+    def list_work_packages(self, mission_id: int | None = None) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            query = "SELECT * FROM work_packages"
+            params: tuple[Any, ...] = ()
+            if mission_id is not None:
+                query += " WHERE mission_id=%s"; params = (mission_id,)
+            query += " ORDER BY id"
+            return [dict(row) for row in connection.execute(query, params).fetchall()]
+
+    def claim_work_package(self, worker_id: str, lease_seconds: int = 900,
+                           worktree_manager=None) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute("""WITH candidate AS (
+                SELECT p.id FROM work_packages p JOIN missions m ON m.id=p.mission_id
+                WHERE p.status='ready' AND m.status='active'
+                  AND (p.lease_expires_at IS NULL OR p.lease_expires_at < now())
+                  AND NOT EXISTS (SELECT 1 FROM work_packages d
+                    WHERE d.id = ANY(SELECT jsonb_array_elements_text(p.dependencies)::bigint)
+                    AND d.status <> 'complete')
+                ORDER BY p.id FOR UPDATE SKIP LOCKED LIMIT 1)
+                UPDATE work_packages p SET status='engineering',worker_id=%s,
+                  lease_expires_at=now()+(%s*interval '1 second'),updated_at=now()
+                FROM candidate WHERE p.id=candidate.id RETURNING p.*""", (worker_id, lease_seconds)).fetchone()
+            if not row:
+                return None
+            package = dict(row)
+            if worktree_manager is not None and not package.get("worktree"):
+                worktree = worktree_manager.create(package["repository"], package["mission_id"],
+                                                   package["id"], package["branch"])
+                connection.execute("UPDATE work_packages SET worktree=%s,starting_commit=%s,branch=%s WHERE id=%s",
+                                   (str(worktree.path), worktree.starting_commit, worktree.branch, package["id"]))
+                connection.execute("UPDATE jobs SET repository=%s,branch=%s WHERE id=%s",
+                                   (str(worktree.path), worktree.branch, package.get("job_id")))
+                connection.execute("UPDATE steps SET repository=%s,branch=%s WHERE id=%s",
+                                   (str(worktree.path), worktree.branch, package.get("step_id")))
+                package.update(worktree=str(worktree.path), starting_commit=worktree.starting_commit,
+                               branch=worktree.branch)
+            return package
+
+    def resume_engineering_session(self, job_id: int, step_id: int | None = None) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute("""SELECT * FROM engineering_sessions WHERE job_id=%s
+                AND (%s IS NULL OR step_id=%s) AND completed_at IS NULL
+                ORDER BY updated_at DESC LIMIT 1""", (job_id, step_id, step_id)).fetchone()
+            return dict(row) if row else None
+
+    def update_work_package(self, package_id: int, worker_id: str, status: str,
+                            resulting_commit: str | None = None) -> None:
+        if status not in {'engineering', 'review', 'verifying', 'complete', 'blocked'}:
+            raise ValueError('invalid work package status')
+        with self.connect() as connection:
+            result = connection.execute("""UPDATE work_packages SET status=%s,
+                resulting_commit=COALESCE(%s,resulting_commit),lease_expires_at=NULL,
+                updated_at=now() WHERE id=%s AND worker_id=%s""",
+                (status, resulting_commit, package_id, worker_id))
+            if result.rowcount != 1:
+                raise RuntimeError('work package lease is no longer owned')
+
+    def advance_work_package(self, package_id: int, worker_id: str, current: str,
+                             next_status: str, resulting_commit: str | None = None) -> None:
+        allowed = {"engineering": {"review", "blocked"}, "review": {"verifying", "engineering", "blocked"},
+                   "verifying": {"complete", "engineering", "blocked"}}
+        if next_status not in allowed.get(current, set()):
+            raise ValueError(f"invalid package transition: {current} -> {next_status}")
+        with self.connect() as connection:
+            result = connection.execute("""UPDATE work_packages SET status=%s,
+                resulting_commit=COALESCE(%s,resulting_commit),lease_expires_at=NULL,updated_at=now()
+                WHERE id=%s AND worker_id=%s AND status=%s""",
+                (next_status, resulting_commit, package_id, worker_id, current))
+            if result.rowcount != 1:
+                raise RuntimeError("work package transition lost its lease")
+
+    def complete_work_package(self, package_id: int, worker_id: str, commit_sha: str) -> None:
+        if not commit_sha or len(commit_sha) < 7:
+            raise ValueError("a verified commit SHA is required")
+        self.advance_work_package(package_id, worker_id, "verifying", "complete", commit_sha)
+
+    def sync_package_for_step(self, step_id: int, status: str, commit_sha: str | None = None) -> None:
+        """Mirror V1 Step completion into its linked V2 package, when present."""
+        with self.connect() as connection:
+            connection.execute("""UPDATE work_packages SET status=%s,
+                resulting_commit=COALESCE(%s,resulting_commit),lease_expires_at=NULL,updated_at=now()
+                WHERE step_id=%s""", (status, commit_sha, step_id))
+
+    def heartbeat_work_package(self, package_id: int, worker_id: str,
+                               lease_seconds: int = 900) -> bool:
+        with self.connect() as connection:
+            result = connection.execute("""UPDATE work_packages SET lease_expires_at=
+                now()+(%s*interval '1 second'), updated_at=now()
+                WHERE id=%s AND worker_id=%s AND status IN ('engineering','review','verifying')""",
+                (lease_seconds, package_id, worker_id))
+            return result.rowcount == 1
+
+    def recover_work_packages(self) -> list[int]:
+        with self.connect() as connection:
+            rows = connection.execute("""UPDATE work_packages SET status='ready',worker_id=NULL,
+                lease_expires_at=NULL,updated_at=now() WHERE status IN ('engineering','review','verifying')
+                AND lease_expires_at < now() RETURNING id""").fetchall()
+            return [row["id"] for row in rows]
+
+    def start_engineering_session(self, job_id: int, step_id: int | None,
+                                  worker_id: str, starting_commit: str | None = None) -> int:
+        with self.connect() as connection:
+            row = connection.execute("""INSERT INTO engineering_sessions
+                (job_id,step_id,worker_id,starting_commit) VALUES(%s,%s,%s,%s)
+                RETURNING id""", (job_id, step_id, worker_id, starting_commit)).fetchone()
+            return row["id"]
+
+    def record_engineering_action(self, session_id: int, sequence: int, action: str,
+                                  observation: str = "", model: str | None = None,
+                                  progress_classification: str | None = None) -> None:
+        with self.connect() as connection:
+            connection.execute("""INSERT INTO engineering_actions
+                (session_id,sequence,model,action,observation,progress_classification)
+                VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(session_id,sequence) DO UPDATE SET
+                model=EXCLUDED.model,action=EXCLUDED.action,observation=EXCLUDED.observation,
+                progress_classification=EXCLUDED.progress_classification""",
+                (session_id, sequence, model, action, observation[:30000], progress_classification))
+            connection.execute("""UPDATE engineering_sessions SET turn_count=%s,
+                last_successful_action=CASE WHEN %s NOT IN ('invalid','no_progress') THEN %s ELSE last_successful_action END,
+                updated_at=now() WHERE id=%s""", (sequence, action, action, session_id))
 
     # ------------------------------------------------------------------
     # Repository mutation lease
