@@ -304,6 +304,7 @@ tr.clickable:hover { cursor: pointer; background: rgba(103,152,255,.045); }
 .code { color: #a7c5ff; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .progress { width: 105px; }
 .progress-label { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; margin-bottom: 5px; }
+.job-row-actions { display: flex; align-items: center; gap: 4px; }
 
 .status {
   display: inline-flex;
@@ -434,6 +435,8 @@ textarea { min-height: 122px; resize: vertical; }
 
 .row-open { display: grid; place-items: center; min-width: 30px; min-height: 30px; padding: 0; border-color: transparent; border-radius: 8px; background: transparent; color: var(--muted); }
 .row-open:hover { color: var(--cyan); border-color: rgba(85,217,209,.2); background: rgba(85,217,209,.06); }
+.row-remove { display: grid; place-items: center; min-width: 30px; min-height: 30px; padding: 0; border-color: transparent; border-radius: 8px; background: transparent; color: var(--muted); font-size: 18px; line-height: 1; }
+.row-remove:hover { color: var(--red); border-color: rgba(255,119,133,.2); background: rgba(255,119,133,.06); }
 
 @media (max-width: 1120px) {
   .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }

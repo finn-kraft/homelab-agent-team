@@ -1078,6 +1078,41 @@ class OrchestratorStore:
                 "status": status,
             })
 
+    def remove_queued_job(self, job_id: int) -> None:
+        """Permanently remove a job that has not entered the workflow yet.
+
+        A queued job is represented by the ``pending`` job state and has no
+        steps.  Refusing every other state prevents an operator action from
+        deleting work that may already have changed a repository or acquired
+        a worker lease.  Its creation event is removed with the job because
+        the events table references the job and queued jobs have no durable
+        execution history to preserve.
+        """
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT id,status FROM jobs WHERE id=%s FOR UPDATE", (job_id,)
+            ).fetchone()
+            if not row:
+                raise KeyError(f"job {job_id} does not exist")
+            if row["status"] != "pending":
+                raise ValueError("only queued jobs can be removed")
+            step = connection.execute(
+                "SELECT 1 FROM steps WHERE job_id=%s LIMIT 1", (job_id,)
+            ).fetchone()
+            if step:
+                raise ValueError("queued job already has workflow steps")
+            package = connection.execute(
+                "SELECT 1 FROM work_packages WHERE job_id=%s LIMIT 1", (job_id,)
+            ).fetchone()
+            if package:
+                raise ValueError("queued job is linked to a work package")
+            connection.execute("DELETE FROM events WHERE job_id=%s", (job_id,))
+            deleted = connection.execute(
+                "DELETE FROM jobs WHERE id=%s AND status='pending'", (job_id,)
+            )
+            if deleted.rowcount != 1:
+                raise RuntimeError("queued job changed before it could be removed")
+
     @staticmethod
     def allowed_control_actions(status: str) -> set[str]:
         """Return safe operator actions for one durable job state."""

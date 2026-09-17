@@ -18,10 +18,13 @@ class ControlCenter:
         return {**self.store.overview(), "telemetry": self.telemetry.snapshot()}
 
     def perform_action(self, job_id, action, data):
-        if action not in {"pause", "resume", "cancel"}:
+        if action not in {"pause", "resume", "cancel", "remove"}:
             raise ValueError("unsupported action")
-        if action == "cancel" and data.get("confirm") is not True:
+        if action in {"cancel", "remove"} and data.get("confirm") is not True:
             raise PermissionError("confirmation_required")
+        if action == "remove":
+            self.store.remove_queued_job(job_id)
+            return {"status": "removed"}
         self.store.action(job_id, action)
         return {"status": action}
 
