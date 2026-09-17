@@ -349,7 +349,8 @@ class OrchestratorStore:
             query += " ORDER BY id"
             return [dict(row) for row in connection.execute(query, params).fetchall()]
 
-    def claim_work_package(self, worker_id: str, lease_seconds: int = 900) -> dict[str, Any] | None:
+    def claim_work_package(self, worker_id: str, lease_seconds: int = 900,
+                           worktree_manager=None) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute("""WITH candidate AS (
                 SELECT p.id FROM work_packages p JOIN missions m ON m.id=p.mission_id
@@ -362,6 +363,23 @@ class OrchestratorStore:
                 UPDATE work_packages p SET status='engineering',worker_id=%s,
                   lease_expires_at=now()+(%s*interval '1 second'),updated_at=now()
                 FROM candidate WHERE p.id=candidate.id RETURNING p.*""", (worker_id, lease_seconds)).fetchone()
+            if not row:
+                return None
+            package = dict(row)
+            if worktree_manager is not None and not package.get("worktree"):
+                worktree = worktree_manager.create(package["repository"], package["mission_id"],
+                                                   package["id"], package["branch"])
+                connection.execute("UPDATE work_packages SET worktree=%s,starting_commit=%s,branch=%s WHERE id=%s",
+                                   (str(worktree.path), worktree.starting_commit, worktree.branch, package["id"]))
+                package.update(worktree=str(worktree.path), starting_commit=worktree.starting_commit,
+                               branch=worktree.branch)
+            return package
+
+    def resume_engineering_session(self, job_id: int, step_id: int | None = None) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute("""SELECT * FROM engineering_sessions WHERE job_id=%s
+                AND (%s IS NULL OR step_id=%s) AND completed_at IS NULL
+                ORDER BY updated_at DESC LIMIT 1""", (job_id, step_id, step_id)).fetchone()
             return dict(row) if row else None
 
     def update_work_package(self, package_id: int, worker_id: str, status: str,
