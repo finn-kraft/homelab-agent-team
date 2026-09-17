@@ -381,6 +381,12 @@ pre { max-height: 300px; overflow: auto; padding: 11px; border: 1px solid var(--
 .job-hero .section-head { align-items: start; }
 .job-hero h2 { max-width: 780px; margin-bottom: 7px; font-size: 21px; }
 .job-actions { display: flex; gap: 7px; flex-wrap: wrap; justify-content: flex-end; }
+.operation-list { display: grid; gap: 0; }
+.operation-row { display: flex; align-items: center; gap: 10px; min-height: 42px; border-bottom: 1px solid var(--line); }
+.operation-row:last-child { border-bottom: 0; }
+.operation-row small { margin-left: auto; color: var(--muted); }
+.stale-warning { display: flex; align-items: center; gap: 8px; margin: -4px 0 12px; color: var(--amber); font-size: 12px; }
+.stale-warning svg { width: 16px; height: 16px; }
 .job-flow { margin-top: 21px; padding-top: 17px; border-top: 1px solid var(--line); }
 .job-flow .flow { justify-content: center; }
 .step-summary { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(260px, .75fr); gap: 14px; }

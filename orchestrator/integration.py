@@ -25,12 +25,17 @@ class IntegrationManager:
                   *, target_branch: str | None = None) -> dict[str, Any]:
         package_id = int(package["id"])
         mission_id = int(package["mission_id"])
+        package_status = package.get("status")
+        if package_status is not None and package_status != "complete":
+            raise ValueError(
+                f"package {package_id} is not verified and complete (status={package_status})"
+            )
         source_branch = str(package.get("branch") or "")
         target = target_branch or str(package.get("target_branch") or "")
         if not target:
             mission = self.store.mission_detail(mission_id)
             target = str(mission["branch"]) if mission else ""
-        if target in self.protected_branches:
+        if target.lower() in {branch.lower() for branch in self.protected_branches}:
             raise ValueError(f"refusing to integrate directly into protected branch {target}")
         root = Path(repository).expanduser().resolve(strict=True)
         if not (root / ".git").exists():
@@ -58,6 +63,28 @@ class IntegrationManager:
                                               source_branch=source_branch, target_branch=target,
                                               status="conflict", commit_sha=source_commit,
                                               error=(merge.stderr or merge.stdout)[-4000:])
+                enqueue = getattr(self.store, "enqueue_human_request", None)
+                if enqueue is not None:
+                    enqueue(
+                        mission_id=mission_id,
+                        job_id=package.get("job_id"),
+                        step_id=package.get("step_id"),
+                        kind="integration-conflict",
+                        question=(
+                            f"Resolve the merge conflict while integrating package {package_id} "
+                            f"into {target}, then retry integration."
+                        ),
+                        context={
+                            "package_id": package_id,
+                            "source_branch": source_branch,
+                            "target_branch": target,
+                            "source_commit": source_commit,
+                            "merge_output": (merge.stderr or merge.stdout)[-4_000:],
+                        },
+                    )
+                update_mission = getattr(self.store, "update_mission_status", None)
+                if update_mission is not None:
+                    update_mission(mission_id, "blocked")
                 return {"status": "conflict", "package_id": package_id,
                         "target_branch": target, "error": (merge.stderr or merge.stdout).strip()}
             merged = self._git(worktree, "rev-parse", "HEAD")

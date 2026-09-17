@@ -1,7 +1,10 @@
 from __future__ import annotations
 import json
+import os
+from datetime import datetime, timezone
 from orchestrator.store import OrchestratorStore
 from planner_agent.store import PlannerStore
+from orchestrator.worktrees import WorktreeManager
 
 class ControlStore:
     def __init__(self, database_url, projects):
@@ -10,6 +13,19 @@ class ControlStore:
     def healthy(self):
         report = self.health()
         return bool(report.get("ready"))
+
+    @staticmethod
+    def _lease_expired(value):
+        if isinstance(value, str):
+            try:
+                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return False
+        if not isinstance(value, datetime):
+            return False
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value < datetime.now(timezone.utc)
 
     def health(self):
         readiness = getattr(self.workflow, "schema_readiness", None)
@@ -31,13 +47,22 @@ class ControlStore:
                     "migration_required": True, "error": str(exc)[:500]}
     def overview(self):
         with self.workflow.connect() as connection:
-            workers = list(connection.execute("""SELECT *,heartbeat_at > now()-interval '30 seconds' online
+            workers = list(connection.execute("""SELECT *,
+            heartbeat_at > now()-interval '30 seconds' online,
+            EXTRACT(EPOCH FROM (now()-heartbeat_at))::double precision heartbeat_age_seconds
             FROM worker_heartbeats ORDER BY component,worker_id""").fetchall())
             agent_events = list(connection.execute("""SELECT DISTINCT ON(agent) agent,event_type,
             structured_payload,created_at FROM events ORDER BY agent,created_at DESC""").fetchall())
             active_work = list(connection.execute("""SELECT s.id step_id,s.job_id,s.status,s.title,
-            s.attempt_count,s.files_changed,j.goal,j.current_phase,r.verdict,
+            s.attempt_count,s.files_changed,j.goal,j.current_phase,s.worker_id,
+            s.lease_expires_at,s.reviewer_worker_id,s.review_lease_expires_at,
+            s.orchestrator_worker_id,s.orchestrator_lease_expires_at,s.updated_at,
+            s.started_at,r.verdict,
             m.provider,m.model,m.latency_seconds,p.progress_classification,
+            lm.last_model_call_at, lm.model_call_age_seconds,
+            pm.phase AS current_phase_name, pm.phase_started_at,
+            EXTRACT(EPOCH FROM (now()-pm.phase_started_at))::double precision phase_duration_seconds,
+            cr.current_command, cr.current_command_started_at,
             (SELECT count(*) FROM command_runs c WHERE c.step_id=s.id) command_count,
             (SELECT count(*) FROM review_issues i WHERE i.step_id=s.id AND i.status='open') open_issue_count
             FROM steps s JOIN jobs j ON j.id=s.job_id LEFT JOIN LATERAL
@@ -46,6 +71,13 @@ class ControlStore:
             WHERE step_id=s.id ORDER BY id DESC LIMIT 1) m ON true
             LEFT JOIN LATERAL (SELECT structured_payload->>'progress_classification' progress_classification
             FROM events WHERE step_id=s.id AND event_type='agent_action' ORDER BY id DESC LIMIT 1) p ON true
+            LEFT JOIN LATERAL (SELECT created_at AS last_model_call_at,
+              EXTRACT(EPOCH FROM (now()-created_at))::double precision model_call_age_seconds
+              FROM llm_invocations WHERE step_id=s.id ORDER BY id DESC LIMIT 1) lm ON true
+            LEFT JOIN LATERAL (SELECT phase,started_at AS phase_started_at
+              FROM phase_metrics WHERE step_id=s.id ORDER BY id DESC LIMIT 1) pm ON true
+            LEFT JOIN LATERAL (SELECT argv AS current_command,created_at AS current_command_started_at
+              FROM command_runs WHERE step_id=s.id ORDER BY id DESC LIMIT 1) cr ON true
             WHERE s.status NOT IN ('complete','cancelled') ORDER BY s.updated_at DESC""").fetchall())
             inference = connection.execute("""SELECT count(*) FILTER(WHERE provider='openrouter') cloud_requests,
             count(*) FILTER(WHERE provider<>'openrouter') local_requests,count(*) FILTER(WHERE fallback) fallback_requests,
@@ -66,13 +98,33 @@ class ControlStore:
             round(avg(prompt_tokens)::numeric,0) AS average_prompt_tokens,
             max(prompt_tokens) AS max_prompt_tokens
             FROM phase_metrics GROUP BY phase ORDER BY phase""").fetchall())
+            operations = list(connection.execute(
+                "SELECT operation_id,job_id,action,status,requested_by,detail,error,created_at,updated_at,completed_at "
+                "FROM control_operations ORDER BY created_at DESC LIMIT 100"
+            ).fetchall())
         jobs = self.workflow.status()
+        for work in active_work:
+            status = work.get("status")
+            lease = (work.get("lease_expires_at") if status == "running" else
+                     work.get("review_lease_expires_at") if status == "review" else
+                     work.get("orchestrator_lease_expires_at") if status in {"verification", "checkpoint"} else None)
+            work["lease_owner"] = (work.get("worker_id") if status == "running" else
+                                    work.get("reviewer_worker_id") if status == "review" else
+                                    work.get("orchestrator_worker_id") if status in {"verification", "checkpoint"} else None)
+            work["stale"] = self._lease_expired(lease)
+            if work["stale"]:
+                work["stale_warning"] = "Lease expired; use Recover lease to release it safely."
+            elif work.get("model_call_age_seconds") is not None and work["model_call_age_seconds"] > 180:
+                work["stale_warning"] = "No model call has been recorded for more than 3 minutes."
+            else:
+                work["stale_warning"] = None
         return {"jobs": jobs, "missions": self.workflow.list_missions(),
                 "human_queue": self.workflow.list_human_queue("open"),
                 "workers": [dict(x) for x in workers],
                 "agent_events":[dict(x) for x in agent_events],"active_work":[dict(x) for x in active_work],
                 "inference": dict(inference),
                 "phase_metrics": [dict(x) for x in phase_metrics],
+                "operations": [dict(x) for x in operations],
                 "recent_commits": [dict(x) for x in commits],
                 "attention_count": sum(j["status"] in {"needs_human","blocked","failed"} for j in jobs)}
     def project_list(self):
@@ -136,8 +188,30 @@ class ControlStore:
                     "SELECT * FROM review_issues WHERE step_id=%s ORDER BY id", (sid,)).fetchall()]
                 checkpoint = connection.execute("SELECT * FROM checkpoint_runs WHERE step_id=%s", (sid,)).fetchone()
                 step["checkpoint"] = dict(checkpoint) if checkpoint else None
+                status = step.get("status")
+                lease = (step.get("lease_expires_at") if status == "running" else
+                         step.get("review_lease_expires_at") if status == "review" else
+                         step.get("orchestrator_lease_expires_at") if status in {"verification", "checkpoint"} else None)
+                step["lease_owner"] = (step.get("worker_id") if status == "running" else
+                                        step.get("reviewer_worker_id") if status == "review" else
+                                        step.get("orchestrator_worker_id") if status in {"verification", "checkpoint"} else None)
+                if step["lease_owner"]:
+                    heartbeat = connection.execute(
+                        """SELECT heartbeat_at,
+                           EXTRACT(EPOCH FROM (now()-heartbeat_at))::double precision heartbeat_age_seconds
+                           FROM worker_heartbeats WHERE worker_id=%s
+                           ORDER BY heartbeat_at DESC LIMIT 1""",
+                        (step["lease_owner"],),
+                    ).fetchone()
+                    if heartbeat:
+                        step["heartbeat_at"] = heartbeat["heartbeat_at"]
+                        step["heartbeat_age_seconds"] = heartbeat["heartbeat_age_seconds"]
+                step["stale"] = self._lease_expired(lease)
+                step["stale_warning"] = "Lease expired; use Recover lease to release it safely." if step["stale"] else None
         result["current_step_detail"] = next((s for s in result["steps"] if s["status"] != "complete"), None)
         result["needs_attention"] = self._attention(result)
+        list_operations = getattr(self.workflow, "list_control_operations", None)
+        result["operations"] = list_operations(int(job_id)) if list_operations else []
         return result
     @staticmethod
     def _attention(result):
@@ -205,6 +279,25 @@ class ControlStore:
         return self.planner.create_job(goal, project.repository, project.branch,
                                        priority, max_iterations)
     def action(self, job_id, action): self.workflow.control(job_id, action)
+    def begin_operation(self, job_id, action, requested_by="control-center"):
+        return self.workflow.begin_control_operation(job_id, action, requested_by)
+    def update_operation(self, operation_id, status, detail=None, error=None):
+        return self.workflow.update_control_operation(operation_id, status, detail=detail, error=error)
+    def operation(self, operation_id):
+        return self.workflow.control_operation(operation_id)
+    def operations(self, job_id=None, limit=100):
+        return self.workflow.list_control_operations(job_id, limit)
+    def retry(self, job_id):
+        return self.workflow.retry_job(int(job_id))
+    def recover_lease(self, job_id):
+        return self.workflow.recover_job(int(job_id))
+    def rerun_verification(self, job_id, step_id=None):
+        return self.workflow.rerun_verification(int(job_id), int(step_id) if step_id is not None else None)
+    def refresh_planning(self, job_id):
+        return self.workflow.refresh_planning(int(job_id))
+    def cleanup_worktrees(self):
+        manager = WorktreeManager(os.getenv("ENGINEERING_WORKTREE_ROOT", "/tmp/agent-worktrees"))
+        return self.workflow.reconcile_worktrees(manager, remove_orphans=True)
     def remove_job(self, job_id): self.workflow.remove_job(job_id)
     def answer(self, job_id, answer):
         answer = str(answer).strip()
