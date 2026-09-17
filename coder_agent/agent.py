@@ -39,10 +39,18 @@ change branches, access secrets, or expand the assignment. Prefer small, reviewa
 
 class EngineeringAgent:
     def __init__(self, store: Store, router: Router, worker_id: str,
-                 allowed_roots: list[str], max_turns: int = 30, max_attempts: int = 4,
-                 max_prompt_chars: int = DEFAULT_PROMPT_CHARS):
+                 allowed_roots: list[str], max_turns: int | None = None, max_attempts: int = 4,
+                 max_prompt_chars: int = DEFAULT_PROMPT_CHARS,
+                 max_stagnation_episodes: int = 6):
         self.store, self.router, self.worker_id = store, router, worker_id
-        self.allowed_roots, self.max_turns, self.max_attempts = allowed_roots, max_turns, max_attempts
+        self.allowed_roots = allowed_roots
+        # An overall turn cutoff is retained only for explicit compatibility
+        # callers. Production Engineering uses progress/stagnation detection;
+        # a productive package is not interrupted just because it crossed 30
+        # model/tool turns.
+        self.max_turns = None if max_turns is None or int(max_turns) <= 0 else int(max_turns)
+        self.max_attempts = max_attempts
+        self.max_stagnation_episodes = max(1, int(max_stagnation_episodes))
         self.max_prompt_chars = max(1_024, int(max_prompt_chars))
         self.last_prompt_chars = 0
 
@@ -155,8 +163,11 @@ class EngineeringAgent:
             verified = False
             previous_observation = ""
             stagnation = 0
+            stagnation_episodes = 0
             escalation_level = 0
-            for turn in range(self.max_turns):
+            turn = 0
+            while self.max_turns is None or turn < self.max_turns:
+                turn += 1
                 controlled = self._controlled_result(task, last_model)
                 if controlled is not None:
                     return controlled
@@ -167,6 +178,24 @@ class EngineeringAgent:
                         return controlled
                     raise RuntimeError("coder lease is no longer owned")
                 if stagnation >= 3:
+                    stagnation_episodes += 1
+                    if stagnation_episodes > self.max_stagnation_episodes:
+                        blocker = (
+                            "engineering stagnation detected after "
+                            f"{stagnation_episodes} recovery episodes; resume to retry"
+                        )
+                        result = AgentResult(
+                            Status.BLOCKED,
+                            "engineering paused after repeated non-progress",
+                            blocker=blocker,
+                            model=last_model,
+                        )
+                        self.store.update_step(
+                            task.step_id, self.worker_id, result.status,
+                            blocker=result.blocker, model_used=last_model,
+                            coder_response={"reason": "stagnation_detected", "turns": turn},
+                        )
+                        return result
                     escalation_level += 1
                     first_cloud_attempt = int(getattr(
                         self.router, "escalate_after", task.attempt + 3
@@ -217,14 +246,14 @@ class EngineeringAgent:
                     except (json.JSONDecodeError, KeyError):
                         pass
                 self.store.event(task, "agent_action", {
-                    "turn": turn + 1, "model": response.model,
+                    "turn": turn, "model": response.model,
                     "action": action.get("action"), "observation": self._redact(observation),
                     "progress_classification": progress_classification,
                 })
                 if session_id is not None:
                     record_action = getattr(self.store, "record_engineering_action", None)
                     if record_action:
-                        record_action(session_id, turn + 1, action.get("action", "invalid"),
+                        record_action(session_id, turn, action.get("action", "invalid"),
                                       self._redact(observation), response.model,
                                       progress_classification)
                 if observation == previous_observation or action.get("action") == "invalid":
@@ -238,6 +267,7 @@ class EngineeringAgent:
                         backend = self.router.choose(task.attempt, False)
                         last_model = backend.model
                         escalation_level = 0
+                        stagnation_episodes = 0
                 previous_observation = observation
                 if action["action"] == "blocked":
                     result = AgentResult(Status.BLOCKED, "implementation blocked",
@@ -274,11 +304,12 @@ class EngineeringAgent:
                 return controlled
             blocker = (
                 f"agent turn budget exhausted after {self.max_turns} turns; "
-                "review progress before resuming"
+                "this is an explicit compatibility limit; use progress-based mode "
+                "or raise the compatibility limit"
             )
             result = AgentResult(
                 Status.BLOCKED,
-                "implementation paused at the configured turn budget",
+                "implementation paused at an explicit compatibility limit",
                 blocker=blocker,
                 model=last_model,
             )
@@ -288,7 +319,7 @@ class EngineeringAgent:
                 result.status,
                 blocker=result.blocker,
                 model_used=last_model,
-                coder_response={"reason": "turn_budget_exhausted", "turns": self.max_turns},
+                coder_response={"reason": "compatibility_turn_limit", "turns": self.max_turns},
             )
             return result
         except (BackendError, WorkspaceViolation, CommandRejected, RuntimeError, ValueError) as exc:

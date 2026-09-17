@@ -6,6 +6,7 @@ import pytest
 from agent_core.llm import LLMResponse
 from agent_core.prompt_budget import bounded_json, bounded_messages, bounded_text, message_chars
 from coder_agent.agent import CoderAgent
+from coder_agent.cli import _engineering_turn_limit
 from coder_agent.db import Store
 from coder_agent.models import Status, Task
 
@@ -195,3 +196,34 @@ def test_turn_budget_becomes_a_recoverable_blocker(monkeypatch, tmp_path):
     assert result.status is Status.BLOCKED
     assert "turn budget exhausted" in (result.blocker or "")
     assert store.updates[-1][2] is Status.BLOCKED
+
+
+def test_progress_mode_has_no_overall_turn_cutoff_and_stops_only_on_stagnation(monkeypatch, tmp_path):
+    store = _AgentStore("running")
+    monkeypatch.setattr("coder_agent.agent.Workspace", _AgentWorkspace)
+    monkeypatch.setattr("coder_agent.agent.CommandRunner", _AgentRunner)
+    monkeypatch.setattr("coder_agent.agent.GitRepository", _AgentGit)
+    agent = CoderAgent(
+        store,
+        _AgentRouter(_AgentBackend('{"action":"inspect","kind":"status"}')),
+        "engineering-1",
+        [str(tmp_path)],
+        max_turns=0,
+        max_stagnation_episodes=1,
+    )
+
+    result = agent.run_task(_task(tmp_path))
+
+    assert agent.max_turns is None
+    assert result.status is Status.BLOCKED
+    assert "stagnation" in (result.blocker or "")
+    assert "turn budget exhausted" not in (result.blocker or "")
+
+
+def test_legacy_turn_environment_cannot_reintroduce_the_30_turn_cutoff(monkeypatch):
+    monkeypatch.delenv("ENGINEERING_TURN_LIMIT", raising=False)
+    monkeypatch.setenv("ENGINEERING_MAX_TURNS", "30")
+    monkeypatch.setenv("CODER_MAX_TURNS", "30")
+    assert _engineering_turn_limit() is None
+    monkeypatch.setenv("ENGINEERING_TURN_LIMIT", "45")
+    assert _engineering_turn_limit() == 45

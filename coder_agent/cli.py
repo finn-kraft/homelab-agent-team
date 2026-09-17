@@ -19,6 +19,18 @@ from .worker import Worker
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 
 
+def _engineering_turn_limit() -> int | None:
+    """Read only the explicit compatibility limit; normal mode is unbounded."""
+    raw = os.getenv("ENGINEERING_TURN_LIMIT")
+    if raw is None:
+        # ENGINEERING_MAX_TURNS/CODER_MAX_TURNS used to impose the 30-turn
+        # failure. They are intentionally ignored so an old .env cannot
+        # interrupt a productive Engineering session.
+        return None
+    value = int(raw)
+    return value if value > 0 else None
+
+
 def build_engineer() -> EngineeringAgent:
     database_url = os.environ["DATABASE_URL"]
 
@@ -112,12 +124,7 @@ def build_engineer() -> EngineeringAgent:
             os.getenv("CODER_WORKER_ID", "engineering-1"),
         ),
         roots,
-        max_turns=int(
-            os.getenv(
-                "ENGINEERING_MAX_TURNS",
-                os.getenv("CODER_MAX_TURNS", "30"),
-            )
-        ),
+        max_turns=_engineering_turn_limit(),
         max_attempts=int(
             os.getenv(
                 "MAX_ENGINEERING_ATTEMPTS",
@@ -128,6 +135,7 @@ def build_engineer() -> EngineeringAgent:
             "ENGINEERING_MAX_CONTEXT_CHARS",
             os.getenv("CODER_MAX_CONTEXT_CHARS", "120000"),
         )),
+        max_stagnation_episodes=int(os.getenv("ENGINEERING_MAX_STAGNATION_EPISODES", "6")),
     )
 
 

@@ -72,7 +72,7 @@ def build_planner() -> PlannerAgent:
         ),
         os.getenv("PLANNER_WORKER_ID", "planner-1"),
         int(os.getenv("PLANNER_LEASE_SECONDS", "300")),
-        int(os.getenv("PLANNER_DECISION_RETRIES", "3")),
+        int(os.getenv("PLANNER_DECISION_RETRIES", "1")),
         escalation_attempt,
         int(os.getenv("PLANNER_MAX_CONTEXT_CHARS", "120000")),
         int(os.getenv("PLANNER_PACKAGE_STEPS", "3")),

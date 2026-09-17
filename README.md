@@ -285,6 +285,9 @@ See [`.env.example`](.env.example). The principal values are:
 | `OPENROUTER_TIMEOUT_SECONDS` / `OPENROUTER_RETRIES` | Cloud request timeout and retry budget (defaults `90` / `1`) |
 | `ENGINEERING_MAX_CONTEXT_CHARS`, `PLANNER_MAX_CONTEXT_CHARS`, `REVIEWER_MAX_CONTEXT_CHARS` | Hard prompt character budgets |
 | `PLANNER_PACKAGE_STEPS` | Maximum ordered steps emitted before replanning (default `3`) |
+| `PLANNER_DECISION_RETRIES` | Short planning repair budget (default `1`; two total planning calls) |
+| `ENGINEERING_TURN_LIMIT` | Optional compatibility cap; `0`/unset means progress-based Engineering with no overall turn cutoff |
+| `ENGINEERING_MAX_STAGNATION_EPISODES` | Safety stop after repeated no-progress/escalation episodes (default `6`) |
 | `PROTECTED_BRANCHES` | Comma-separated autonomous-commit deny list |
 | `AUTO_COMMIT` | Enables reviewer-approved local checkpoints |
 | `AUTO_PUSH` | Off by default; no force/history rewrite is ever permitted |
