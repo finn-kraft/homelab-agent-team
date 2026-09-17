@@ -285,9 +285,10 @@ function progressFor(job) {
 
 function jobsTable(jobs) {
   if (!jobs.length) return '<div class="card empty"><div><strong>No active jobs</strong>Launch a job when you are ready to put the team to work.</div></div>';
-  return `<div class="card table-card"><table><thead><tr><th>Mission</th><th>Project</th><th>Status</th><th>Current phase</th><th>Progress</th><th></th></tr></thead><tbody>${jobs.map(job => {
+  return `<div class="card table-card"><table><thead><tr><th>Mission</th><th>Project</th><th>Status</th><th>Current phase</th><th>Progress</th><th>Blocker / action</th><th></th></tr></thead><tbody>${jobs.map(job => {
     const progress = progressFor(job);
-    return `<tr class="clickable"><td class="job-goal">${esc(job.goal)}</td><td>${esc(projectFor(job.repository)?.name || job.repository)}</td><td>${badge(job.status)}</td><td>${esc(job.current_phase || 'Waiting')}</td><td><div class="progress"><div class="progress-label"><span>${progress.done}/${progress.total || '—'} steps</span><span>${progress.percent}%</span></div><div class="bar"><span style="width:${progress.percent}%"></span></div></div></td><td><button class="row-open" data-action="open-job" data-job-id="${Number(job.id)}" aria-label="Open job ${Number(job.id)}">→</button></td></tr>`;
+    const blocker = job.blocker ? (typeof job.blocker === 'string' ? job.blocker : (job.blocker.reason || job.blocker.message || JSON.stringify(job.blocker))) : '';
+    return `<tr class="clickable"><td class="job-goal">${esc(job.goal)}</td><td>${esc(projectFor(job.repository)?.name || job.repository)}</td><td>${badge(job.status)}</td><td>${esc(job.current_phase || 'Waiting')}</td><td><div class="progress"><div class="progress-label"><span>${progress.done}/${progress.total || '—'} steps</span><span>${progress.percent}%</span></div><div class="bar"><span style="width:${progress.percent}%"></span></div></div></td><td class="job-blocker">${esc(blocker || (['blocked','needs_human','failed'].includes(job.status) ? 'Needs attention' : '—'))}</td><td><button class="row-open" data-action="open-job" data-job-id="${Number(job.id)}" aria-label="Manage job ${Number(job.id)}">→</button></td></tr>`;
   }).join('')}</tbody></table></div>`;
 }
 
