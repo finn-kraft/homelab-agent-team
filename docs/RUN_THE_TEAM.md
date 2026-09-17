@@ -3,12 +3,12 @@
 This is the operator runbook for one persistent local stack:
 
 ```text
-PostgreSQL ─┬─ Orchestrator (embeds Planner, Coder, and Reviewer)
+PostgreSQL ─┬─ Orchestrator (embeds Planner, EngineeringAgent, and Reviewer)
             └─ Control Center web UI
 Ollama ── Routing Agent ── Orchestrator
 ```
 
-Do **not** also start the legacy `planner-agent run`, `coder-agent run`, or
+Do **not** also start the legacy `planner-agent run`, `engineering-agent run`, or
 `reviewer-agent run` loops. `agent-orchestrator run` constructs and coordinates all
 three specialists.
 
@@ -47,14 +47,19 @@ At minimum, verify these values:
 DATABASE_URL=postgresql://agent_team_app@127.0.0.1:5432/agent_team
 
 PLANNER_ALLOWED_REPOSITORIES=/home/finn/work
-CODER_WORKSPACES=/home/finn/work
+ENGINEERING_WORKSPACES=/home/finn/work
 REVIEWER_ALLOWED_REPOSITORIES=/home/finn/work
 
 ROUTER_URL=http://127.0.0.1:8090
 OLLAMA_URL=http://192.168.10.193:11434
 PLANNER_MODEL=llama3.2:latest
-CODER_MODEL=llama3.2:latest
+ENGINEERING_MODEL=llama3.2:latest
 REVIEWER_MODEL=llama3.2:latest
+
+# Planning gets one repair retry; Engineering has no overall turn cutoff.
+PLANNER_DECISION_RETRIES=1
+ENGINEERING_TURN_LIMIT=0
+ENGINEERING_MAX_STAGNATION_EPISODES=6
 
 CONTROL_CENTER_HOST=127.0.0.1
 CONTROL_CENTER_PORT=8080
@@ -111,7 +116,8 @@ is reachable from the agent server.
 ## 4. Initialize the workflow database
 
 Run this once after first install and again after pulling a release that contains an
-additive migration (including the Control Center credential table):
+additive migration (including the Control Center credential, mission, integration,
+and human-queue tables):
 
 ```bash
 cd /home/finn/homelab-ai/dev-team
@@ -120,6 +126,22 @@ set -a
 set +a
 .venv/bin/agent-orchestrator init-db
 ```
+
+For a roadmap-driven V2 mission, create it once and let the coordinator materialize
+the next bounded items automatically:
+
+```bash
+.venv/bin/agent-orchestrator create-mission "Follow the Align roadmap" \
+  --repository /home/finn/work/align --branch agents/autonomous-align
+.venv/bin/agent-orchestrator expand-mission 1 --limit 3
+.venv/bin/agent-orchestrator missions
+.venv/bin/agent-orchestrator packages --mission-id 1
+```
+
+The coordinator continues through Engineering → Reviewer → Verification →
+Checkpoint. Integration is deliberately an explicit, protected-branch-aware
+operation until you opt into `AUTO_INTEGRATE=true`; conflicts are recorded for
+the Human Queue rather than silently rewriting history.
 
 Use a migration-capable database identity for this step. The normal services should
 run with the restricted application identity.

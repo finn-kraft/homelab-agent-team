@@ -1,6 +1,7 @@
 const state = {
   csrfToken: '', overview: null, projects: [], events: [], view: 'dashboard',
   jobId: null, streamGeneration: 0, eventFilter: '', eventSearch: {}, humanDraft: '',
+  telemetry: null, telemetryTimer: null, telemetryInFlight: false,
 };
 
 const $ = selector => document.querySelector(selector);
@@ -114,6 +115,7 @@ function showView(name) {
     projects: ['Projects', 'Repositories the team is authorized to change.'],
     agents: ['Agents', 'Live assignments backed by durable workflow evidence.'],
     jobs: ['Jobs', 'Track and manage every workflow in one place.'],
+    missions: ['Missions', 'Roadmap packages, human gates, and integration status.'],
     events: ['Events', 'Technical workflow history, routes, and recovery evidence.'],
     job: ['Job detail', 'Progress, decisions, verification, and human gates.'],
   };
@@ -137,7 +139,7 @@ async function connect() {
   try {
     const login = await api('/api/login', {method: 'POST', body: JSON.stringify({password})});
     state.csrfToken = login.csrf_token;
-    [state.overview, state.projects] = await Promise.all([api('/api/overview'), api('/api/projects')]);
+    [state.overview, state.projects, state.telemetry] = await Promise.all([api('/api/overview'), api('/api/projects'), api('/api/telemetry')]);
     $('#password').value = '';
     document.body.classList.add('connected');
     $('#login').hidden = true;
@@ -145,6 +147,7 @@ async function connect() {
     populateProjects();
     showView('dashboard');
     stream(++state.streamGeneration);
+    startTelemetry(state.streamGeneration);
   } catch (error) {
     state.csrfToken = '';
     $('#loginError').textContent = 'Could not sign in. Check the password and server status.';
@@ -159,8 +162,11 @@ async function disconnect() {
   try { await api('/api/logout', {method: 'POST', body: '{}'}); } catch (_) { /* session may already be expired */ }
   state.csrfToken = '';
   state.overview = null;
+  state.telemetry = null;
   state.projects = [];
   state.events = [];
+  if (state.telemetryTimer) clearInterval(state.telemetryTimer);
+  state.telemetryTimer = null;
   document.body.classList.remove('connected');
   $('#app').hidden = true;
   $('#login').hidden = false;
@@ -188,6 +194,7 @@ async function stream(generation) {
         const line = frame.split('\n').find(item => item.startsWith('data: '));
         if (!line) continue;
         state.overview = JSON.parse(line.slice(6));
+        if (state.overview.telemetry) state.telemetry = state.overview.telemetry;
         render();
         if (state.view === 'events') loadEvents(true);
       }
@@ -201,12 +208,33 @@ async function stream(generation) {
   }
 }
 
+async function refreshTelemetry(generation) {
+  if (!state.csrfToken || generation !== state.streamGeneration || state.telemetryInFlight) return;
+  state.telemetryInFlight = true;
+  try {
+    state.telemetry = await api('/api/telemetry');
+    if (state.overview) state.overview.telemetry = state.telemetry;
+    if (state.view === 'dashboard') renderDashboard();
+  } catch (_) {
+    // The one-second loop keeps trying; the last good reading stays visible.
+  } finally {
+    state.telemetryInFlight = false;
+  }
+}
+
+function startTelemetry(generation) {
+  if (state.telemetryTimer) clearInterval(state.telemetryTimer);
+  refreshTelemetry(generation);
+  state.telemetryTimer = setInterval(() => refreshTelemetry(generation), 1000);
+}
+
 function render() {
   if (!state.overview) return;
   if (state.view === 'dashboard') renderDashboard();
   if (state.view === 'projects') renderProjects();
   if (state.view === 'agents') renderAgents();
   if (state.view === 'jobs') $('#jobsView').innerHTML = `<div class="section-head"><div class="section-title"><h2>All jobs</h2><small>Running, waiting, blocked, and completed work</small></div></div>${jobsTable(state.overview.jobs || [])}`;
+  if (state.view === 'missions') renderMissions();
   if (state.view === 'events') renderEventView();
   if (state.view === 'job' && state.jobId) renderJob(state.jobId);
 }
@@ -224,7 +252,7 @@ function serviceCard(name, online, detail, iconName) {
 
 function renderDashboard() {
   const overview = state.overview;
-  const telemetry = overview.telemetry || {};
+  const telemetry = state.telemetry || overview.telemetry || {};
   const ollama = telemetry.ollama || {};
   const gpu = telemetry.gpu || {};
   const router = telemetry.routing_agent || {};
@@ -234,7 +262,7 @@ function renderDashboard() {
   const attention = jobs.filter(job => ['needs_human', 'blocked', 'failed'].includes(job.status));
   const loaded = ollama.loaded_model || {};
   const model = loaded.name || loaded.model || 'No model loaded';
-  const context = loaded.context_length || gpu.context_length;
+  const context = loaded.context_length || ollama.context_length || gpu.context_length;
   const modelVram = loaded.size_vram || ollama.size_vram;
   const services = [orchestrator?.online, true, ollama.status === 'online', router.status === 'online'];
   const healthyServices = services.filter(Boolean).length;
@@ -243,6 +271,10 @@ function renderDashboard() {
   const vramTotal = Number(gpu.vram_total_mb || 0);
   const vramUsed = Number(gpu.vram_used_mb || 0);
   const vramPercent = vramTotal ? Math.round(vramUsed / vramTotal * 100) : 0;
+  const phaseMetrics = overview.phase_metrics || [];
+  const slowestPhase = phaseMetrics.reduce((best, item) => Number(item.max_seconds || 0) > Number(best?.max_seconds || 0) ? item : best, null);
+  const ollamaVersion = ollama.version ? `Ollama ${ollama.version}` : 'Ollama version unavailable';
+  const ollamaModels = Array.isArray(ollama.models) ? ollama.models : [];
 
   $('#dashboardView').innerHTML = `
     <div class="grid">
@@ -250,15 +282,16 @@ function renderDashboard() {
       ${metricCard('Needs attention', attention.length, attention.length ? 'Operator decision required' : 'Nothing waiting on you', 'alert', attention.length ? 'offline' : 'online')}
       ${metricCard('Healthy services', `${healthyServices} / 4`, healthyServices === 4 ? 'All systems nominal' : 'Check service health below', 'server', healthyServices === 4 ? 'online' : 'offline')}
       ${metricCard('Cloud spend', `$${cloudSpend.toFixed(3)}`, `${overview.inference?.cloud_requests || 0} routed requests`, 'cloud')}
+      ${metricCard('Slowest phase', slowestPhase ? `${Number(slowestPhase.max_seconds).toFixed(1)}s` : '—', slowestPhase ? `${slowestPhase.phase} · ${Number(slowestPhase.max_prompt_chars || 0).toLocaleString()} prompt chars` : 'Telemetry begins after migration', 'activity')}
     </div>
-    ${attention.length ? `<div class="section-head"><div class="section-title"><h2>Needs your attention</h2><small>Jobs paused at a decision or technical gate</small></div></div>${attentionPanel(attention)}` : ''}
+    ${attention.length || (overview.human_queue || []).length ? `<div class="section-head"><div class="section-title"><h2>Needs your attention</h2><small>Jobs and durable decisions waiting for you</small></div></div>${attentionPanel(attention)}${humanQueuePanel(overview.human_queue || [])}` : ''}
     <div class="section-head"><div class="section-title"><h2>Active jobs</h2><small>Work currently moving through the delivery loop</small></div><span>${active.length} running</span></div>
     ${jobsTable(active)}
     <div class="section-head"><div class="section-title"><h2>System health</h2><small>Live service and model availability</small></div><span>Updated just now</span></div>
     <div class="grid">
       ${serviceCard('Orchestrator', Boolean(orchestrator?.online), orchestrator?.current_action || 'No recent heartbeat', 'route')}
       ${serviceCard('PostgreSQL', true, 'Durable workflow connected', 'database')}
-      ${serviceCard('Ollama', ollama.status === 'online', `${model}${context ? ` · ${context} context` : ''}${modelVram ? ` · ${bytes(modelVram)} VRAM` : ''}`, 'brain')}
+      ${serviceCard('Ollama', ollama.status === 'online', `${ollamaVersion} · ${model}${context ? ` · ${context} context` : ''}${modelVram ? ` · ${bytes(modelVram)} VRAM` : ''}`, 'brain')}
       ${serviceCard('Routing agent', router.status === 'online', router.service || router.status || 'Not configured', 'route')}
     </div>
     <div class="section-head"><div class="section-title"><h2>Compute</h2><small>Local inference capacity and routing</small></div></div>
@@ -268,8 +301,28 @@ function renderDashboard() {
       <article class="card metric"><div class="metric-head"><span>Thermals</span><span class="metric-icon">${icon('thermometer')}</span></div><div><div class="metric-value"><strong>${esc(gpu.temperature_c ?? '—')}</strong><em>°C</em></div><small>${gpu.power_w ? `${esc(gpu.power_w)} watts` : 'Power data unavailable'}</small></div></article>
       <article class="card metric"><div class="metric-head"><span>Inference routes</span><span class="metric-icon">${icon('route')}</span></div><div class="routing-split"><div><b>${overview.inference?.local_requests || 0}</b><small>Local</small></div><div><b>${overview.inference?.cloud_requests || 0}</b><small>Cloud</small></div><div><b>${overview.inference?.fallback_requests || 0}</b><small>Fallback</small></div></div></article>
     </div>
+    <div class="section-head"><div class="section-title"><h2>Ollama detail</h2><small>Read-only data refreshed every second</small></div><span>${esc(ollama.loaded_count || 0)} loaded · ${esc(ollama.model_count || ollamaModels.length || 0)} installed</span></div>
+    <div class="card telemetry-detail"><div class="facts"><div class="fact"><span>API</span>${badge(ollama.status || 'unavailable')}</div><div class="fact"><span>Version</span><strong>${esc(ollama.version || '—')}</strong></div><div class="fact"><span>Loaded model</span><strong>${esc(model)}</strong></div><div class="fact"><span>Processor</span><strong>${esc(loaded.processor || ollama.processor || '—')}</strong></div><div class="fact"><span>Model size</span><strong>${bytes(loaded.size || ollama.size) || '—'}</strong></div><div class="fact"><span>VRAM used by model</span><strong>${bytes(modelVram) || '—'}</strong></div><div class="fact"><span>Context</span><strong>${esc(context || '—')}</strong></div><div class="fact"><span>Keep-alive until</span><strong>${esc(ollama.expires_at || '—')}</strong></div></div><div class="chips">${ollamaModels.slice(0, 24).map(item => `<span class="chip">${esc(item.name || item.model || item.digest || 'model')}</span>`).join('') || '<span class="muted">No installed models reported</span>'}</div></div>
     <div class="section-head"><div class="section-title"><h2>Recent autonomous commits</h2><small>Reviewer-approved checkpoints produced by the team</small></div></div>
     ${commitsList(overview.recent_commits || [])}`;
+}
+
+function humanQueuePanel(items) {
+  if (!items.length) return '';
+  return `<div class="card attention"><div class="attention-head">${icon('alert')}<h3>Human queue</h3></div>${items.map(item => `<button class="attention-row" data-action="open-job" data-job-id="${Number(item.job_id || 0)}"><span>${badge(item.kind)}</span><strong>${esc(item.question)}</strong><small>${item.job_id ? `Job #${Number(item.job_id)}` : 'Mission decision'} · ${age(item.created_at)}</small><b>Review →</b></button>`).join('')}</div>`;
+}
+
+function renderMissions() {
+  const missions = state.overview.missions || [];
+  $('#missionsView').innerHTML = `<div class="section-head"><div class="section-title"><h2>Mission control</h2><small>Roadmap work is materialized into bounded packages before engineering starts.</small></div><span>${missions.length} mission${missions.length === 1 ? '' : 's'}</span></div>${missions.length ? `<div class="project-list">${missions.map(mission => `<article class="card project-card"><div class="section-head tight"><div><span class="kicker">MISSION #${Number(mission.id)}</span><h3>${esc(mission.goal)}</h3></div>${badge(mission.status)}</div><p class="path">${esc(mission.repository)} · ${esc(mission.branch)}</p><div class="project-meta"><div><span>Packages</span><b>${Number(mission.completed_packages || 0)} / ${Number(mission.package_count || 0)} complete</b></div><div><span>Blocked</span><b>${Number(mission.blocked_packages || 0)}</b></div><div><span>Human queue</span><b>${Number(mission.open_human_requests || 0)}</b></div><div><span>Updated</span><b>${esc(age(mission.updated_at))}</b></div></div><button class="primary" data-action="open-mission" data-mission-id="${Number(mission.id)}">Open mission →</button></article>`).join('')}</div>` : '<div class="card empty"><div><strong>No V2 missions yet</strong>Create one with the orchestrator mission command, then let the roadmap manager populate packages.</div></div>'}`;
+}
+
+async function openMission(id) {
+  try {
+    const mission = await api(`/api/missions/${Number(id)}`);
+    const packageRows = (mission.packages || []).map(pkg => `<div class="commit-row"><span>${badge(pkg.status)}</span><div class="commit-main"><strong>${esc(pkg.objective)}</strong><small>${esc(pkg.roadmap_reference || 'manual package')} · ${esc(pkg.branch)}</small></div><span class="code">${esc((pkg.resulting_commit || 'not committed').slice(0, 10))}</span></div>`).join('');
+    $('#missionsView').innerHTML = `<div class="section-head"><div class="section-title"><h2>${esc(mission.goal)}</h2><small>${esc(mission.repository)} · ${esc(mission.branch)}</small></div><button data-action="back-missions">← All missions</button></div><div class="card commit-list">${packageRows || '<div class="empty"><div><strong>No packages yet</strong>The roadmap manager will materialize the next bounded items.</div></div>'}</div>${(mission.integrations || []).length ? `<div class="section-head"><div class="section-title"><h2>Integration</h2><small>Verified package commits and branch updates</small></div></div><div class="card commit-list">${mission.integrations.map(item => `<div class="commit-row">${badge(item.status)}<div class="commit-main"><strong>${esc(item.source_branch)} → ${esc(item.target_branch)}</strong><small>${esc(item.error || item.commit_sha || 'Pending')}</small></div></div>`).join('')}</div>` : ''}`;
+  } catch (error) { toast('Could not load mission', error.message, true); }
 }
 
 function attentionPanel(jobs) {
@@ -292,7 +345,8 @@ function jobsTable(jobs) {
     const blocker = job.blocker ? (typeof job.blocker === 'string' ? job.blocker : (job.blocker.reason || job.blocker.message || JSON.stringify(job.blocker))) : '';
     const lease = job.planner_worker_id ? `${job.planner_worker_id} · expires ${age(job.planner_lease_expires_at)}` : 'Unleased';
     const progressState = job.progress_classification ? ` · ${job.progress_classification.replaceAll('_', ' ')}` : '';
-    return `<tr class="clickable"><td class="job-goal">${esc(job.goal)}</td><td>${esc(projectFor(job.repository)?.name || job.repository)}</td><td>${badge(job.status)}</td><td>${esc(job.current_phase || 'Waiting')}<small class="table-meta">${esc(lease)}${esc(progressState)}</small></td><td><div class="progress"><div class="progress-label"><span>${progress.done}/${progress.total || '—'} steps</span><span>${progress.percent}%</span></div><div class="bar"><span style="width:${progress.percent}%"></span></div></div></td><td class="job-blocker">${esc(blocker || (['blocked','needs_human','failed'].includes(job.status) ? 'Needs attention' : '—'))}</td><td><button class="row-open" data-action="open-job" data-job-id="${Number(job.id)}" aria-label="Manage job ${Number(job.id)}">→</button></td></tr>`;
+    const remove = job.status === 'pending' ? `<button class="row-remove" data-action="job-action" data-job-action="remove" data-job-id="${Number(job.id)}" aria-label="Remove queued job ${Number(job.id)}" title="Remove queued job">×</button>` : '';
+    return `<tr class="clickable"><td class="job-goal">${esc(job.goal)}</td><td>${esc(projectFor(job.repository)?.name || job.repository)}</td><td>${badge(job.status)}</td><td>${esc(job.current_phase || 'Waiting')}<small class="table-meta">${esc(lease)}${esc(progressState)}</small></td><td><div class="progress"><div class="progress-label"><span>${progress.done}/${progress.total || '—'} steps</span><span>${progress.percent}%</span></div><div class="bar"><span style="width:${progress.percent}%"></span></div></div></td><td class="job-blocker">${esc(blocker || (['blocked','needs_human','failed'].includes(job.status) ? 'Needs attention' : '—'))}</td><td class="job-row-actions">${remove}<button class="row-open" data-action="open-job" data-job-id="${Number(job.id)}" aria-label="Manage job ${Number(job.id)}">→</button></td></tr>`;
   }).join('')}</tbody></table></div>`;
 }
 
@@ -333,7 +387,7 @@ function derivedAgents() {
   const active = work[0];
   return [
     {name: 'Planner', role: 'Strategy & decomposition', icon: 'brain', state: active?.current_phase === 'planning' ? 'planning' : 'idle', detail: events['planner-agent']?.event_type, meta: active?.provider ? `${active.provider} / ${active.model}` : 'Ready for the next roadmap decision'},
-    {name: 'Coder', role: 'Implementation', icon: 'code', state: active?.status === 'running' ? 'coding' : 'idle', detail: active?.status === 'running' ? active.title : events['coder-agent']?.event_type, meta: active?.files_changed?.length ? `${active.files_changed.length} files · ${active.command_count} recorded commands` : 'No implementation currently claimed'},
+    {name: 'Engineer', role: 'Implementation & debugging', icon: 'code', state: active?.status === 'running' ? 'engineering' : 'idle', detail: active?.status === 'running' ? active.title : (events['engineering-agent']?.event_type || events['coder-agent']?.event_type), meta: active?.files_changed?.length ? `${active.files_changed.length} files · ${active.command_count} recorded commands` : 'No implementation currently claimed'},
     {name: 'Reviewer', role: 'Independent quality gate', icon: 'review', state: active?.status === 'review' ? 'reviewing' : 'idle', detail: active?.verdict || events['reviewer-agent']?.event_type, meta: active?.open_issue_count ? `${active.open_issue_count} open review issues` : 'Waiting for reviewable work'},
     {name: 'Orchestrator', role: 'Deterministic coordination', icon: 'route', state: orchestrator?.online ? 'running' : 'stopped', detail: orchestrator?.current_action, meta: orchestrator?.started_at ? `Started ${age(orchestrator.started_at)} · heartbeat ${age(orchestrator.heartbeat_at)}` : 'No durable heartbeat'},
   ];
@@ -380,7 +434,8 @@ function jobControls(job) {
   const active = ['pending', 'planning', 'running', 'reviewing', 'verifying', 'checkpointing'].includes(job.status);
   const resumable = ['paused', 'blocked', 'failed'].includes(job.status);
   const cancellable = !['complete', 'cancelled'].includes(job.status);
-  return `${active ? '<button data-action="job-action" data-job-action="pause">Pause</button>' : ''}${resumable ? '<button class="primary" data-action="job-action" data-job-action="resume">Resume</button>' : ''}${cancellable ? '<button class="danger" data-action="job-action" data-job-action="cancel">Cancel</button>' : ''}`;
+  const removable = job.status === 'pending';
+  return `${active ? '<button data-action="job-action" data-job-action="pause">Pause</button>' : ''}${resumable ? '<button class="primary" data-action="job-action" data-job-action="resume">Resume</button>' : ''}${removable ? '<button class="danger" data-action="job-action" data-job-action="remove">Remove from queue</button>' : ''}${cancellable ? '<button class="danger" data-action="job-action" data-job-action="cancel">Cancel</button>' : ''}`;
 }
 
 async function renderJob(id) {
@@ -398,26 +453,19 @@ async function renderJob(id) {
 	start: humanAnswer.selectionStart,
   	end: humanAnswer.selectionEnd
     } : null;
-      $('#jobView').innerHTML = `
-    if (activeHumanAnswer) {
-    const restored = $('#humanAnswer');
-
-    if (restored) {
-    	restored.focus({ preventScroll: true });
-
-    if (humanSelection) {
-      restored.setSelectionRange(
-        humanSelection.start,
-        humanSelection.end
-      );
-    }
-  }
-}
+    $('#jobView').innerHTML = `
       ${detail.needs_attention ? attentionCard(id, detail.needs_attention) : ''}
       <article class="card job-hero"><div class="section-head tight"><div><span class="kicker">JOB #${Number(job.id)}</span><h2>${esc(job.goal)}</h2><span>${badge(job.status)} <span class="muted">· ${esc(projectFor(job.repository)?.name || job.repository)} · ${esc(job.branch)}</span></span></div><div class="job-actions">${jobControls(job)}</div></div><div class="job-flow"><div class="flow">${stages.map((item, index) => `${index ? '<span class="arrow">›</span>' : ''}<span class="stage ${item === stage ? 'active' : ''} ${index < activeIndex || job.status === 'complete' ? 'done' : ''}"><i>${index + 1}</i>${item[0].toUpperCase() + item.slice(1)}</span>${item === 'reviewer' && current?.status === 'changes_requested' ? '<span class="loop">↩ revision</span>' : ''}`).join('')}</div></div></article>
       ${current ? stepCard(current) : ''}
       <div class="section-head"><div class="section-title"><h2>Completed steps</h2><small>Durable checkpoints already accepted</small></div><span>${detail.steps.filter(step => step.status === 'complete').length} complete</span></div>
       <div class="card timeline">${detail.steps.filter(step => step.status === 'complete').map(stepTimeline).join('') || '<div class="empty"><div><strong>No completed steps yet</strong>The first checkpoint will appear here.</div></div>'}</div>`;
+    if (activeHumanAnswer) {
+      const restored = $('#humanAnswer');
+      if (restored) {
+        restored.focus({preventScroll: true});
+        if (humanSelection) restored.setSelectionRange(humanSelection.start, humanSelection.end);
+      }
+    }
   } catch (error) { toast('Could not load job', error.message, true); }
 }
 
@@ -429,8 +477,9 @@ function stepCard(step) {
   const review = step.reviews?.at(-1);
   const verification = step.verification_runs?.at(-1);
   const route = step.model_routes?.at(-1);
+  const phase = step.phase_metrics?.at(-1);
   const issues = (step.review_issues || []).filter(issue => issue.status === 'open');
-  return `<div class="section-head"><div class="section-title"><h2>Current step</h2><small>Live implementation and quality evidence</small></div>${badge(step.status)}</div><div class="step-summary"><article class="card"><span class="kicker">OBJECTIVE</span><h3>${esc(step.title)}</h3><p>${esc(step.objective)}</p><h4>Acceptance criteria</h4><ul class="criteria">${(step.acceptance_criteria || []).map(item => `<li>${esc(item)}</li>`).join('') || '<li>No criteria recorded</li>'}</ul><h4>Changed files</h4><div class="chips">${(step.files_changed || []).map(item => `<span class="chip">${esc(item)}</span>`).join('') || '<span class="muted">No changed files recorded</span>'}</div>${issues.length ? `<h4>Reviewer issues</h4><ul class="criteria">${issues.map(issue => `<li><strong>${esc(issue.severity)}</strong> · ${esc(issue.problem)}</li>`).join('')}</ul>` : ''}</article><article class="card"><span class="kicker">EXECUTION EVIDENCE</span><div class="facts"><div class="fact"><span>Attempt</span><strong>${Number(step.attempt_count || 0)}</strong></div><div class="fact"><span>Elapsed</span><strong>${age(step.started_at)}</strong></div><div class="fact"><span>Model route</span><strong>${esc(route?.model || step.model_used || '—')} · ${esc(route?.provider || '—')}</strong></div><div class="fact"><span>Reviewer</span>${badge(review?.verdict || 'waiting')}</div><div class="fact"><span>Verification</span>${badge(verification?.status || 'waiting')}</div><div class="fact"><span>Commands / tests</span><strong>${(step.commands || []).length}</strong></div><div class="fact"><span>Resulting commit</span><span class="code">${esc((step.resulting_commit || '—').slice(0, 12))}</span></div></div></article></div>`;
+  return `<div class="section-head"><div class="section-title"><h2>Current step</h2><small>Live implementation and quality evidence</small></div>${badge(step.status)}</div><div class="step-summary"><article class="card"><span class="kicker">OBJECTIVE</span><h3>${esc(step.title)}</h3><p>${esc(step.objective)}</p><h4>Acceptance criteria</h4><ul class="criteria">${(step.acceptance_criteria || []).map(item => `<li>${esc(item)}</li>`).join('') || '<li>No criteria recorded</li>'}</ul><h4>Changed files</h4><div class="chips">${(step.files_changed || []).map(item => `<span class="chip">${esc(item)}</span>`).join('') || '<span class="muted">No changed files recorded</span>'}</div>${issues.length ? `<h4>Reviewer issues</h4><ul class="criteria">${issues.map(issue => `<li><strong>${esc(issue.severity)}</strong> · ${esc(issue.problem)}</li>`).join('')}</ul>` : ''}</article><article class="card"><span class="kicker">EXECUTION EVIDENCE</span><div class="facts"><div class="fact"><span>Attempt</span><strong>${Number(step.attempt_count || 0)}</strong></div><div class="fact"><span>Elapsed</span><strong>${age(step.started_at)}</strong></div><div class="fact"><span>Model route</span><strong>${esc(route?.model || step.model_used || '—')} · ${esc(route?.provider || '—')}</strong></div><div class="fact"><span>Reviewer</span>${badge(review?.verdict || 'waiting')}</div><div class="fact"><span>Verification</span>${badge(verification?.status || 'waiting')}</div><div class="fact"><span>Commands / tests</span><strong>${(step.commands || []).length}</strong></div><div class="fact"><span>Last phase</span><strong>${esc(phase ? `${phase.phase} · ${Number(phase.duration_seconds || 0).toFixed(1)}s` : '—')}</strong></div><div class="fact"><span>Prompt size</span><strong>${phase ? `${Number(phase.prompt_chars || 0).toLocaleString()} chars` : '—'}</strong></div><div class="fact"><span>Resulting commit</span><span class="code">${esc((step.resulting_commit || '—').slice(0, 12))}</span></div></div></article></div>`;
 }
 
 function stepTimeline(step) {
@@ -438,15 +487,25 @@ function stepTimeline(step) {
 }
 
 async function jobAction(action, button) {
-  if (action === 'cancel' && !confirm('Cancel this job? The team will stop claiming new work.')) return;
+  const jobId = Number(button?.dataset.jobId || state.jobId);
+  const confirmation = action === 'remove'
+    ? 'Remove this queued job permanently? It has not started and cannot be restored.'
+    : 'Cancel this job? The team will stop claiming new work.';
+  if (['cancel', 'remove'].includes(action) && !confirm(confirmation)) return;
   setBusy(button, true);
   try {
-    await api(`/api/jobs/${state.jobId}/${action}`, {method: 'POST', body: JSON.stringify({confirm: action === 'cancel'})});
-    const labels = {pause: 'paused', resume: 'resumed', cancel: 'cancelled'};
-    toast(`Job ${labels[action]}`, `Job #${state.jobId} was updated.`);
+    await api(`/api/jobs/${jobId}/${action}`, {method: 'POST', body: JSON.stringify({confirm: ['cancel', 'remove'].includes(action)})});
+    const labels = {pause: 'paused', resume: 'resumed', cancel: 'cancelled', remove: 'removed'};
+    toast(`Job ${labels[action]}`, `Job #${jobId} was updated.`);
     state.overview = await api('/api/overview');
     state.humanDraft = '';
-    await renderJob(state.jobId);
+    if (action === 'remove') {
+      if (state.jobId === jobId) state.jobId = null;
+      if (state.view === 'job') showView('jobs');
+      else render();
+      return;
+    }
+    await renderJob(jobId);
   } catch (error) { toast('Job action failed', error.message, true); }
   finally { setBusy(button, false); }
 }
@@ -503,6 +562,8 @@ document.addEventListener('click', event => {
   const action = target.dataset.action;
   if (action === 'new-job') return newJob(target.dataset.projectId);
   if (action === 'open-job') return openJob(target.dataset.jobId);
+  if (action === 'open-mission') return openMission(target.dataset.missionId);
+  if (action === 'back-missions') return renderMissions();
   if (action === 'event-filter') { state.eventFilter = target.dataset.filter; return loadEvents(); }
   if (action === 'job-action') return jobAction(target.dataset.jobAction, target);
   if (action === 'answer-job') return answerJob(Number(target.dataset.jobId), target);
@@ -534,9 +595,9 @@ async function restoreSession() {
     const session = await api('/api/session');
     if (!session.authenticated) return;
     state.csrfToken = session.csrf_token;
-    [state.overview, state.projects] = await Promise.all([api('/api/overview'), api('/api/projects')]);
+    [state.overview, state.projects, state.telemetry] = await Promise.all([api('/api/overview'), api('/api/projects'), api('/api/telemetry')]);
     document.body.classList.add('connected'); $('#login').hidden = true; $('#app').hidden = false;
-    populateProjects(); showView('dashboard'); stream(++state.streamGeneration);
+    populateProjects(); showView('dashboard'); stream(++state.streamGeneration); startTelemetry(state.streamGeneration);
   } catch (_) { /* no existing session */ }
 }
 restoreSession();

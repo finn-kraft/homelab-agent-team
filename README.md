@@ -14,7 +14,7 @@ specialist command between steps.
 | Component | Owns | Does not own |
 | --- | --- | --- |
 | Planner | What safe, concrete step happens next; semantic goal completion | Editing, committing, scheduling |
-| Coder | Implementing one assigned step and recording commands/diff | Approval, commit, goal completion |
+| EngineeringAgent (legacy Coder alias) | Inspecting a Work Package, implementing, testing, debugging, and recording commands/diff | Approval, commit, goal completion |
 | Reviewer | Independent acceptance-criteria review | Silent fixes, merge, goal completion |
 | Orchestrator | Deterministic next-state selection, leases, final verification, checkpoint hand-off | LLM planning or code reasoning |
 | Routing Agent | Model/compute policy | Workflow state transitions |
@@ -25,8 +25,8 @@ The Orchestrator is intentionally not another reasoning agent. Its normal
 transition is deterministic:
 
 ```text
-Planner → queued step → Coder → Reviewer
-                               ├─ changes requested → same Coder step
+Planner → queued Work Package → EngineeringAgent → Reviewer
+                               ├─ changes requested → same EngineeringAgent step
                                └─ approved → final verification → checkpoint
                                                         ↓
                                                      Planner again
@@ -40,13 +40,13 @@ roadmap item or mark the overall goal complete with evidence.
 
 - A foreground `agent-orchestrator run` service and bounded
   `agent-orchestrator once` command.
-- Reuse of the existing Planner, Coder, Reviewer, PostgreSQL `jobs`, `steps`,
+- Reuse of the existing Planner, EngineeringAgent, Reviewer, PostgreSQL `jobs`, `steps`,
   `events`, `reviews`, `review_issues`, and `command_runs` contracts.
 - Additive PostgreSQL migration for repository locks, verification runs,
   checkpoint recovery markers, model-routing audit records, and orchestration
   leases. No second orchestration database is created.
 - Same-step revision cycles: a reviewer or verifier rejection returns the
-  existing `step_id` to Coder rather than creating a duplicate Planner step.
+  existing `step_id` to EngineeringAgent rather than creating a duplicate Planner step.
 - Final deterministic verification after reviewer approval and before a
   commit. It runs `git diff --check`, scans candidate files for likely
   secrets, and runs only explicit allowlisted project verification commands.
@@ -59,6 +59,12 @@ roadmap item or mark the overall goal complete with evidence.
   repeated local failures (default fourth attempt).
 - Pause, resume, cancel, inspection, events, structured logs, worker leases,
   and safe recovery of expired verification/checkpoint leases.
+- Hard-bounded planner, Engineer, and reviewer prompts with truncated historical
+  events, diffs, command output, and project documents. The planner can emit a
+  small ordered package (up to `PLANNER_PACKAGE_STEPS`) so the team can execute
+  several clear steps before another planning pass.
+- Durable `phase_metrics` telemetry records phase duration, prompt size, model,
+  provider, and crash status for operations and the Control Center.
 - An authenticated, loopback-only Control Center backed by structured PostgreSQL APIs,
   including job controls, durable events, model routes, repository locks, Ollama model
   state, and optional trusted GPU telemetry.
@@ -71,7 +77,7 @@ operational validation steps, not silently claimed by this source package.
 
 - The dedicated worker branch is required. `main` and `master` are protected
   by default and never receive autonomous commits.
-- The Coder command policy rejects `git add`, `git commit`, `git push`, branch
+- The EngineeringAgent command policy rejects `git add`, `git commit`, `git push`, branch
   changes, history rewrites, and destructive Git cleanup. Checkpointing has
   separate narrow authority after review and verification.
 - The checkpoint stages only the reviewer-approved files and refuses unknown,
@@ -101,6 +107,12 @@ chmod 600 .env
 Edit `.env` through your normal secret-management process. It must contain a
 restricted PostgreSQL application URL, repository allow-roots, and worker
 identities. Do not use a database-owner account or commit `.env`.
+
+The default model transport budget is intentionally fail-fast (`OLLAMA_RETRIES=0`
+and a 60-second local timeout), with OpenRouter available as the immediate
+availability fallback. Adjust `OLLAMA_TIMEOUT_SECONDS`, `OLLAMA_RETRIES`,
+`OPENROUTER_TIMEOUT_SECONDS`, and `OPENROUTER_RETRIES` for your hardware and
+network.
 
 Apply the **additive** agent-team schema migration once with a migration-capable
 database role:
@@ -159,7 +171,7 @@ agent-orchestrator run
 
 `run` remains in the foreground, writes structured stdout/stderr logs, sleeps
 when idle (default ten seconds), and handles `SIGTERM` at a safe boundary. Do
-not simultaneously run `planner-agent run`, `coder-agent run`, or
+not simultaneously run `planner-agent run`, `engineering-agent run`, or
 `reviewer-agent run` against the same jobs; those legacy independent workers
 can bypass coordinator timing.
 
@@ -269,9 +281,25 @@ See [`.env.example`](.env.example). The principal values are:
 | `OLLAMA_URL` | Local Ollama endpoint |
 | `OPENROUTER_API_KEY` | Optional backup only; never commit it |
 | `INFERENCE_ESCALATE_AFTER` | First normal cloud-eligible attempt (default `4`) |
+| `OLLAMA_TIMEOUT_SECONDS` / `OLLAMA_RETRIES` | Local request timeout and retry budget (defaults `60` / `0`) |
+| `OPENROUTER_TIMEOUT_SECONDS` / `OPENROUTER_RETRIES` | Cloud request timeout and retry budget (defaults `90` / `1`) |
+| `ENGINEERING_MAX_CONTEXT_CHARS`, `PLANNER_MAX_CONTEXT_CHARS`, `REVIEWER_MAX_CONTEXT_CHARS` | Hard prompt character budgets |
+| `PLANNER_PACKAGE_STEPS` | Maximum ordered steps emitted before replanning (default `3`) |
+| `PLANNER_DECISION_RETRIES` | Short planning repair budget (default `1`; two total planning calls) |
+| `ENGINEERING_TURN_LIMIT` | Optional compatibility cap; `0`/unset means progress-based Engineering with no overall turn cutoff |
+| `ENGINEERING_MAX_STAGNATION_EPISODES` | Safety stop after repeated no-progress/escalation episodes (default `6`) |
 | `PROTECTED_BRANCHES` | Comma-separated autonomous-commit deny list |
 | `AUTO_COMMIT` | Enables reviewer-approved local checkpoints |
 | `AUTO_PUSH` | Off by default; no force/history rewrite is ever permitted |
+| `MISSION_PACKAGE_LIMIT` | Maximum unchecked roadmap items materialized per mission pass (default `3`) |
+| `AUTO_INTEGRATE` | Opt-in integration of verified package commits into a non-protected mission branch |
+
+V2 operations are also available from the orchestrator CLI: `missions`,
+`expand-mission`, `packages`, `human-queue`, `answer-human`, and
+`integrate-package`. The Control Center exposes the same mission/package and human
+queue read models after running the additive `orchestrator-0005` migration.
+The dashboard's `/api/telemetry` path is independent of the workflow stream and polls
+Ollama/GPU data once per second, including loaded and installed model details.
 
 ## Tests
 

@@ -14,7 +14,7 @@ class ReadOnlyRepositoryInspector:
     DOCUMENTS = ("WORKER.md", "AGENTS.md", "README.md", "docs/roadmap.md",
                  "docs/architecture.md", "ARCHITECTURE.md")
 
-    def __init__(self, allowed_roots: list[str], max_file_bytes: int = 100_000,
+    def __init__(self, allowed_roots: list[str], max_file_bytes: int = 50_000,
                  max_tree_entries: int = 500):
         self.allowed_roots = [Path(root).resolve(strict=True) for root in allowed_roots]
         self.max_file_bytes = max_file_bytes
@@ -35,7 +35,7 @@ class ReadOnlyRepositoryInspector:
                                 capture_output=True, timeout=15, shell=False)
         if result.returncode:
             raise InspectionError(result.stderr.strip() or "Git inspection failed")
-        return result.stdout[:100_000]
+        return result.stdout[:50_000]
 
     def inspect(self, repository: str, branch: str) -> dict:
         root = self.resolve_repository(repository)
@@ -56,4 +56,3 @@ class ReadOnlyRepositoryInspector:
             "repository_files": tracked,
             "documents": documents,
         }
-

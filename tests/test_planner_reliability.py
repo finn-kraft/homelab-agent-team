@@ -75,3 +75,18 @@ def test_transient_blocked_decision_is_deferred_for_retry():
     store=Store(); router=SequenceRouter([ResponseBackend(json.dumps(payload))])
     decision=PlannerAgent(store,router,Inspector(),'planner',decision_retries=0).plan_once()
     assert decision.job_status=='running' and store.deferred=='planner_blocker'
+
+
+def test_planner_accepts_a_bounded_ordered_package():
+    first = valid_step()
+    second = json.loads(json.dumps(first))
+    second["step"]["title"] = "Add endpoint tests"
+    second["step"]["objective"] = "Add focused endpoint tests"
+    payload = dict(first, steps=[first["step"], second["step"]])
+
+    decision = parse_decision(json.dumps(payload))
+
+    assert decision.step["title"] == "Add endpoint"
+    assert [step["title"] for step in decision.steps] == [
+        "Add endpoint", "Add endpoint tests"
+    ]

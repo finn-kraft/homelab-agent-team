@@ -32,8 +32,49 @@ class ReviewerStore:
             return row
 
     def heartbeat(self, review_id, worker_id, lease_seconds):
-        with self.connect() as c:return c.execute("""UPDATE reviews SET lease_expires_at=now()+(%s*interval '1 second')
-        WHERE id=%s AND reviewer_worker_id=%s AND completed_at IS NULL""",(lease_seconds,review_id,worker_id)).rowcount==1
+        with self.connect() as c:
+            review = c.execute("""UPDATE reviews SET lease_expires_at=now()+(%s*interval '1 second')
+            WHERE id=%s AND reviewer_worker_id=%s AND completed_at IS NULL
+            RETURNING step_id""", (lease_seconds, review_id, worker_id)).fetchone()
+            if not review:
+                return False
+            # The orchestrator's recovery query watches the step lease, while
+            # the reviewer owns a separate row in reviews. Renew both in the
+            # same transaction so a long evidence/model call cannot appear
+            # abandoned to either side of the workflow.
+            return c.execute("""UPDATE steps SET review_lease_expires_at=now()+(%s*interval '1 second')
+            WHERE id=%s AND reviewer_worker_id=%s AND status='review'""",
+                             (lease_seconds, review['step_id'], worker_id)).rowcount == 1
+
+    def abandon(self, step_id, worker_id, detail, retry_seconds=20):
+        """Release a failed review safely and make it retryable soon.
+
+        A review can fail before ``complete`` persists a verdict (for example
+        an evidence timeout or unavailable model). Marking the in-flight review
+        row finished and clearing the step owner prevents the lease from
+        stranding the job until its full expiry window.
+        """
+        with self.connect() as c:
+            review = c.execute("""SELECT id,job_id FROM reviews
+            WHERE step_id=%s AND reviewer_worker_id=%s AND completed_at IS NULL
+            ORDER BY id DESC LIMIT 1 FOR UPDATE""", (step_id, worker_id)).fetchone()
+            if not review:
+                return False
+            summary = f"Reviewer failed before producing a verdict: {str(detail)[:2000]}"
+            c.execute("""UPDATE reviews SET verdict='blocked',summary=%s,
+            lease_expires_at=NULL,completed_at=now() WHERE id=%s""",
+                      (summary, review['id']))
+            c.execute("""UPDATE steps SET reviewer_worker_id=NULL,
+            review_lease_expires_at=now()+(%s*interval '1 second'),updated_at=now()
+            WHERE id=%s AND reviewer_worker_id=%s""",
+                      (retry_seconds, step_id, worker_id))
+            c.execute("""UPDATE jobs SET status='running',current_phase='review',updated_at=now()
+            WHERE id=%s AND status='reviewing'""", (review['job_id'],))
+            self._event(c, review['job_id'], step_id, 'review_failed', {
+                'review_id': review['id'], 'detail': str(detail)[:30_000],
+                'retry_seconds': retry_seconds,
+            })
+            return True
 
     def commands(self,step_id,attempt=None):
         with self.connect() as c:
@@ -71,7 +112,15 @@ class ReviewerStore:
             c.execute("""UPDATE steps SET status=%s,reviewer_feedback=%s,reviewer_worker_id=NULL,
             review_lease_expires_at=NULL,updated_at=now() WHERE id=%s""",
             (step_status,json.dumps({'verdict':verdict,'issues':decision.blocking_issues}),item['id']))
-            if verdict=='needs_human':c.execute("UPDATE jobs SET status='needs_human',updated_at=now() WHERE id=%s",(item['job_id'],))
+            if verdict=='needs_human':
+                c.execute("UPDATE jobs SET status='needs_human',updated_at=now() WHERE id=%s",(item['job_id'],))
+                c.execute("""INSERT INTO human_queue(mission_id,job_id,step_id,kind,question,context)
+                    SELECT p.mission_id,%s,%s,'review',%s,%s
+                    FROM work_packages p WHERE p.step_id=%s
+                    ON CONFLICT (job_id,step_id,kind) WHERE status='open' DO UPDATE SET
+                      question=EXCLUDED.question,context=EXCLUDED.context,updated_at=now()""",
+                    (item['job_id'], item['id'], getattr(decision, 'human_question', None) or decision.summary,
+                     json.dumps({'summary': decision.summary, 'verdict': verdict}), item['id']))
             self._event(c,item['job_id'],item['id'],'review_approved' if verdict=='approved' else verdict,
                         {'review_id':item['review_id'],'verdict':verdict,'next':decision.recommended_next_state})
 

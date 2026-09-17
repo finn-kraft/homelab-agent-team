@@ -85,7 +85,7 @@ class PlannerStore:
             ).fetchall())
             events = list(connection.execute(
                 """SELECT event_type,step_id,structured_payload,created_at FROM events
-                WHERE job_id=%s ORDER BY id DESC LIMIT 100""", (job_id,)
+                WHERE job_id=%s ORDER BY id DESC LIMIT 40""", (job_id,)
             ).fetchall())
             return self._job(job_row), [dict(row) for row in steps], [dict(row) for row in events]
 
@@ -103,32 +103,48 @@ class PlannerStore:
                 ).fetchone()
                 if active:
                     raise RuntimeError("job already has an active implementation step")
+                step_specs = list(decision.steps or [decision.step])
+                if not 1 <= len(step_specs) <= 5:
+                    raise ValueError("a bounded planner package must contain 1-5 steps")
+                remaining_iterations = int(job.max_iterations) - int(job.iteration_count)
+                if len(step_specs) > remaining_iterations:
+                    raise ValueError("bounded planner package exceeds the job iteration budget")
                 prior = connection.execute(
                     "SELECT objective FROM steps WHERE job_id=%s", (job.id,)
                 ).fetchall()
-                objective = str(decision.step["objective"])
-                if normalize_objective(objective) in {normalize_objective(r["objective"]) for r in prior}:
+                prior_objectives = {normalize_objective(r["objective"]) for r in prior}
+                normalized_batch = [normalize_objective(str(step["objective"])) for step in step_specs]
+                if len(set(normalized_batch)) != len(normalized_batch):
+                    raise RuntimeError("bounded package contains duplicate objectives")
+                if prior_objectives.intersection(normalized_batch):
                     raise RuntimeError("equivalent step already exists")
                 sequence = connection.execute(
                     "SELECT COALESCE(MAX(sequence),0)+1 AS n FROM steps WHERE job_id=%s", (job.id,)
                 ).fetchone()["n"]
-                step = decision.step
-                row = connection.execute(
-                    """INSERT INTO steps(job_id,sequence,repository,branch,title,objective,
-                    rationale,acceptance_criteria,constraints,suggested_files,dependencies,assigned_agent)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-                    (job.id, sequence, job.repository, job.branch, step["title"], objective,
-                     step.get("rationale", ""), json.dumps(step["acceptance_criteria"]),
-                     json.dumps(step["constraints"]), json.dumps(step["suggested_files"]),
-                     json.dumps(step.get("dependencies", [])), step["assigned_agent"]),
-                ).fetchone()
-                step_id = row["id"]
+                created_ids = []
+                for offset, step in enumerate(step_specs):
+                    row = connection.execute(
+                        """INSERT INTO steps(job_id,sequence,repository,branch,title,objective,
+                        rationale,acceptance_criteria,constraints,suggested_files,dependencies,assigned_agent)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                        (job.id, sequence + offset, job.repository, job.branch, step["title"],
+                         str(step["objective"]), step.get("rationale", ""),
+                         json.dumps(step["acceptance_criteria"]), json.dumps(step["constraints"]),
+                         json.dumps(step["suggested_files"]), json.dumps(step.get("dependencies", [])),
+                         step["assigned_agent"]),
+                    ).fetchone()
+                    created_ids.append(row["id"])
+                step_id = created_ids[0]
                 connection.execute(
-                    """UPDATE jobs SET status='running',current_step=%s,iteration_count=iteration_count+1,
+                    """UPDATE jobs SET status='running',current_step=%s,iteration_count=iteration_count+%s,
                     planner_worker_id=NULL,planner_lease_expires_at=NULL,updated_at=now() WHERE id=%s""",
-                    (step_id, job.id),
+                    (step_id, len(created_ids), job.id),
                 )
-                self._event(connection, job.id, step_id, "step_created", decision.as_dict())
+                for offset, created_id in enumerate(created_ids):
+                    self._event(connection, job.id, created_id, "step_created", {
+                        **decision.as_dict(), "package_index": offset + 1,
+                        "package_size": len(created_ids),
+                    })
                 if decision.provider and decision.provider != "ollama":
                     self._event(connection, job.id, step_id, "model_escalated", {
                         "provider": decision.provider, "model": decision.model,
@@ -156,6 +172,13 @@ class PlannerStore:
                 WHERE id=%s""", (status, job.id),
             )
             self._event(connection, job.id, None, f"job_{decision.decision}", decision.as_dict())
+            if decision.decision == "needs_human":
+                connection.execute("""INSERT INTO human_queue(job_id,kind,question,context)
+                    VALUES(%s,'planning',%s,%s)
+                    ON CONFLICT (job_id,step_id,kind) WHERE status='open' DO UPDATE SET
+                      question=EXCLUDED.question,context=EXCLUDED.context,updated_at=now()""",
+                    (job.id, decision.human_question or decision.reasoning_summary,
+                     json.dumps(decision.as_dict(), default=str)))
             return None
 
     def defer(self, job_id: int, worker_id: str, failure_kind: str, detail: str,

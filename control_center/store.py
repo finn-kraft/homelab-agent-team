@@ -41,10 +41,19 @@ class ControlStore:
             (SELECT verdict FROM reviews WHERE step_id=s.id ORDER BY review_attempt DESC LIMIT 1) r ON true
             LEFT JOIN LATERAL (SELECT status FROM verification_runs WHERE step_id=s.id ORDER BY attempt DESC LIMIT 1) v ON true
             WHERE c.status='complete' ORDER BY c.completed_at DESC LIMIT 20""").fetchall())
+            phase_metrics = list(connection.execute("""SELECT phase,count(*) AS runs,
+            round(avg(duration_seconds)::numeric,2) AS average_seconds,
+            round(max(duration_seconds)::numeric,2) AS max_seconds,
+            round(avg(prompt_chars)::numeric,0) AS average_prompt_chars,
+            max(prompt_chars) AS max_prompt_chars
+            FROM phase_metrics GROUP BY phase ORDER BY phase""").fetchall())
         jobs = self.workflow.status()
-        return {"jobs": jobs, "workers": [dict(x) for x in workers],
+        return {"jobs": jobs, "missions": self.workflow.list_missions(),
+                "human_queue": self.workflow.list_human_queue("open"),
+                "workers": [dict(x) for x in workers],
                 "agent_events":[dict(x) for x in agent_events],"active_work":[dict(x) for x in active_work],
                 "inference": dict(inference),
+                "phase_metrics": [dict(x) for x in phase_metrics],
                 "recent_commits": [dict(x) for x in commits],
                 "attention_count": sum(j["status"] in {"needs_human","blocked","failed"} for j in jobs)}
     def project_list(self):
@@ -61,6 +70,24 @@ class ControlStore:
             project["current_job"] = by_repo.get(project["repository"])
             project["latest_autonomous_commit"] = autonomous.get(project["repository"])
         return result
+
+    def missions(self):
+        return self.workflow.list_missions()
+
+    def mission(self, mission_id):
+        result = self.workflow.mission_detail(int(mission_id))
+        if result is None:
+            raise KeyError(mission_id)
+        return result
+
+    def work_packages(self, mission_id=None):
+        return self.workflow.list_work_packages(int(mission_id) if mission_id is not None else None)
+
+    def human_queue(self, status="open"):
+        return self.workflow.list_human_queue(status)
+
+    def answer_human_request(self, request_id, answer):
+        self.workflow.answer_human_request(int(request_id), answer)
     def job(self, job_id):
         result = self.workflow.inspect(job_id)
         with self.workflow.connect() as connection:
@@ -77,6 +104,9 @@ class ControlStore:
                     """SELECT caller_agent,provider,model,route_reason,attempt,latency_seconds,usage,
                     estimated_cloud_cost,fallback,created_at FROM llm_invocations WHERE step_id=%s ORDER BY id""",
                     (sid,)).fetchall()]
+                step["phase_metrics"] = [dict(x) for x in connection.execute(
+                    "SELECT phase,status,duration_seconds,prompt_chars,provider,model,detail,started_at,completed_at "
+                    "FROM phase_metrics WHERE step_id=%s ORDER BY id", (sid,)).fetchall()]
                 progress = connection.execute(
                     """SELECT structured_payload->>'progress_classification' AS value
                     FROM events WHERE step_id=%s AND event_type='agent_action'
@@ -170,4 +200,9 @@ class ControlStore:
                 "human_response_received",
                 {"answer": answer},
                 agent="control-center",
+            )
+            connection.execute(
+                """UPDATE human_queue SET status='answered',answer=%s,answered_by='control-center',
+                   answered_at=now(),updated_at=now() WHERE job_id=%s AND status='open'""",
+                (answer, job_id),
             )

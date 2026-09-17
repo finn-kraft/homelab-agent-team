@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "homelab-agent-team"
 version = "0.2.0"
-description = "Persistent planner, coder, reviewer, and deterministic workflow orchestration for local development"
+description = "Persistent planner, EngineeringAgent, reviewer, and deterministic workflow orchestration for local development"
 requires-python = ">=3.11"
 dependencies = ["psycopg[binary]>=3.1,<4", "bcrypt>=4,<6"]
 
@@ -14,13 +14,14 @@ test = ["pytest>=8,<9"]
 
 [project.scripts]
 coder-agent = "coder_agent.cli:main"
+engineering-agent = "coder_agent.cli:main"
 planner-agent = "planner_agent.cli:main"
 reviewer-agent = "reviewer_agent.cli:main"
 agent-orchestrator = "orchestrator.cli:main"
 agent-control-center = "control_center.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["agent_core*", "coder_agent*", "planner_agent*", "reviewer_agent*", "orchestrator*", "control_center*"]
+include = ["agent_core*", "coder_agent*", "engineering_agent*", "planner_agent*", "reviewer_agent*", "orchestrator*", "control_center*"]
 
 [tool.setuptools.package-data]
 agent_core = ["schema.sql"]

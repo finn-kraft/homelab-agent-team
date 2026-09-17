@@ -60,6 +60,8 @@ class OrchestratorConfig:
     verification_timeout_seconds: int = 900
     max_coder_attempts: int = 5
     max_review_attempts: int = 5
+    mission_package_limit: int = 3
+    auto_integrate: bool = False
 
     @classmethod
     def from_env(cls) -> "OrchestratorConfig":
@@ -85,4 +87,6 @@ class OrchestratorConfig:
             ),
             max_coder_attempts=_positive_int("MAX_CODER_ATTEMPTS", 5),
             max_review_attempts=_positive_int("MAX_REVIEW_ATTEMPTS", 5),
+            mission_package_limit=_positive_int("MISSION_PACKAGE_LIMIT", 3),
+            auto_integrate=_bool("AUTO_INTEGRATE", False),
         )

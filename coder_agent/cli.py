@@ -6,7 +6,7 @@ import logging
 import os
 import sys
 
-from .agent import CoderAgent
+from .agent import EngineeringAgent
 from .db import Store
 from .llm import (
     InferenceRouter,
@@ -19,14 +19,32 @@ from .worker import Worker
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 
 
-def build_agent() -> CoderAgent:
+def _engineering_turn_limit() -> int | None:
+    """Read only the explicit compatibility limit; normal mode is unbounded."""
+    raw = os.getenv("ENGINEERING_TURN_LIMIT")
+    if raw is None:
+        # ENGINEERING_MAX_TURNS/CODER_MAX_TURNS used to impose the 30-turn
+        # failure. They are intentionally ignored so an old .env cannot
+        # interrupt a productive Engineering session.
+        return None
+    value = int(raw)
+    return value if value > 0 else None
+
+
+def build_engineer() -> EngineeringAgent:
     database_url = os.environ["DATABASE_URL"]
 
-    roots = [
-        path
-        for path in os.environ["CODER_WORKSPACES"].split(os.pathsep)
-        if path
-    ]
+    workspace_roots = os.getenv("ENGINEERING_WORKSPACES", os.getenv("CODER_WORKSPACES", ""))
+    roots = [path for path in workspace_roots.split(os.pathsep) if path]
+    if not roots:
+        raise KeyError("ENGINEERING_WORKSPACES")
+
+    llm_timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+    llm_retries = int(os.getenv("LLM_RETRIES", "0"))
+    ollama_timeout = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", str(llm_timeout)))
+    ollama_retries = int(os.getenv("OLLAMA_RETRIES", str(llm_retries)))
+    cloud_timeout = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "90"))
+    cloud_retries = int(os.getenv("OPENROUTER_RETRIES", "1"))
 
     local = OllamaBackend(
         os.getenv(
@@ -34,9 +52,11 @@ def build_agent() -> CoderAgent:
             "http://localhost:11434",
         ),
         os.getenv(
-            "CODER_MODEL",
-            "qwen2.5-coder:14b",
+            "ENGINEERING_MODEL",
+            os.getenv("CODER_MODEL", "qwen2.5-coder:14b"),
         ),
+        timeout=ollama_timeout,
+        retries=ollama_retries,
     )
 
     standard_cloud = None
@@ -48,26 +68,29 @@ def build_agent() -> CoderAgent:
         standard_cloud = OpenRouterBackend(
             OPENROUTER_URL,
             os.getenv(
-                "OPENROUTER_CODER_STANDARD_MODEL",
-                "qwen/qwen3-coder-next",
+                "OPENROUTER_ENGINEERING_STANDARD_MODEL",
+                os.getenv("OPENROUTER_CODER_STANDARD_MODEL", "qwen/qwen3-coder-next"),
             ),
             api_key,
+            timeout=cloud_timeout,
+            retries=cloud_retries,
         )
 
         premium_cloud = OpenRouterBackend(
             OPENROUTER_URL,
             os.getenv(
-                "OPENROUTER_CODER_PREMIUM_MODEL",
-                "openai/gpt-5.2-codex",
+                "OPENROUTER_ENGINEERING_PREMIUM_MODEL",
+                os.getenv("OPENROUTER_CODER_PREMIUM_MODEL", "openai/gpt-5.2-codex"),
             ),
             api_key,
+            timeout=cloud_timeout,
+            retries=cloud_retries,
         )
 
-    local_attempts = int(
-        os.getenv("INFERENCE_LOCAL_ATTEMPTS", "5")
-    )
-
-    escalation_attempt = local_attempts + 1
+    local_attempts = int(os.getenv("INFERENCE_LOCAL_ATTEMPTS", "3"))
+    escalation_attempt = int(os.getenv(
+        "INFERENCE_ESCALATE_AFTER", str(local_attempts + 1)
+    ))
 
     router = InferenceRouter(
         local,
@@ -77,7 +100,7 @@ def build_agent() -> CoderAgent:
             "ROUTER_URL",
             "http://127.0.0.1:8090",
         ),
-        caller_agent="coder-agent",
+        caller_agent="engineering-agent",
         task_type="code_implementation",
         escalate_after=escalation_attempt,
         timeout=float(
@@ -93,32 +116,36 @@ def build_agent() -> CoderAgent:
         in {"1", "true", "yes", "on"},
     )
 
-    return CoderAgent(
+    return EngineeringAgent(
         Store(database_url),
         router,
         os.getenv(
-            "CODER_WORKER_ID",
-            "coder-1",
+            "ENGINEERING_WORKER_ID",
+            os.getenv("CODER_WORKER_ID", "engineering-1"),
         ),
         roots,
-        max_turns=int(
-            os.getenv(
-                "CODER_MAX_TURNS",
-                "30",
-            )
-        ),
+        max_turns=_engineering_turn_limit(),
         max_attempts=int(
             os.getenv(
-                "MAX_CODER_ATTEMPTS",
-                "5",
+                "MAX_ENGINEERING_ATTEMPTS",
+                os.getenv("MAX_CODER_ATTEMPTS", "5"),
             )
         ),
+        max_prompt_chars=int(os.getenv(
+            "ENGINEERING_MAX_CONTEXT_CHARS",
+            os.getenv("CODER_MAX_CONTEXT_CHARS", "120000"),
+        )),
+        max_stagnation_episodes=int(os.getenv("ENGINEERING_MAX_STAGNATION_EPISODES", "6")),
     )
+
+
+# Compatibility for existing systemd units and V1 scripts.
+build_agent = build_engineer
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="coder-agent"
+        prog="engineering-agent" if os.path.basename(sys.argv[0]) == "engineering-agent" else "coder-agent"
     )
 
     sub = parser.add_subparsers(

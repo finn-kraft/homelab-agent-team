@@ -7,13 +7,15 @@ import signal
 import sys
 from typing import Sequence
 
-from coder_agent.cli import build_agent
+from coder_agent.cli import build_engineer
 from planner_agent.cli import build_planner
 from planner_agent.store import PlannerStore
 from reviewer_agent.cli import build as build_reviewer
 
 from .checkpoint import CheckpointService
 from .config import OrchestratorConfig
+from .integration import IntegrationManager
+from .mission import MissionManager
 from .orchestrator import AgentOrchestrator
 from .store import OrchestratorStore
 from .verification import VerificationService
@@ -22,14 +24,14 @@ from .verification import VerificationService
 def build_orchestrator(config: OrchestratorConfig | None = None) -> AgentOrchestrator:
     """Construct bounded specialist agents around one deterministic coordinator."""
     config = config or OrchestratorConfig.from_env()
-    coder = build_agent()
+    engineer = build_engineer()
     reviewer = build_reviewer()
-    coder.max_attempts = config.max_coder_attempts
+    engineer.max_attempts = config.max_coder_attempts
     reviewer.max_attempts = config.max_review_attempts
     return AgentOrchestrator(
         store=OrchestratorStore(config.database_url),
         planner=build_planner(),
-        coder=coder,
+        engineer=engineer,
         reviewer=reviewer,
         verifier=VerificationService(),
         checkpoint=CheckpointService(),
@@ -50,6 +52,9 @@ def _parser() -> argparse.ArgumentParser:
     subcommands.add_parser("audit", help="report read-only workflow invariant violations")
     mission = subcommands.add_parser("create-mission", help="create a durable V2 mission")
     mission.add_argument("goal"); mission.add_argument("--repository", required=True); mission.add_argument("--branch", required=True)
+    expand = subcommands.add_parser("expand-mission", help="materialize unchecked roadmap items as packages")
+    expand.add_argument("mission_id", type=int); expand.add_argument("--roadmap", default="docs/roadmap.md"); expand.add_argument("--limit", type=int, default=3)
+    subcommands.add_parser("missions", help="list durable V2 missions")
     packages = subcommands.add_parser("packages", help="list durable V2 work packages")
     packages.add_argument("--mission-id", type=int)
     package = subcommands.add_parser("create-package", help="create a V2 package and linked V1 step")
@@ -59,6 +64,12 @@ def _parser() -> argparse.ArgumentParser:
     claim = subcommands.add_parser("claim-package", help="claim one ready V2 package")
     claim.add_argument("--worker-id", default="engineering-1"); claim.add_argument("--lease-seconds", type=int, default=900)
     subcommands.add_parser("recover-packages", help="return expired V2 package leases to ready")
+    queue = subcommands.add_parser("human-queue", help="list durable human decisions")
+    queue.add_argument("--status", default="open", choices=("open", "answered", "cancelled", "all"))
+    answer = subcommands.add_parser("answer-human", help="answer a durable human decision")
+    answer.add_argument("request_id", type=int); answer.add_argument("answer")
+    integrate = subcommands.add_parser("integrate-package", help="merge a verified package into its mission branch")
+    integrate.add_argument("package_id", type=int); integrate.add_argument("--repository", required=True); integrate.add_argument("--target-branch")
     advance = subcommands.add_parser("advance-package", help="advance a leased V2 package lifecycle state")
     advance.add_argument("package_id", type=int); advance.add_argument("current"); advance.add_argument("next_status")
     advance.add_argument("--worker-id", default="engineering-1"); advance.add_argument("--commit")
@@ -67,6 +78,8 @@ def _parser() -> argparse.ArgumentParser:
     for name in ("pause", "resume", "cancel"):
         item = subcommands.add_parser(name, help=f"{name} one job at a safe boundary")
         item.add_argument("job_id", type=int)
+    retry = subcommands.add_parser("retry", help="requeue failed or exhausted work")
+    retry.add_argument("job_id", type=int)
     create = subcommands.add_parser("create-job", help="create a persistent high-level job")
     create.add_argument("goal")
     create.add_argument("--repository", required=True)
@@ -102,7 +115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "init-db":
             store.migrate()
-            print(json.dumps({"status": "ok", "migration": "orchestrator-0003"}))
+            print(json.dumps({"status": "ok", "migration": "orchestrator-0005"}))
             return 0
         if args.command == "run":
             orchestrator = build_orchestrator(config)
@@ -126,6 +139,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "create-mission":
             print(json.dumps({"mission_id": store.create_mission(args.goal, args.repository, args.branch)}))
             return 0
+        if args.command == "missions":
+            print(json.dumps(store.list_missions(), default=str, indent=2))
+            return 0
+        if args.command == "expand-mission":
+            ids = MissionManager(store, max_packages=args.limit).ensure_packages(
+                args.mission_id, roadmap=args.roadmap, limit=args.limit
+            )
+            print(json.dumps({"created_package_ids": ids}))
+            return 0
         if args.command == "packages":
             print(json.dumps(store.list_work_packages(args.mission_id), default=str, indent=2))
             return 0
@@ -140,6 +162,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "recover-packages":
             print(json.dumps({"recovered": store.recover_work_packages()}))
             return 0
+        if args.command == "human-queue":
+            print(json.dumps(store.list_human_queue(args.status), default=str, indent=2))
+            return 0
+        if args.command == "answer-human":
+            store.answer_human_request(args.request_id, args.answer)
+            print(json.dumps({"status": "answered", "request_id": args.request_id}))
+            return 0
+        if args.command == "integrate-package":
+            package = next((p for p in store.list_work_packages() if int(p["id"]) == args.package_id), None)
+            if not package:
+                raise KeyError(args.package_id)
+            result = IntegrationManager(store, protected_branches=config.protected_branches).integrate(
+                package, args.repository, target_branch=args.target_branch
+            )
+            print(json.dumps(result, default=str))
+            return 0
         if args.command == "advance-package":
             store.advance_work_package(args.package_id, args.worker_id, args.current,
                                        args.next_status, args.commit)
@@ -151,6 +189,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command in {"pause", "resume", "cancel"}:
             store.control(args.job_id, args.command)
             print(json.dumps({"status": "ok", "action": args.command, "job_id": args.job_id}))
+            return 0
+        if args.command == "retry":
+            store.retry_job(args.job_id)
+            print(json.dumps({"status": "ok", "action": "retry", "job_id": args.job_id}))
             return 0
         if args.command == "create-job":
             if args.max_iterations <= 0:

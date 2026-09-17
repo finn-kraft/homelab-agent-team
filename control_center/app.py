@@ -18,10 +18,13 @@ class ControlCenter:
         return {**self.store.overview(), "telemetry": self.telemetry.snapshot()}
 
     def perform_action(self, job_id, action, data):
-        if action not in {"pause", "resume", "cancel"}:
+        if action not in {"pause", "resume", "cancel", "remove"}:
             raise ValueError("unsupported action")
-        if action == "cancel" and data.get("confirm") is not True:
+        if action in {"cancel", "remove"} and data.get("confirm") is not True:
             raise PermissionError("confirmation_required")
+        if action == "remove":
+            self.store.remove_queued_job(job_id)
+            return {"status": "removed"}
         self.store.action(job_id, action)
         return {"status": action}
 
@@ -139,8 +142,20 @@ class ControlCenter:
                         return self.send_json(200, {"authenticated": True, "csrf_token": session.csrf_token})
                     if parsed.path == "/api/overview":
                         return self.send_json(200, app.snapshot())
+                    if parsed.path == "/api/telemetry":
+                        return self.send_json(200, app.telemetry.snapshot())
                     if parsed.path == "/api/projects":
                         return self.send_json(200, app.store.project_list())
+                    if parsed.path == "/api/missions":
+                        return self.send_json(200, app.store.missions())
+                    if parsed.path == "/api/work-packages":
+                        mission_id = parse_qs(parsed.query).get("mission_id", [None])[0]
+                        return self.send_json(200, app.store.work_packages(mission_id))
+                    if parsed.path == "/api/human-queue":
+                        status = parse_qs(parsed.query).get("status", ["open"])[0]
+                        return self.send_json(200, app.store.human_queue(status))
+                    if parsed.path.startswith("/api/missions/"):
+                        return self.send_json(200, app.store.mission(int(parsed.path.rsplit("/", 1)[1])))
                     if parsed.path == "/api/stream":
                         return self.send_stream(session)
                     if parsed.path == "/api/events":
@@ -202,6 +217,9 @@ class ControlCenter:
                         except PermissionError:
                             return self.send_json(409, {"error": "confirmation_required"})
                         return self.send_json(200, result)
+                    if len(parts) == 4 and parts[:2] == ["api", "human-queue"] and parts[3] == "answer":
+                        app.store.answer_human_request(int(parts[2]), data["answer"])
+                        return self.send_json(200, {"status": "answered"})
                     return self.send_json(404, {"error": "not_found"})
                 except (KeyError, ValueError, json.JSONDecodeError):
                     return self.send_json(400, {"error": "invalid_request"})

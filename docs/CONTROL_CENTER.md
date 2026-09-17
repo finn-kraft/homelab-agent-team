@@ -45,7 +45,10 @@ Cancel requires explicit confirmation.
 ## Live state
 
 The browser uses an authenticated streaming `fetch` to `/api/stream`. The server emits
-structured snapshots every five seconds using Server-Sent Events. Reconnects read fresh
+workflow snapshots every five seconds using Server-Sent Events. GPU and Ollama telemetry
+has its own authenticated `/api/telemetry` endpoint and is polled by the dashboard every
+second, so fast-changing utilization, temperature, power, VRAM, model allocation, and
+Ollama process data do not wait for the slower workflow refresh. Reconnects read fresh
 PostgreSQL state; terminal output is never scraped. Orchestrator writes a durable worker
 heartbeat so online/offline is objective.
 
@@ -56,7 +59,9 @@ to durable job notes/events, and return the existing step to Coder when appropri
 
 ## GPU and Ollama telemetry
 
-Ollama model allocation comes from its read-only `/api/ps`. Routing readiness comes
+Ollama model allocation comes from its read-only `/api/ps`; installed model names come
+from `/api/tags` and the server version from `/api/version`. The API response preserves
+both loaded and installed model records for inspection. Routing readiness comes
 from `/health`. Optional GPU telemetry must be a narrowly scoped bearer-authenticated
 JSON endpoint configured as `GPU_TELEMETRY_URL`; expected fields are:
 

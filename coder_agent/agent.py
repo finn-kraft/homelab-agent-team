@@ -10,6 +10,12 @@ from .db import Store
 from .git import GitRepository
 from .llm import BackendError, Router
 from .models import AgentResult, Status, Task, WorkPackage
+from agent_core.prompt_budget import (
+    DEFAULT_PROMPT_CHARS,
+    bounded_json,
+    bounded_messages,
+    message_chars,
+)
 from .workspace import Workspace, WorkspaceViolation
 
 
@@ -31,14 +37,25 @@ change branches, access secrets, or expand the assignment. Prefer small, reviewa
 """
 
 
-class CoderAgent:
+class EngineeringAgent:
     def __init__(self, store: Store, router: Router, worker_id: str,
-                 allowed_roots: list[str], max_turns: int = 30, max_attempts: int = 4):
+                 allowed_roots: list[str], max_turns: int | None = None, max_attempts: int = 4,
+                 max_prompt_chars: int = DEFAULT_PROMPT_CHARS,
+                 max_stagnation_episodes: int = 6):
         self.store, self.router, self.worker_id = store, router, worker_id
-        self.allowed_roots, self.max_turns, self.max_attempts = allowed_roots, max_turns, max_attempts
+        self.allowed_roots = allowed_roots
+        # An overall turn cutoff is retained only for explicit compatibility
+        # callers. Production Engineering uses progress/stagnation detection;
+        # a productive package is not interrupted just because it crossed 30
+        # model/tool turns.
+        self.max_turns = None if max_turns is None or int(max_turns) <= 0 else int(max_turns)
+        self.max_attempts = max_attempts
+        self.max_stagnation_episodes = max(1, int(max_stagnation_episodes))
+        self.max_prompt_chars = max(1_024, int(max_prompt_chars))
+        self.last_prompt_chars = 0
 
-    def run_package(self, package: WorkPackage | Task, step_id: int | None = None,
-                    attempt: int = 0) -> AgentResult:
+    def run_work_package(self, package: WorkPackage | Task, step_id: int | None = None,
+                         attempt: int = 0) -> AgentResult:
         """Run one Work Package using the preserved workspace/tooling loop.
 
         ``Task`` remains the V1-compatible transport while V2 introduces a
@@ -51,6 +68,12 @@ class CoderAgent:
                 raise ValueError("a V2 WorkPackage requires its durable step_id")
             package = package.as_task(step_id, attempt)
         return self.run_task(package)
+
+    # V2's public name is ``run_work_package``. Keep the earlier method name
+    # for callers that adopted the first package transport increment.
+    def run_package(self, package: WorkPackage | Task, step_id: int | None = None,
+                    attempt: int = 0) -> AgentResult:
+        return self.run_work_package(package, step_id, attempt)
 
     @staticmethod
     def _parse_action(text: str) -> dict[str, Any]:
@@ -73,11 +96,12 @@ class CoderAgent:
         return value[:30_000]
 
     def run_task(self, task: Task) -> AgentResult:
+        self.last_prompt_chars = 0
         if task.attempt > self.max_attempts:
             result = AgentResult(
                 Status.FAILED,
                 "retry limit reached; return step for replanning",
-                blocker="maximum coder attempts exceeded",
+                blocker="maximum engineering attempts exceeded",
             )
             self.store.update_step(
                 task.step_id,
@@ -92,17 +116,31 @@ class CoderAgent:
             git = GitRepository(runner)
             starting_commit = git.head()
             session_id = None
+            session_baseline: dict[str, Any] = {}
+            resume_session = getattr(self.store, "resume_engineering_session", None)
+            if resume_session:
+                session_id = resume_session(task.job_id, task.step_id)
+            get_baseline = getattr(self.store, "engineering_baseline", None)
+            if session_id is not None and get_baseline:
+                session_baseline = get_baseline(task.job_id, task.step_id) or {}
+                starting_commit = session_baseline.get("starting_commit") or starting_commit
             start_session = getattr(self.store, "start_engineering_session", None)
-            if start_session:
+            if session_id is None and start_session:
                 session_id = start_session(task.job_id, task.step_id, self.worker_id, starting_commit)
             current_branch = git.branch()
             if current_branch != task.branch:
                 raise RuntimeError(
                     f"expected branch {task.branch!r}, found {current_branch!r}; branch changes require human setup"
                 )
-            initial_changes = set(git.changed_files())
-            self.store.event(task, "started", {"starting_commit": starting_commit,
-                                                "preexisting_changes": sorted(initial_changes)})
+            if "preexisting_changes" in session_baseline:
+                initial_changes = set(session_baseline.get("preexisting_changes") or [])
+            else:
+                initial_changes = set(git.changed_files())
+            self.store.event(task, "resumed" if session_baseline else "started", {
+                "starting_commit": starting_commit,
+                "preexisting_changes": sorted(initial_changes),
+                "session_id": session_id,
+            })
             backend = self.router.choose(task.attempt)
             context = {
                 "task": {
@@ -118,18 +156,60 @@ class CoderAgent:
                 "project_instructions": workspace.project_instructions(),
             }
             messages = [{"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": json.dumps(context)}]
+                        {"role": "user", "content": bounded_json(
+                            context, self.max_prompt_chars, "engineering context"
+                        )}]
             last_model = backend.model
             verified = False
             previous_observation = ""
             stagnation = 0
-            for turn in range(self.max_turns):
-                self.store.heartbeat(task.step_id, self.worker_id)
+            stagnation_episodes = 0
+            escalation_level = 0
+            turn = 0
+            while self.max_turns is None or turn < self.max_turns:
+                turn += 1
+                controlled = self._controlled_result(task, last_model)
+                if controlled is not None:
+                    return controlled
+                heartbeat_ok = self.store.heartbeat(task.step_id, self.worker_id)
+                if not heartbeat_ok:
+                    controlled = self._controlled_result(task, last_model)
+                    if controlled is not None:
+                        return controlled
+                    raise RuntimeError("coder lease is no longer owned")
                 if stagnation >= 3:
-                    backend = self.router.choose(task.attempt + stagnation, True)
+                    stagnation_episodes += 1
+                    if stagnation_episodes > self.max_stagnation_episodes:
+                        blocker = (
+                            "engineering stagnation detected after "
+                            f"{stagnation_episodes} recovery episodes; resume to retry"
+                        )
+                        result = AgentResult(
+                            Status.BLOCKED,
+                            "engineering paused after repeated non-progress",
+                            blocker=blocker,
+                            model=last_model,
+                        )
+                        self.store.update_step(
+                            task.step_id, self.worker_id, result.status,
+                            blocker=result.blocker, model_used=last_model,
+                            coder_response={"reason": "stagnation_detected", "turns": turn},
+                        )
+                        return result
+                    escalation_level += 1
+                    first_cloud_attempt = int(getattr(
+                        self.router, "escalate_after", task.attempt + 3
+                    ))
+                    route_attempt = max(
+                        task.attempt + 2 + escalation_level,
+                        first_cloud_attempt + escalation_level - 1,
+                    )
+                    backend = self.router.choose(route_attempt, True)
                     last_model = backend.model
                     stagnation = 0
-                response = backend.complete(messages)
+                request_messages = bounded_messages(messages, self.max_prompt_chars)
+                self.last_prompt_chars = message_chars(request_messages)
+                response = backend.complete(request_messages)
                 last_model = response.model
                 try:
                     action = self._parse_action(response.text)
@@ -144,31 +224,50 @@ class CoderAgent:
                     observation = f"Action rejected: {exc}. Choose a valid path relative to the repository root."
                     messages.extend([{"role": "assistant", "content": response.text},
                                      {"role": "user", "content": observation}])
+                run_succeeded = False
+                if action.get("action") == "run":
+                    try:
+                        run_succeeded = json.loads(observation).get("exit_code") == 0
+                    except (TypeError, json.JSONDecodeError, AttributeError):
+                        run_succeeded = False
+                if action.get("action") == "invalid":
+                    progress_classification = "invalid_action"
+                elif run_succeeded:
+                    progress_classification = "verification_progress"
+                elif action.get("action") in {"write", "delete"}:
+                    progress_classification = "repository_change"
+                elif observation != previous_observation and action.get("action") in {"read", "inspect"}:
+                    progress_classification = "inspection_progress"
+                else:
+                    progress_classification = "no_progress"
                 if action["action"] == "run":
                     try:
                         verified = verified or json.loads(observation)["exit_code"] == 0
                     except (json.JSONDecodeError, KeyError):
                         pass
                 self.store.event(task, "agent_action", {
-                    "turn": turn + 1, "model": response.model,
+                    "turn": turn, "model": response.model,
                     "action": action.get("action"), "observation": self._redact(observation),
-                    "progress_classification": (
-                        "invalid_action" if action.get("action") == "invalid" else
-                        "verification_progress" if action.get("action") == "run" and verified else
-                        "repository_change" if action.get("action") in {"write", "delete"} else
-                        "no_progress"
-                    ),
+                    "progress_classification": progress_classification,
                 })
                 if session_id is not None:
                     record_action = getattr(self.store, "record_engineering_action", None)
                     if record_action:
-                        record_action(session_id, turn + 1, action.get("action", "invalid"),
+                        record_action(session_id, turn, action.get("action", "invalid"),
                                       self._redact(observation), response.model,
-                                      "invalid_action" if action.get("action") == "invalid" else None)
+                                      progress_classification)
                 if observation == previous_observation or action.get("action") == "invalid":
                     stagnation += 1
                 else:
                     stagnation = 0
+                    if escalation_level:
+                        # A resolved difficult turn returns routine work to the
+                        # local model, preserving cloud budget for the next
+                        # genuinely stalled problem.
+                        backend = self.router.choose(task.attempt, False)
+                        last_model = backend.model
+                        escalation_level = 0
+                        stagnation_episodes = 0
                 previous_observation = observation
                 if action["action"] == "blocked":
                     result = AgentResult(Status.BLOCKED, "implementation blocked",
@@ -200,7 +299,29 @@ class CoderAgent:
                         return result
                 messages.extend([{"role": "assistant", "content": response.text},
                                  {"role": "user", "content": observation}])
-            raise RuntimeError("maximum agent turns exceeded")
+            controlled = self._controlled_result(task, last_model)
+            if controlled is not None:
+                return controlled
+            blocker = (
+                f"agent turn budget exhausted after {self.max_turns} turns; "
+                "this is an explicit compatibility limit; use progress-based mode "
+                "or raise the compatibility limit"
+            )
+            result = AgentResult(
+                Status.BLOCKED,
+                "implementation paused at an explicit compatibility limit",
+                blocker=blocker,
+                model=last_model,
+            )
+            self.store.update_step(
+                task.step_id,
+                self.worker_id,
+                result.status,
+                blocker=result.blocker,
+                model_used=last_model,
+                coder_response={"reason": "compatibility_turn_limit", "turns": self.max_turns},
+            )
+            return result
         except (BackendError, WorkspaceViolation, CommandRejected, RuntimeError, ValueError) as exc:
             status = Status.FAILED
             self.store.update_step(
@@ -214,6 +335,26 @@ class CoderAgent:
                 "task did not reach review; return step for autonomous recovery",
                 blocker=str(exc),
             )
+
+    def _controlled_result(self, task: Task, model: str | None) -> AgentResult | None:
+        """Stop at a safe turn boundary when an operator pauses or cancels."""
+        get_status = getattr(self.store, "job_status", None)
+        if get_status is None:
+            return None
+        status = get_status(task.job_id)
+        if status not in {"paused", "cancelled"}:
+            return None
+        result_status = Status.PAUSED if status == "paused" else Status.CANCELLED
+        summary = f"job {status}; coder stopped at a safe boundary"
+        self.store.update_step(
+            task.step_id,
+            self.worker_id,
+            Status.QUEUED,
+            model_used=model,
+            coder_response={"reason": f"job_{status}", "summary": summary},
+        )
+        self.store.event(task, f"coding_{status}", {"reason": "operator_control", "model": model})
+        return AgentResult(result_status, summary, model=model)
 
     def _execute(self, action: dict[str, Any], workspace: Workspace,
                  runner: CommandRunner, git: GitRepository, task: Task,
@@ -243,8 +384,8 @@ class CoderAgent:
                 raise ValueError("argv must be a string list")
             result = runner.run(argv, min(int(action.get("timeout", 300)), 900))
             self.store.record_command(task.step_id, result, task.attempt)
-            return json.dumps({"stdout": self._redact(result.stdout),
-                               "stderr": self._redact(result.stderr),
+            return json.dumps({"stdout": self._redact(result.stdout)[:12_000],
+                               "stderr": self._redact(result.stderr)[:12_000],
                                "exit_code": result.exit_code,
                                "duration_seconds": result.duration_seconds,
                                "timed_out": result.timed_out})
@@ -278,3 +419,7 @@ class CoderAgent:
             if any(pattern.search(content) for pattern in secret_patterns):
                 flagged.append(relative)
         return sorted(flagged)
+
+
+# Backwards-compatible V1 import. New code should use EngineeringAgent.
+CoderAgent = EngineeringAgent

@@ -36,8 +36,8 @@ class HTTPBackend:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
-        self.timeout = timeout
-        self.retries = retries
+        self.timeout = max(0.1, float(timeout))
+        self.retries = max(0, int(retries))
         self._circuit_open_until = 0.0
 
     @property

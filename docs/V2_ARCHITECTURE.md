@@ -43,3 +43,18 @@ test result. `engineering_actions` provide an append-only operational trace.
 Every stage requires an isolated deterministic test before the next stage is
 enabled. V2 will not be selected by default until a disposable repository
 produces multiple reviewed and verified commits with no manual agent calls.
+
+## Current implementation status
+
+The mission boundary is now operational: `MissionManager` parses unchecked
+roadmap items into an idempotent rolling wave, the coordinator materializes the
+next wave before claiming work, and `IntegrationManager` can merge verified
+package commits into a non-protected mission branch using a detached temporary
+worktree. The `human_queue` and `mission_integrations` tables are included in
+`orchestrator-0005`, with CLI and Control Center read/write access.
+
+`AUTO_INTEGRATE` remains opt-in. The remaining acceptance gate is live: run one
+coordinator against a disposable repository and observe at least three packages,
+including one deliberate Reviewer revision, reach verified checkpoints without
+manual `once` calls. That requires the operator's PostgreSQL, Ollama, repository,
+and service environment and is not reproducible inside the unit-test sandbox.

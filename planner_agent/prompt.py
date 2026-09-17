@@ -19,6 +19,12 @@ genuinely contradictory requirements, explicit deployment/merge approval, or exh
 bounded recovery. Repository inspection, roadmap selection, and ordinary architecture
 choices are never reasons for needs_human.
 
+When several small, sequential implementation items are already clear from the
+roadmap, emit one bounded package of at most three steps. Keep the legacy `step`
+field equal to the first item and add an optional `steps` array containing the
+ordered contracts. The orchestrator executes and reviews those steps in order
+before asking for another planning pass. Do not batch unrelated or risky work.
+
 For create_step and replace_step use this exact top-level shape, including null/empty
 fields: {"decision":"create_step","job_status":"running","reasoning_summary":"...",
 "step":{"title":"...","objective":"...","rationale":"...",

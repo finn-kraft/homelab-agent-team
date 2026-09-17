@@ -5,6 +5,7 @@ class Store:
     def overview(self): return {"jobs": [], "agents": [], "inference": {}, "repository_locks": []}
     def events(self, _filters): return []
     def action(self, _job, _action): pass
+    def remove_queued_job(self, _job): pass
 
 class Telemetry:
     def snapshot(self): return {"gpu": {"status": "ok"}, "ollama": {"status": "ok"}}
@@ -22,6 +23,11 @@ def test_cancel_requires_explicit_confirmation(app):
     with pytest.raises(PermissionError): app.perform_action(1, "cancel", {})
     assert app.perform_action(1, "cancel", {"confirm": True}) == {"status": "cancel"}
 
+
+def test_remove_requires_confirmation_and_returns_removed(app):
+    with pytest.raises(PermissionError): app.perform_action(1, "remove", {})
+    assert app.perform_action(1, "remove", {"confirm": True}) == {"status": "removed"}
+
 def test_dashboard_has_no_arbitrary_command_or_filesystem_api():
     from importlib.resources import files
     html = files("control_center.static").joinpath("index.html").read_text()
@@ -35,6 +41,7 @@ def test_static_dashboard_contains_primary_operator_workflow():
     assert all(stage in html for stage in ("Planner", "Coder", "Reviewer", "Verification", "Commit"))
     assert "/api/stream" in script and "Needs attention" in script
     assert "/api/login" in script and "Control Center password" in html
+    assert "Remove from queue" in script and "data-job-action=\"remove\"" in script
 
 def test_dashboard_uses_accessible_delegated_controls():
     from importlib.resources import files

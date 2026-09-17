@@ -3,11 +3,11 @@ from __future__ import annotations
 import logging
 import threading
 
-from .agent import CoderAgent
+from .agent import EngineeringAgent
 
 
 class Worker:
-    def __init__(self, agent: CoderAgent, poll_seconds: float = 5.0):
+    def __init__(self, agent: EngineeringAgent, poll_seconds: float = 5.0):
         self.agent, self.poll_seconds = agent, poll_seconds
         self.stop_event = threading.Event()
 
@@ -21,3 +21,7 @@ class Worker:
             else:
                 self.stop_event.wait(self.poll_seconds)
 
+
+# Public V2 name; the loop remains identical and V1 Worker imports continue
+# to function during the migration.
+EngineeringWorker = Worker

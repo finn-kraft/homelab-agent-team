@@ -7,17 +7,23 @@ LLM output to decide a transition; it advances exclusively from durable state
 such as a reviewer verdict, a command exit status, and a Git checkpoint result.
 """
 
+import json
 import logging
 import subprocess
 import threading
 import os
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from coder_agent.models import WorkPackage
+
 from .config import OrchestratorConfig
+from .integration import IntegrationManager
+from .mission import MissionManager
 from .worktrees import WorktreeManager
 
 
@@ -40,7 +46,8 @@ class AgentOrchestrator:
         *,
         store,
         planner,
-        coder,
+        coder=None,
+        engineer=None,
         reviewer,
         verifier,
         checkpoint,
@@ -48,11 +55,18 @@ class AgentOrchestrator:
     ):
         self.store = store
         self.planner = planner
-        self.coder = coder
+        self.engineer = engineer or coder
+        if self.engineer is None:
+            raise ValueError("an EngineeringAgent (or legacy coder) is required")
+        # Keep the old attribute for integrations that inspect the coordinator.
+        self.coder = self.engineer
         self.reviewer = reviewer
         self.verifier = verifier
         self.checkpoint = checkpoint
         self.config = config
+        self.mission_manager = MissionManager(
+            self.store, max_packages=getattr(config, "mission_package_limit", 3)
+        )
         self._stop_requested = threading.Event()
 
     def request_stop(self) -> None:
@@ -82,6 +96,20 @@ class AgentOrchestrator:
 
     def once(self) -> AdvanceResult:
         """Perform one deterministic advancement, suitable for tests and cron-like use."""
+        self._populate_mission_queue()
+        claim_engineering = getattr(self.store, "claim_engineering_package", None)
+        if claim_engineering:
+            try:
+                claimed = claim_engineering(
+                    self.engineer.worker_id,
+                    self.config.lease_seconds,
+                    self.config.repository_lock_seconds,
+                    WorktreeManager(os.getenv("ENGINEERING_WORKTREE_ROOT", "/tmp/agent-worktrees")),
+                )
+                if claimed:
+                    return self._code(claimed["task"], package=claimed.get("package"))
+            except Exception:
+                LOG.debug("v2_native_package_claim_unavailable", exc_info=True)
         # V2 packages are admitted into the existing durable Step pipeline.
         # Keep this additive and safe for databases that have not migrated yet.
         claim_package = getattr(self.store, "claim_work_package", None)
@@ -129,7 +157,7 @@ class AgentOrchestrator:
             return self._review(step_id)
 
         task = self.store.claim_coding(
-            self.coder.worker_id,
+            self.engineer.worker_id,
             self.config.lease_seconds,
             self.config.repository_lock_seconds,
         )
@@ -138,27 +166,55 @@ class AgentOrchestrator:
 
         return self._plan()
 
+    def _populate_mission_queue(self) -> None:
+        """Materialize the next bounded roadmap packages before claiming work."""
+        list_missions = getattr(self.store, "list_missions", None)
+        if not list_missions:
+            return
+        try:
+            for mission in list_missions():
+                if mission.get("status") != "active":
+                    continue
+                if int(mission.get("active_packages") or 0) >= self.mission_manager.max_packages:
+                    continue
+                self.mission_manager.ensure_packages(int(mission["id"]), limit=self.mission_manager.max_packages)
+        except Exception:
+            # A missing roadmap or an un-migrated database must not stop V1 jobs.
+            LOG.debug("mission_queue_materialization_unavailable", exc_info=True)
+
     # ------------------------------------------------------------------
     # State machine actions
     # ------------------------------------------------------------------
-    def _code(self, task) -> AdvanceResult:
+    def _code(self, task, package: dict[str, Any] | None = None) -> AdvanceResult:
         # The durable claim is owned by the Coder worker identity, not the
         # Orchestrator process identity.  These are commonly different under
         # systemd and must match exactly for release.
-        owner = f"{self.coder.worker_id}:coder:{task.step_id}"
+        owner = f"{self.engineer.worker_id}:coder:{task.step_id}"
+        started = time.monotonic()
+        phase_status = "crashed"
+        phase_detail = ""
         try:
-            self._clear_route(self.coder)
+            self._clear_route(self.engineer)
+            package = package or self._work_package_for_step(task)
             with self._lease_heartbeat(
-                task.repository, owner, task.step_id, "coder", self.coder.worker_id
+                task.repository, owner, task.step_id, "coder", self.engineer.worker_id,
+                package_id=(package or {}).get("id"),
             ):
-                result = self.coder.run_task(task)
-            status = self.store.finish_coding_handoff(task.step_id, self.coder.worker_id)
-            self._record_route(self.coder, task.job_id, task.step_id, task.attempt)
+                run_package = getattr(self.engineer, "run_work_package", None)
+                if package is not None and run_package is not None:
+                    result = run_package(package, step_id=task.step_id, attempt=task.attempt)
+                else:
+                    result = self.engineer.run_task(task)
+            status = self.store.finish_coding_handoff(task.step_id, self.engineer.worker_id)
+            self._record_route(self.engineer, task.job_id, task.step_id, task.attempt)
             detail = getattr(result, "summary", "")
+            phase_status = str(getattr(result, "status", status))
+            phase_detail = detail
             self._log("coding_finished", job_id=task.job_id, step_id=task.step_id,
                       attempt=task.attempt, status=status)
             return AdvanceResult("coding", task.job_id, task.step_id, detail)
         except Exception as exc:
+            phase_detail = str(exc)
             # The Coder agent normally persists its own errors.  If it crashes
             # before doing so, the short lease plus recovery path protects us.
             self._log("coding_crashed", job_id=task.job_id, step_id=task.step_id,
@@ -173,30 +229,56 @@ class AgentOrchestrator:
                 )
             return AdvanceResult("coding_crashed", task.job_id, task.step_id, str(exc))
         finally:
+            self._record_phase_metric(self.engineer, "engineering", started, phase_status,
+                                      task.job_id, task.step_id, phase_detail)
             self.store.release_repository_lock(task.repository, owner)
 
     def _review(self, step_id: int) -> AdvanceResult:
+        started = time.monotonic()
+        phase_status = "crashed"
+        phase_detail = ""
+        work: dict[str, Any] = {}
         try:
             self._clear_route(self.reviewer)
             decision = self.reviewer.review_once(step_id)
             status = self.store.finish_review_handoff(step_id)
+            sync_package = getattr(self.store, "sync_package_for_step", None)
+            if sync_package:
+                package_status = {"changes_requested": "engineering", "verifying": "verifying"}.get(status)
+                if package_status:
+                    sync_package(step_id, package_status)
             work = self.store.step(step_id) or {}
             self._record_route(
                 self.reviewer, work.get("job_id"), step_id,
                 int(work.get("attempt_count") or 0),
             )
             verdict = getattr(decision, "verdict", status or "review_not_claimed")
+            phase_status = str(verdict)
+            phase_detail = str(verdict)
             self._log("review_finished", job_id=work.get("job_id"), step_id=step_id,
                       verdict=verdict)
             return AdvanceResult("review", work.get("job_id"), step_id, str(verdict))
         except Exception as exc:
+            phase_detail = str(exc)
             work = self.store.step(step_id) or {}
+            abandon = getattr(self.reviewer, "abandon", None)
+            if abandon is not None:
+                try:
+                    abandon(step_id, str(exc))
+                except Exception:
+                    LOG.exception("review_cleanup_failed step_id=%s", step_id)
             self._log("review_crashed", job_id=work.get("job_id"), step_id=step_id,
                       error=str(exc), level=logging.ERROR)
             return AdvanceResult("review_crashed", work.get("job_id"), step_id, str(exc))
+        finally:
+            self._record_phase_metric(self.reviewer, "review", started, phase_status,
+                                      work.get("job_id"), step_id, phase_detail)
 
     def _verify(self, work: dict[str, Any]) -> AdvanceResult:
         owner = self._lock_owner("verify", work["id"])
+        started = time.monotonic()
+        phase_status = "crashed"
+        phase_detail = ""
         try:
             with self._lease_heartbeat(
                 work["repository"], owner, work["id"], "orchestrator", self.config.worker_id
@@ -217,14 +299,25 @@ class AgentOrchestrator:
             )
         try:
             next_state = self.store.record_verification(work, self.config.worker_id, result)
+            sync_package = getattr(self.store, "sync_package_for_step", None)
+            if sync_package:
+                package_status = "complete" if next_state == "complete" else ("engineering" if not getattr(result, "passed", False) else "verifying")
+                sync_package(work["id"], package_status, getattr(result, "commit_sha", None))
             self._log("verification_finished", job_id=work["job_id"], step_id=work["id"],
                       passed=bool(getattr(result, "passed", False)), next_state=next_state)
+            phase_status = str(next_state)
+            phase_detail = getattr(result, "summary", "")
             return AdvanceResult("verification", work["job_id"], work["id"], next_state)
         finally:
+            self._record_phase_metric(self.verifier, "verification", started, phase_status,
+                                      work["job_id"], work["id"], phase_detail)
             self.store.release_repository_lock(work["repository"], owner)
 
     def _checkpoint(self, work: dict[str, Any]) -> AdvanceResult:
         owner = self._lock_owner("checkpoint", work["id"])
+        started = time.monotonic()
+        phase_status = "crashed"
+        phase_detail = ""
         try:
             if not self.config.auto_commit:
                 result = SimpleNamespace(
@@ -253,23 +346,74 @@ class AgentOrchestrator:
             result = SimpleNamespace(success=False, retryable=False, error=f"checkpoint service failed: {exc}")
         try:
             next_state = self.store.record_checkpoint(work, self.config.worker_id, result)
+            if next_state == "complete":
+                complete_session = getattr(self.store, "complete_engineering_session_for_step", None)
+                if complete_session:
+                    complete_session(work["id"])
             sync_package = getattr(self.store, "sync_package_for_step", None)
             if sync_package and next_state == "complete":
                 sync_package(work["id"], "complete", getattr(result, "commit_sha", None))
+            if next_state == "complete" and self.config.auto_integrate:
+                self._integrate_completed_package(work, getattr(result, "commit_sha", None))
             self._log("checkpoint_finished", job_id=work["job_id"], step_id=work["id"],
                       commit_sha=getattr(result, "commit_sha", None), next_state=next_state)
+            phase_status = str(next_state)
+            phase_detail = getattr(result, "error", None) or ""
             return AdvanceResult("checkpoint", work["job_id"], work["id"], next_state)
         finally:
+            self._record_phase_metric(self.checkpoint, "checkpoint", started, phase_status,
+                                      work["job_id"], work["id"], phase_detail)
             self.store.release_repository_lock(work["repository"], owner)
 
+    def _integrate_completed_package(self, work: dict[str, Any], commit_sha: str | None) -> None:
+        """Opt-in branch integration after a durable checkpoint.
+
+        Checkpoint success remains authoritative even if integration conflicts;
+        the conflict is persisted for an operator to resolve and retry.
+        """
+        getter = getattr(self.store, "work_package_for_step", None)
+        if not getter:
+            return
+        package = getter(work["id"])
+        if not package:
+            return
+        mission = getattr(self.store, "mission_detail", lambda _id: None)(package.get("mission_id"))
+        if not mission:
+            return
+        try:
+            result = IntegrationManager(
+                self.store, protected_branches=self.config.protected_branches
+            ).integrate(
+                {**package, "resulting_commit": commit_sha or package.get("resulting_commit")},
+                mission["repository"], target_branch=mission["branch"],
+            )
+            self._log("package_integrated", job_id=work["job_id"], step_id=work["id"], **result)
+        except Exception as exc:
+            self._log("package_integration_failed", job_id=work["job_id"], step_id=work["id"],
+                      error=str(exc), level=logging.ERROR)
+
     def _plan(self) -> AdvanceResult:
+        started = time.monotonic()
+        phase_status = "crashed"
+        phase_detail = ""
         try:
             self._clear_route(self.planner)
             decision = self.planner.plan_once()
+            if decision is None:
+                phase_status = "idle"
         except Exception as exc:
+            phase_detail = str(exc)
             self._log("planning_crashed", error=str(exc), level=logging.ERROR)
             return AdvanceResult("planning_crashed", detail=str(exc))
+        finally:
+            job_id = getattr(self.planner, "last_job_id", None)
+            if "decision" in locals() and decision is not None:
+                phase_status = str(getattr(decision, "decision", "finished"))
+                phase_detail = str(getattr(decision, "reasoning_summary", ""))
+            self._record_phase_metric(self.planner, "planning", started, phase_status,
+                                      job_id, None, phase_detail)
         if decision is None:
+            phase_status = "idle"
             return AdvanceResult("idle")
         job_id = getattr(self.planner, "last_job_id", None)
         self._record_route(self.planner, job_id, None, None)
@@ -340,6 +484,66 @@ class AgentOrchestrator:
             fallback=bool(getattr(route, "fallback", False)),
         )
 
+    def _work_package_for_step(self, task) -> WorkPackage | None:
+        """Load the V2 package linked to a claimed V1 step, when present."""
+        getter = getattr(self.store, "work_package_for_step", None)
+        if getter is None:
+            return None
+        try:
+            row = getter(task.step_id)
+        except Exception:
+            # Work-package tables are additive. A V1 database can continue
+            # using the durable Step transport until its migration is applied.
+            LOG.debug("v2_work_package_lookup_unavailable step_id=%s", task.step_id,
+                      exc_info=True)
+            return None
+        if not row:
+            return None
+        return WorkPackage(
+            id=int(row["id"]),
+            job_id=int(row["job_id"] or task.job_id),
+            # The linked package keeps the source repository, while the
+            # claimed Step may point at its isolated Engineering worktree.
+            # Always execute against the Step's current repository/branch.
+            repository=str(task.repository),
+            branch=str(task.branch),
+            objective=str(row["objective"] or task.objective),
+            acceptance_criteria=self._list_value(row.get("acceptance_criteria")) or list(task.acceptance_criteria),
+            constraints=self._list_value(row.get("constraints")) or list(task.constraints),
+            roadmap_reference=row.get("roadmap_reference"),
+            dependencies=[int(value) for value in self._list_value(row.get("dependencies"))],
+            reviewer_feedback=task.reviewer_feedback,
+        )
+
+    def _record_phase_metric(self, agent: Any, phase: str, started: float,
+                             status: str, job_id: int | None = None,
+                             step_id: int | None = None, detail: str = "") -> None:
+        duration = time.monotonic() - started
+        prompt_chars = int(getattr(agent, "last_prompt_chars", 0) or 0)
+        route = getattr(getattr(agent, "router", None), "last_route", None)
+        provider = getattr(route, "provider", None)
+        model = getattr(route, "model", None) or getattr(agent, "last_model", None)
+        recorder = getattr(self.store, "record_phase_metric", None)
+        if recorder is not None:
+            try:
+                recorder(
+                    job_id=job_id,
+                    step_id=step_id,
+                    phase=phase,
+                    status=status,
+                    duration_seconds=duration,
+                    prompt_chars=prompt_chars,
+                    provider=provider,
+                    model=model,
+                    detail={"detail": detail[:4_000]} if detail else {},
+                )
+            except Exception:
+                LOG.exception("phase_metric_record_failed phase=%s job_id=%s step_id=%s",
+                              phase, job_id, step_id)
+        self._log("phase_finished", phase=phase, status=status, job_id=job_id,
+                  step_id=step_id, duration_seconds=round(duration, 3),
+                  prompt_chars=prompt_chars, provider=provider, model=model)
+
     @staticmethod
     def _clear_route(agent: Any) -> None:
         router = getattr(agent, "router", None)
@@ -357,6 +561,7 @@ class AgentOrchestrator:
         step_id: int,
         lease_kind: str,
         lease_worker_id: str,
+        package_id: int | None = None,
     ):
         """Renew durable ownership while a bounded action is still executing."""
         stop = threading.Event()
@@ -379,7 +584,14 @@ class AgentOrchestrator:
                         work_ok = self.store.heartbeat_orchestration(
                             step_id, lease_worker_id, self.config.lease_seconds
                         )
-                    if not repository_ok or not work_ok:
+                    package_ok = True
+                    if package_id is not None:
+                        heartbeat_package = getattr(self.store, "heartbeat_work_package", None)
+                        if heartbeat_package:
+                            package_ok = heartbeat_package(
+                                package_id, lease_worker_id, self.config.lease_seconds
+                            )
+                    if not repository_ok or not work_ok or not package_ok:
                         self._log(
                             "lease_heartbeat_lost", level=logging.ERROR,
                             step_id=step_id, owner=owner, phase=lease_kind,
@@ -409,6 +621,12 @@ class AgentOrchestrator:
             return [str(item) for item in value]
         if isinstance(value, tuple):
             return [str(item) for item in value]
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError):
+                return []
+            return AgentOrchestrator._list_value(parsed)
         return []
 
     @staticmethod
