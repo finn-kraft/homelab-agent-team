@@ -387,6 +387,10 @@ class OrchestratorStore:
                                                    package["id"], package["branch"])
                 connection.execute("UPDATE work_packages SET worktree=%s,starting_commit=%s,branch=%s WHERE id=%s",
                                    (str(worktree.path), worktree.starting_commit, worktree.branch, package["id"]))
+                connection.execute("UPDATE jobs SET repository=%s,branch=%s WHERE id=%s",
+                                   (str(worktree.path), worktree.branch, package.get("job_id")))
+                connection.execute("UPDATE steps SET repository=%s,branch=%s WHERE id=%s",
+                                   (str(worktree.path), worktree.branch, package.get("step_id")))
                 package.update(worktree=str(worktree.path), starting_commit=worktree.starting_commit,
                                branch=worktree.branch)
             return package

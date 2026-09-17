@@ -10,6 +10,7 @@ such as a reviewer verdict, a command exit status, and a Git checkpoint result.
 import logging
 import subprocess
 import threading
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from .config import OrchestratorConfig
+from .worktrees import WorktreeManager
 
 
 LOG = logging.getLogger(__name__)
@@ -80,6 +82,21 @@ class AgentOrchestrator:
 
     def once(self) -> AdvanceResult:
         """Perform one deterministic advancement, suitable for tests and cron-like use."""
+        # V2 packages are admitted into the existing durable Step pipeline.
+        # Keep this additive and safe for databases that have not migrated yet.
+        claim_package = getattr(self.store, "claim_work_package", None)
+        if claim_package:
+            try:
+                package = claim_package(
+                    self.config.worker_id,
+                    self.config.repository_lock_seconds,
+                    WorktreeManager(os.getenv("ENGINEERING_WORKTREE_ROOT", "/tmp/agent-worktrees")),
+                )
+                if package:
+                    return AdvanceResult("package_claimed", package.get("job_id"), package.get("step_id"))
+            except Exception:
+                LOG.debug("v2_package_queue_unavailable", exc_info=True)
+
         recovered = self.store.recover_expired()
         if recovered:
             return self._handle_recovery(recovered[0])
