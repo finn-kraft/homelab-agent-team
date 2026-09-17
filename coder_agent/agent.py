@@ -13,8 +13,11 @@ from .models import AgentResult, Status, Task
 from .workspace import Workspace, WorkspaceViolation
 
 
-SYSTEM_PROMPT = """You are coder-agent, an implementation member of a development team.
-Work only on the assigned step. The planner owns scope and the reviewer owns approval.
+SYSTEM_PROMPT = """You are an Engineering Worker, the implementation owner of one Work Package.
+Inspect the repository and project instructions first, form and revise your implementation
+plan internally, then implement, test, debug, and prepare a reviewable candidate. The
+reviewer owns approval, but reviewer feedback returns to this same package session.
+Work only within the package objective and constraints.
 Return exactly one JSON object per turn, with one action:
 {"action":"read","path":"relative/path"}
 {"action":"write","path":"relative/path","content":"complete file content"}
@@ -33,6 +36,16 @@ class CoderAgent:
                  allowed_roots: list[str], max_turns: int = 30, max_attempts: int = 4):
         self.store, self.router, self.worker_id = store, router, worker_id
         self.allowed_roots, self.max_turns, self.max_attempts = allowed_roots, max_turns, max_attempts
+
+    def run_package(self, package: Task) -> AgentResult:
+        """Run one Work Package using the preserved workspace/tooling loop.
+
+        ``Task`` remains the V1-compatible transport while V2 introduces a
+        package-owned execution boundary. Reviewer feedback is carried on the
+        same object and the package worktree remains the source of truth across
+        retries and restarts.
+        """
+        return self.run_task(package)
 
     @staticmethod
     def _parse_action(text: str) -> dict[str, Any]:

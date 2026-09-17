@@ -88,6 +88,7 @@ class VerificationResult:
     checks: list[VerificationCommandResult] = field(default_factory=list)
     secret_findings: list[str] = field(default_factory=list)
     failure_summary: str | None = None
+    failure_class: str | None = None
 
     # Compatibility with the persistence boundary: command output is kept in
     # a single canonical list, while these aliases make the result convenient
@@ -124,6 +125,7 @@ class VerificationResult:
             "checks": [check.as_dict() for check in self.checks],
             "secret_findings": self.secret_findings,
             "failure_summary": self.failure_summary,
+            "failure_class": self.failure_class,
         }
 
 
@@ -254,6 +256,14 @@ class VerificationService:
         elif failed_checks:
             summary = self._failure_summary(failed_checks)
 
+        failure_class = None
+        if secret_findings:
+            failure_class = "SECRET"
+        elif failed_checks:
+            first = failed_checks[0]
+            failure_class = "TIMEOUT" if first.timed_out else (
+                "ENVIRONMENT_FAILURE" if first.exit_code == 127 else "TEST_FAILURE"
+            )
         return VerificationResult(
             passed=not failed_checks and not secret_findings,
             repository=str(root),
@@ -262,6 +272,7 @@ class VerificationService:
             checks=checks,
             secret_findings=sorted(set(secret_findings)),
             failure_summary=summary,
+            failure_class=failure_class,
         )
 
     def discover_commands(
