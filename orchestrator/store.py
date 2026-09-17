@@ -47,7 +47,7 @@ REQUIRED_TABLE_COLUMNS = {
         "correlation_id",
     },
     "command_runs": {"step_id", "timed_out", "cancelled"},
-    "reviews": {"step_id", "verdict"},
+    "reviews": {"step_id", "verdict", "review_lease_expires_at"},
     "verification_runs": {"step_id", "status"},
     "checkpoint_runs": {"step_id", "status"},
     "engineering_sessions": {"job_id", "step_id", "turn_count"},
