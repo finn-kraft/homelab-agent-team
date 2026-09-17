@@ -96,9 +96,19 @@ class CoderAgent:
                 self.store.heartbeat(task.step_id, self.worker_id)
                 response = backend.complete(messages)
                 last_model = response.model
-                action = self._parse_action(response.text)
-                observation = self._execute(action, workspace, runner, git, task,
-                                            initial_changes)
+                try:
+                    action = self._parse_action(response.text)
+                    observation = self._execute(action, workspace, runner, git, task,
+                                                initial_changes)
+                except (ValueError, KeyError, OSError, WorkspaceViolation) as exc:
+                    # Invalid model actions (for example trying to read the
+                    # virtual ``repository`` label as a file) are recoverable:
+                    # feed the precise error back to the model instead of
+                    # crashing the durable coding lease.
+                    action = {"action": "invalid"}
+                    observation = f"Action rejected: {exc}. Choose a valid path relative to the repository root."
+                    messages.extend([{"role": "assistant", "content": response.text},
+                                     {"role": "user", "content": observation}])
                 if action["action"] == "run":
                     try:
                         verified = verified or json.loads(observation)["exit_code"] == 0
