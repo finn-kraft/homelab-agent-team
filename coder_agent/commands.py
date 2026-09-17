@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import importlib.util
+import signal
 import shutil
 import subprocess
 import sys
@@ -44,7 +45,7 @@ class CommandRunner:
         self.workspace = workspace
         self.policy = policy or CommandPolicy()
 
-    def run(self, argv: list[str], timeout: int = 300) -> CommandResult:
+    def run(self, argv: list[str], timeout: int = 300, cancel_check=None) -> CommandResult:
         self.policy.validate(argv)
         env = {k: v for k, v in os.environ.items() if k not in {
             "DATABASE_URL", "ALIGN_DATABASE_URL", "OPENROUTER_API_KEY", "GITHUB_TOKEN",
@@ -59,16 +60,41 @@ class CommandRunner:
         )
         execution_argv = self._resolve_python_tool(argv, env)
         started = time.monotonic()
+        process = None
         try:
-            done = subprocess.run(
+            process = subprocess.Popen(
                 execution_argv, cwd=self.workspace.root, env=env, text=True,
-                capture_output=True, timeout=timeout, shell=False,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False,
+                start_new_session=(os.name == "posix"),
             )
-            return CommandResult(argv, done.stdout, done.stderr, done.returncode,
-                                 time.monotonic() - started)
-        except subprocess.TimeoutExpired as exc:
-            return CommandResult(argv, exc.stdout or "", exc.stderr or "", 124,
-                                 time.monotonic() - started, True)
+            deadline = started + max(1, int(timeout))
+            while True:
+                if cancel_check is not None:
+                    try:
+                        cancelled = bool(cancel_check())
+                    except Exception:
+                        # A transient database read must not turn a safe
+                        # command into an untracked crash.
+                        cancelled = False
+                    if cancelled:
+                        stdout, stderr = self._terminate(process)
+                        return CommandResult(
+                            argv, stdout, stderr or "command cancelled at a safe boundary",
+                            130, time.monotonic() - started, False, True,
+                        )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    stdout, stderr = self._terminate(process)
+                    return CommandResult(
+                        argv, stdout, stderr or "command timed out", 124,
+                        time.monotonic() - started, True,
+                    )
+                try:
+                    stdout, stderr = process.communicate(timeout=min(1.0, remaining))
+                    return CommandResult(argv, stdout or "", stderr or "", process.returncode,
+                                         time.monotonic() - started)
+                except subprocess.TimeoutExpired:
+                    continue
         except FileNotFoundError:
             command = argv[0] if argv else "command"
             return CommandResult(
@@ -80,6 +106,30 @@ class CommandRunner:
                 127,
                 time.monotonic() - started,
             )
+
+    @staticmethod
+    def _terminate(process: subprocess.Popen) -> tuple[str, str]:
+        """Stop a command and its descendants, returning captured output."""
+        if process.poll() is None:
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGTERM)
+                else:  # pragma: no cover - Windows compatibility
+                    process.terminate()
+                stdout, stderr = process.communicate(timeout=3)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                if process.poll() is None:
+                    if os.name == "posix":
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    else:  # pragma: no cover - Windows compatibility
+                        process.kill()
+                stdout, stderr = process.communicate()
+        else:
+            stdout, stderr = process.communicate()
+        return stdout or "", stderr or ""
 
     @staticmethod
     def _resolve_python_tool(argv: list[str], env: dict[str, str]) -> list[str]:

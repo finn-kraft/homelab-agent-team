@@ -98,7 +98,7 @@ class ControlStore:
                 step["verification_runs"] = [dict(x) for x in connection.execute(
                     "SELECT * FROM verification_runs WHERE step_id=%s ORDER BY attempt", (sid,)).fetchall()]
                 step["commands"] = [dict(x) for x in connection.execute(
-                    """SELECT argv,exit_code,duration_seconds,timed_out,source,attempt,created_at
+                    """SELECT argv,exit_code,duration_seconds,timed_out,cancelled,source,attempt,created_at
                     FROM command_runs WHERE step_id=%s ORDER BY id""", (sid,)).fetchall()]
                 step["model_routes"] = [dict(x) for x in connection.execute(
                     """SELECT caller_agent,provider,model,route_reason,attempt,latency_seconds,usage,

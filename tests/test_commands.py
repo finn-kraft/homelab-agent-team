@@ -37,3 +37,15 @@ def test_captures_command_truth(tmp_path):
 def test_python_tools_can_use_the_service_interpreter():
     resolved = CommandRunner._resolve_python_tool(["pytest", "-q"], {"PATH": ""})
     assert resolved[:3] == [sys.executable, "-m", "pytest"]
+
+
+def test_cancel_check_terminates_the_process_group(tmp_path):
+    runner = CommandRunner(make_workspace(tmp_path))
+    result = runner.run(
+        ["python3", "-c", "import time; time.sleep(30)"],
+        timeout=30,
+        cancel_check=lambda: True,
+    )
+    assert result.cancelled is True
+    assert result.exit_code == 130
+    assert result.duration_seconds < 5

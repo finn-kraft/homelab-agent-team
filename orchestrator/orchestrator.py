@@ -129,6 +129,16 @@ class AgentOrchestrator:
         if recovered:
             return self._handle_recovery(recovered[0])
 
+        recover_planning = getattr(self.store, "recover_expired_planning", None)
+        if recover_planning is not None:
+            recovered_planning = recover_planning()
+            if recovered_planning:
+                return AdvanceResult(
+                    "planning_recovered",
+                    int(recovered_planning[0]),
+                    detail="expired planner lease released; job is ready to be reclaimed",
+                )
+
         enforce_limit = getattr(self.store, "enforce_iteration_limit", None)
         exhausted = enforce_limit() if enforce_limit is not None else None
         if exhausted is not None:
@@ -187,12 +197,12 @@ class AgentOrchestrator:
     # State machine actions
     # ------------------------------------------------------------------
     def _code(self, task, package: dict[str, Any] | None = None) -> AdvanceResult:
-        # The durable claim is owned by the Coder worker identity, not the
+        # The durable claim is owned by the Engineering worker identity, not the
         # Orchestrator process identity.  These are commonly different under
         # systemd and must match exactly for release.
         # Keep the durable lock suffix stable for V1 workers upgrading in
         # place; the owning component and UI identity are EngineeringAgent.
-        owner = f"{self.engineer.worker_id}:coder:{task.step_id}"
+        owner = f"{self.engineer.worker_id}:engineering:{task.step_id}"
         started = time.monotonic()
         phase_status = "crashed"
         phase_detail = ""
@@ -214,14 +224,15 @@ class AgentOrchestrator:
             detail = getattr(result, "summary", "")
             phase_status = str(getattr(result, "status", status))
             phase_detail = detail
-            self._log("coding_finished", job_id=task.job_id, step_id=task.step_id,
-                      attempt=task.attempt, status=status)
-            return AdvanceResult("coding", task.job_id, task.step_id, detail)
+            self._log("engineering_finished", job_id=task.job_id, step_id=task.step_id,
+                      attempt=task.attempt, status=status,
+                      failure_class=getattr(result, "failure_class", None))
+            return AdvanceResult("engineering", task.job_id, task.step_id, detail)
         except Exception as exc:
             phase_detail = str(exc)
-            # The Coder agent normally persists its own errors.  If it crashes
+            # The EngineeringAgent normally persists its own errors. If it crashes
             # before doing so, the short lease plus recovery path protects us.
-            self._log("coding_crashed", job_id=task.job_id, step_id=task.step_id,
+            self._log("engineering_crashed", job_id=task.job_id, step_id=task.step_id,
                       attempt=task.attempt, error=str(exc), level=logging.ERROR)
             clean, evidence = self._repository_clean(task.repository)
             if clean and hasattr(self.store, "safely_requeue_abandoned_coding"):
@@ -229,9 +240,9 @@ class AgentOrchestrator:
             elif not clean and hasattr(self.store, "block_abandoned_coding"):
                 self.store.block_abandoned_coding(
                     task.step_id,
-                    f"Coder crashed with unclassified repository changes. {evidence}",
+                    f"EngineeringAgent crashed with unclassified repository changes. {evidence}",
                 )
-            return AdvanceResult("coding_crashed", task.job_id, task.step_id, str(exc))
+            return AdvanceResult("engineering_crashed", task.job_id, task.step_id, str(exc))
         finally:
             self._record_phase_metric(self.engineer, "engineering", started, phase_status,
                                       task.job_id, task.step_id, phase_detail)
@@ -437,12 +448,12 @@ class AgentOrchestrator:
         clean, evidence = self._repository_clean(stale["repository"])
         if clean:
             self.store.safely_requeue_abandoned_coding(step_id, evidence)
-            return AdvanceResult("coding_requeued", stale["job_id"], step_id, evidence)
+            return AdvanceResult("engineering_requeued", stale["job_id"], step_id, evidence)
         self.store.block_abandoned_coding(
             step_id,
-            f"Coder lease expired with unclassified repository changes. {evidence}",
+            f"EngineeringAgent lease expired with unclassified repository changes. {evidence}",
         )
-        return AdvanceResult("coding_blocked", stale["job_id"], step_id, evidence)
+        return AdvanceResult("engineering_blocked", stale["job_id"], step_id, evidence)
 
     @staticmethod
     def _repository_clean(repository: str) -> tuple[bool, str]:
@@ -457,11 +468,11 @@ class AgentOrchestrator:
         if done.returncode != 0:
             return False, f"git status failed: {done.stderr[:1000]}"
         if not done.stdout.strip():
-            return True, "working tree is clean after expired Coder lease"
+            return True, "working tree is clean after expired EngineeringAgent lease"
         return False, f"working tree has changes: {done.stdout[:4000]}"
 
     def _preexisting_files(self, step_id: int) -> list[str]:
-        """Read Coder's recorded baseline without guessing from current Git state."""
+        """Read EngineeringAgent's recorded baseline without guessing from Git state."""
         # Store implementations may expose a specialised helper.  Keeping this
         # optional lets test doubles stay small while retaining safety in prod.
         getter = getattr(self.store, "preexisting_files", None)

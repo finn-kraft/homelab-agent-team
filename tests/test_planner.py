@@ -88,8 +88,16 @@ class MemoryStore:
             self.steps.append({**decision.step, "id": len(self.steps) + 1,
                                "sequence": len(self.steps) + 1, "status": "queued"})
             self.job.status = JobStatus.RUNNING
+            self.job.current_phase = "engineering"
         else:
             self.job.status = JobStatus(decision.job_status)
+            self.job.current_phase = {
+                "complete": "complete",
+                "needs_human": "needs_human",
+                "blocked": "blocked",
+                "wait_for_review": "review",
+                "retry_step": "engineering",
+            }.get(decision.decision, "planning")
         self.owner = None
         return len(self.steps) if decision.step else None
 
@@ -116,6 +124,7 @@ def test_01_new_goal_creates_first_step():
     agent, _ = planner(store, [step_payload()])
     assert agent.plan_once().decision == "create_step"
     assert store.steps[0]["assigned_agent"] == "coder-agent"
+    assert store.job.current_phase == "engineering"
 
 
 def test_02_completed_step_causes_next_step():

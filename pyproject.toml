@@ -20,7 +20,7 @@ test = ["pytest>=8,<9"]
 
 [project.scripts]
 coder-agent = "coder_agent.cli:main"
-engineering-agent = "coder_agent.cli:main"
+engineering-agent = "engineering_agent.cli:main"
 planner-agent = "planner_agent.cli:main"
 reviewer-agent = "reviewer_agent.cli:main"
 agent-orchestrator = "orchestrator.cli:main"
