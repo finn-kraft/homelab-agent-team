@@ -142,6 +142,8 @@ class ControlCenter:
                         return self.send_json(200, {"authenticated": True, "csrf_token": session.csrf_token})
                     if parsed.path == "/api/overview":
                         return self.send_json(200, app.snapshot())
+                    if parsed.path == "/api/telemetry":
+                        return self.send_json(200, app.telemetry.snapshot())
                     if parsed.path == "/api/projects":
                         return self.send_json(200, app.store.project_list())
                     if parsed.path == "/api/missions":

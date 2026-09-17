@@ -295,6 +295,8 @@ V2 operations are also available from the orchestrator CLI: `missions`,
 `expand-mission`, `packages`, `human-queue`, `answer-human`, and
 `integrate-package`. The Control Center exposes the same mission/package and human
 queue read models after running the additive `orchestrator-0005` migration.
+The dashboard's `/api/telemetry` path is independent of the workflow stream and polls
+Ollama/GPU data once per second, including loaded and installed model details.
 
 ## Tests
 

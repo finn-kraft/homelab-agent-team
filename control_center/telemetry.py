@@ -6,6 +6,8 @@ import shutil
 import subprocess
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 class TelemetryClient:
     """Read trusted JSON telemetry; never exposes remote command execution."""
@@ -68,22 +70,61 @@ class TelemetryClient:
             result["context_length"] = value["context_length"]
         return result
     def snapshot(self):
-        ollama = self._get(f"{self.ollama_url}/api/ps") if self.ollama_url else {"status": "not_configured"}
-        if "models" in ollama:
+        """Collect all read-only telemetry concurrently for fast one-second polling."""
+        if self.ollama_url:
+            with ThreadPoolExecutor(max_workers=5, thread_name_prefix="telemetry") as pool:
+                ps_future = pool.submit(self._get, f"{self.ollama_url}/api/ps")
+                tags_future = pool.submit(self._get, f"{self.ollama_url}/api/tags")
+                version_future = pool.submit(self._get, f"{self.ollama_url}/api/version")
+                gpu_future = pool.submit(
+                    self._get, self.gpu_url, self.gpu_token
+                ) if self.gpu_url else pool.submit(self._local_gpu)
+                router_future = pool.submit(self._get, f"{self.router_url}/health") \
+                    if self.router_url else None
+                ps = ps_future.result()
+                tags = tags_future.result()
+                version = version_future.result()
+                gpu_raw = gpu_future.result()
+                router = router_future.result() if router_future else {"status": "not_configured"}
+        else:
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="telemetry") as pool:
+                gpu_future = pool.submit(self._get, self.gpu_url, self.gpu_token) \
+                    if self.gpu_url else pool.submit(self._local_gpu)
+                router_future = pool.submit(self._get, f"{self.router_url}/health") \
+                    if self.router_url else None
+                ps, tags, version = {"status": "not_configured"}, {}, {}
+                gpu_raw = gpu_future.result()
+                router = router_future.result() if router_future else {"status": "not_configured"}
+
+        ollama = dict(ps) if isinstance(ps, dict) else {"status": "unavailable"}
+        ps_online = "models" in ollama
+        loaded_models = ollama.get("models") if isinstance(ollama.get("models"), list) else []
+        installed_models = tags.get("models") if isinstance(tags, dict) and isinstance(tags.get("models"), list) else []
+        ollama["loaded_models"] = loaded_models
+        ollama["models"] = installed_models or loaded_models
+        ollama["model_count"] = len(ollama["models"])
+        ollama["loaded_count"] = len(loaded_models)
+        if loaded_models:
             ollama["status"] = "online"
-            ollama["loaded_model"] = ollama["models"][0] if ollama["models"] else None
-            loaded = ollama["loaded_model"] or {}
+            ollama["loaded_model"] = loaded_models[0]
+            loaded = ollama["loaded_model"] if isinstance(ollama["loaded_model"], dict) else {}
+            details = loaded.get("details") if isinstance(loaded.get("details"), dict) else {}
             ollama["model"] = loaded.get("name") or loaded.get("model")
-            ollama["context_length"] = loaded.get("context_length")
+            ollama["context_length"] = loaded.get("context_length") or details.get("context_length")
+            ollama["size"] = loaded.get("size")
             ollama["size_vram"] = loaded.get("size_vram")
+            ollama["expires_at"] = loaded.get("expires_at")
+            ollama["processor"] = loaded.get("processor")
             ollama["online"] = True
         else:
-            ollama["online"] = ollama.get("status") == "online"
-        gpu = self._normalise_gpu(
-            self._get(self.gpu_url, self.gpu_token) if self.gpu_url else self._local_gpu()
-        )
+            ollama["status"] = "online" if ps_online else ollama.get("status", "unavailable")
+            ollama["online"] = ps_online or ollama.get("status") == "online"
+        if isinstance(version, dict) and version.get("version"):
+            ollama["version"] = version["version"]
+        gpu = self._normalise_gpu(gpu_raw)
         return {
             "gpu": gpu,
             "ollama": ollama,
-            "routing_agent": self._get(f"{self.router_url}/health") if self.router_url else {"status": "not_configured"},
+            "routing_agent": router,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
         }

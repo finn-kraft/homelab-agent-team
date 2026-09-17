@@ -1,6 +1,7 @@
 const state = {
   csrfToken: '', overview: null, projects: [], events: [], view: 'dashboard',
   jobId: null, streamGeneration: 0, eventFilter: '', eventSearch: {}, humanDraft: '',
+  telemetry: null, telemetryTimer: null, telemetryInFlight: false,
 };
 
 const $ = selector => document.querySelector(selector);
@@ -138,7 +139,7 @@ async function connect() {
   try {
     const login = await api('/api/login', {method: 'POST', body: JSON.stringify({password})});
     state.csrfToken = login.csrf_token;
-    [state.overview, state.projects] = await Promise.all([api('/api/overview'), api('/api/projects')]);
+    [state.overview, state.projects, state.telemetry] = await Promise.all([api('/api/overview'), api('/api/projects'), api('/api/telemetry')]);
     $('#password').value = '';
     document.body.classList.add('connected');
     $('#login').hidden = true;
@@ -146,6 +147,7 @@ async function connect() {
     populateProjects();
     showView('dashboard');
     stream(++state.streamGeneration);
+    startTelemetry(state.streamGeneration);
   } catch (error) {
     state.csrfToken = '';
     $('#loginError').textContent = 'Could not sign in. Check the password and server status.';
@@ -160,8 +162,11 @@ async function disconnect() {
   try { await api('/api/logout', {method: 'POST', body: '{}'}); } catch (_) { /* session may already be expired */ }
   state.csrfToken = '';
   state.overview = null;
+  state.telemetry = null;
   state.projects = [];
   state.events = [];
+  if (state.telemetryTimer) clearInterval(state.telemetryTimer);
+  state.telemetryTimer = null;
   document.body.classList.remove('connected');
   $('#app').hidden = true;
   $('#login').hidden = false;
@@ -189,6 +194,7 @@ async function stream(generation) {
         const line = frame.split('\n').find(item => item.startsWith('data: '));
         if (!line) continue;
         state.overview = JSON.parse(line.slice(6));
+        if (state.overview.telemetry) state.telemetry = state.overview.telemetry;
         render();
         if (state.view === 'events') loadEvents(true);
       }
@@ -200,6 +206,26 @@ async function stream(generation) {
     setConnection('offline', 'Reconnecting…');
     setTimeout(() => stream(generation), 2000);
   }
+}
+
+async function refreshTelemetry(generation) {
+  if (!state.csrfToken || generation !== state.streamGeneration || state.telemetryInFlight) return;
+  state.telemetryInFlight = true;
+  try {
+    state.telemetry = await api('/api/telemetry');
+    if (state.overview) state.overview.telemetry = state.telemetry;
+    if (state.view === 'dashboard') renderDashboard();
+  } catch (_) {
+    // The one-second loop keeps trying; the last good reading stays visible.
+  } finally {
+    state.telemetryInFlight = false;
+  }
+}
+
+function startTelemetry(generation) {
+  if (state.telemetryTimer) clearInterval(state.telemetryTimer);
+  refreshTelemetry(generation);
+  state.telemetryTimer = setInterval(() => refreshTelemetry(generation), 1000);
 }
 
 function render() {
@@ -226,7 +252,7 @@ function serviceCard(name, online, detail, iconName) {
 
 function renderDashboard() {
   const overview = state.overview;
-  const telemetry = overview.telemetry || {};
+  const telemetry = state.telemetry || overview.telemetry || {};
   const ollama = telemetry.ollama || {};
   const gpu = telemetry.gpu || {};
   const router = telemetry.routing_agent || {};
@@ -236,7 +262,7 @@ function renderDashboard() {
   const attention = jobs.filter(job => ['needs_human', 'blocked', 'failed'].includes(job.status));
   const loaded = ollama.loaded_model || {};
   const model = loaded.name || loaded.model || 'No model loaded';
-  const context = loaded.context_length || gpu.context_length;
+  const context = loaded.context_length || ollama.context_length || gpu.context_length;
   const modelVram = loaded.size_vram || ollama.size_vram;
   const services = [orchestrator?.online, true, ollama.status === 'online', router.status === 'online'];
   const healthyServices = services.filter(Boolean).length;
@@ -247,6 +273,8 @@ function renderDashboard() {
   const vramPercent = vramTotal ? Math.round(vramUsed / vramTotal * 100) : 0;
   const phaseMetrics = overview.phase_metrics || [];
   const slowestPhase = phaseMetrics.reduce((best, item) => Number(item.max_seconds || 0) > Number(best?.max_seconds || 0) ? item : best, null);
+  const ollamaVersion = ollama.version ? `Ollama ${ollama.version}` : 'Ollama version unavailable';
+  const ollamaModels = Array.isArray(ollama.models) ? ollama.models : [];
 
   $('#dashboardView').innerHTML = `
     <div class="grid">
@@ -263,7 +291,7 @@ function renderDashboard() {
     <div class="grid">
       ${serviceCard('Orchestrator', Boolean(orchestrator?.online), orchestrator?.current_action || 'No recent heartbeat', 'route')}
       ${serviceCard('PostgreSQL', true, 'Durable workflow connected', 'database')}
-      ${serviceCard('Ollama', ollama.status === 'online', `${model}${context ? ` · ${context} context` : ''}${modelVram ? ` · ${bytes(modelVram)} VRAM` : ''}`, 'brain')}
+      ${serviceCard('Ollama', ollama.status === 'online', `${ollamaVersion} · ${model}${context ? ` · ${context} context` : ''}${modelVram ? ` · ${bytes(modelVram)} VRAM` : ''}`, 'brain')}
       ${serviceCard('Routing agent', router.status === 'online', router.service || router.status || 'Not configured', 'route')}
     </div>
     <div class="section-head"><div class="section-title"><h2>Compute</h2><small>Local inference capacity and routing</small></div></div>
@@ -273,6 +301,8 @@ function renderDashboard() {
       <article class="card metric"><div class="metric-head"><span>Thermals</span><span class="metric-icon">${icon('thermometer')}</span></div><div><div class="metric-value"><strong>${esc(gpu.temperature_c ?? '—')}</strong><em>°C</em></div><small>${gpu.power_w ? `${esc(gpu.power_w)} watts` : 'Power data unavailable'}</small></div></article>
       <article class="card metric"><div class="metric-head"><span>Inference routes</span><span class="metric-icon">${icon('route')}</span></div><div class="routing-split"><div><b>${overview.inference?.local_requests || 0}</b><small>Local</small></div><div><b>${overview.inference?.cloud_requests || 0}</b><small>Cloud</small></div><div><b>${overview.inference?.fallback_requests || 0}</b><small>Fallback</small></div></div></article>
     </div>
+    <div class="section-head"><div class="section-title"><h2>Ollama detail</h2><small>Read-only data refreshed every second</small></div><span>${esc(ollama.loaded_count || 0)} loaded · ${esc(ollama.model_count || ollamaModels.length || 0)} installed</span></div>
+    <div class="card telemetry-detail"><div class="facts"><div class="fact"><span>API</span>${badge(ollama.status || 'unavailable')}</div><div class="fact"><span>Version</span><strong>${esc(ollama.version || '—')}</strong></div><div class="fact"><span>Loaded model</span><strong>${esc(model)}</strong></div><div class="fact"><span>Processor</span><strong>${esc(loaded.processor || ollama.processor || '—')}</strong></div><div class="fact"><span>Model size</span><strong>${bytes(loaded.size || ollama.size) || '—'}</strong></div><div class="fact"><span>VRAM used by model</span><strong>${bytes(modelVram) || '—'}</strong></div><div class="fact"><span>Context</span><strong>${esc(context || '—')}</strong></div><div class="fact"><span>Keep-alive until</span><strong>${esc(ollama.expires_at || '—')}</strong></div></div><div class="chips">${ollamaModels.slice(0, 24).map(item => `<span class="chip">${esc(item.name || item.model || item.digest || 'model')}</span>`).join('') || '<span class="muted">No installed models reported</span>'}</div></div>
     <div class="section-head"><div class="section-title"><h2>Recent autonomous commits</h2><small>Reviewer-approved checkpoints produced by the team</small></div></div>
     ${commitsList(overview.recent_commits || [])}`;
 }
@@ -565,9 +595,9 @@ async function restoreSession() {
     const session = await api('/api/session');
     if (!session.authenticated) return;
     state.csrfToken = session.csrf_token;
-    [state.overview, state.projects] = await Promise.all([api('/api/overview'), api('/api/projects')]);
+    [state.overview, state.projects, state.telemetry] = await Promise.all([api('/api/overview'), api('/api/projects'), api('/api/telemetry')]);
     document.body.classList.add('connected'); $('#login').hidden = true; $('#app').hidden = false;
-    populateProjects(); showView('dashboard'); stream(++state.streamGeneration);
+    populateProjects(); showView('dashboard'); stream(++state.streamGeneration); startTelemetry(state.streamGeneration);
   } catch (_) { /* no existing session */ }
 }
 restoreSession();
