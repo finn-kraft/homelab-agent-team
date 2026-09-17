@@ -3,6 +3,7 @@ import subprocess
 from pathlib import Path
 import pytest
 from control_center.projects import Project, ProjectCatalog
+from control_center.store import ControlStore
 
 def repository(tmp_path: Path):
     root=tmp_path/"repo";root.mkdir();subprocess.run(["git","init","-q","-b","agents/work"],cwd=root,check=True)
@@ -26,3 +27,15 @@ def test_project_catalog_loads_json_configuration(monkeypatch,tmp_path):
 def test_project_ids_are_safe_and_unique(tmp_path):
     root=repository(tmp_path)
     with pytest.raises(ValueError):ProjectCatalog([Project("../bad","Bad",str(root),"agents/work")])
+
+class Planner:
+    def create_job(self, *args): self.args=args; return 42
+
+def control_store(catalog):
+    store=ControlStore.__new__(ControlStore);store.projects=catalog;store.planner=Planner();return store
+
+def test_control_store_bounds_operator_job_settings(tmp_path):
+    root=repository(tmp_path);store=control_store(ProjectCatalog([Project("demo","Demo",str(root),"agents/work")]))
+    assert store.create({"project_id":"demo","goal":"Implement a safe useful change","priority":10,"max_iterations":50})==42
+    with pytest.raises(ValueError):store.create({"project_id":"demo","goal":"Implement a safe useful change","priority":101})
+    with pytest.raises(ValueError):store.create({"project_id":"demo","goal":"Implement a safe useful change","max_iterations":0})

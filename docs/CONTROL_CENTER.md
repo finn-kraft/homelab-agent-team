@@ -10,7 +10,7 @@ Set a long random `CONTROL_CENTER_TOKEN` through the host secret mechanism. Conf
 the repository allowlist as JSON on one line:
 
 ```text
-CONTROL_CENTER_PROJECTS=[{"id":"align","name":"Align","repository":"/home/finn/work/align","branch":"agents/autonomous-align","roadmap":"docs/roadmap.md"}]
+CONTROL_CENTER_PROJECTS='[{"id":"align","name":"Align","repository":"/home/finn/work/align","branch":"agents/autonomous-align","roadmap":"docs/roadmap.md"}]'
 ```
 
 Only catalogued project IDs can create jobs. Repository paths and branches are selected
@@ -58,3 +58,6 @@ JSON endpoint configured as `GPU_TELEMETRY_URL`; expected fields are:
 ```
 
 Do not point this setting at SSH, a command runner, or a general host-management API.
+
+For a complete install-to-boot command sequence, including the routing service and the
+single `agent-team.target` lifecycle, see [`RUN_THE_TEAM.md`](RUN_THE_TEAM.md).

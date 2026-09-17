@@ -25,6 +25,17 @@ class ControlCenter:
         app = self
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_args): pass
+            def end_headers(self):
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header(
+                    "Content-Security-Policy",
+                    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                    "connect-src 'self'; img-src 'self' data:; object-src 'none'; "
+                    "base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+                )
+                super().end_headers()
             def send_json(self, status, payload):
                 body = json.dumps(payload, default=str).encode()
                 self.send_response(status); self.send_header("Content-Type", "application/json")
@@ -33,7 +44,9 @@ class ControlCenter:
             def send_asset(self, name, content_type):
                 body = files("control_center.static").joinpath(name).read_bytes()
                 self.send_response(200); self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers(); self.wfile.write(body)
             def send_stream(self):
                 self.send_response(200); self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache"); self.send_header("Connection", "keep-alive")

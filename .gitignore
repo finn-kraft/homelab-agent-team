@@ -5,4 +5,4 @@ __pycache__/
 *.pyo
 *.egg-info/
 .pytest_cache/
-
+homelab-routing-agent/routing-agent/config.json

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from agent_core.llm import BackendError, InferenceRouter, LLMResponse, Router
 
 
@@ -77,3 +79,22 @@ def test_legacy_router_default_does_not_escalate_attempt_three():
 
     assert router.choose(3, needs_strong_model=True) is local
     assert router.choose(4) is cloud
+
+
+def test_normal_agent_route_uses_supported_medium_complexity(monkeypatch):
+    captured = {}
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *_args): pass
+        def read(self): return b'{"execution_target":"ollama"}'
+    def open_request(request, timeout):
+        captured.update(json.loads(request.data))
+        return Response()
+    monkeypatch.setattr("urllib.request.urlopen", open_request)
+    router = InferenceRouter(
+        Backend("ollama"), Backend("openrouter"), router_url="http://router.invalid",
+        caller_agent="coder-agent", task_type="code_implementation",
+    )
+
+    assert router._route_request(1, False)["execution_target"] == "ollama"
+    assert captured["complexity"] == "medium"

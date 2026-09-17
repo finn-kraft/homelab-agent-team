@@ -1,7 +1,8 @@
 [Unit]
 Description=Homelab Agent Team Control Center
-After=network-online.target postgresql.service
+After=network-online.target postgresql.service agent-orchestrator.service
 Wants=network-online.target
+PartOf=agent-team.target
 
 [Service]
 Type=simple

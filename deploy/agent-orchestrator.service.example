@@ -1,7 +1,8 @@
 [Unit]
 Description=Homelab Agent Team Orchestrator
-After=network-online.target postgresql.service
+After=network-online.target postgresql.service homelab-routing-agent.service
 Wants=network-online.target
+PartOf=agent-team.target
 
 [Service]
 Type=simple

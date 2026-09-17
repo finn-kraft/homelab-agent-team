@@ -1,0 +1,21 @@
+[Unit]
+Description=Homelab Agent Team Inference Router
+After=network-online.target
+Wants=network-online.target
+PartOf=agent-team.target
+
+[Service]
+Type=simple
+User=finn
+WorkingDirectory=/home/finn/homelab-ai/dev-team/homelab-routing-agent/routing-agent
+EnvironmentFile=-/home/finn/homelab-ai/dev-team/.env
+ExecStart=/home/finn/homelab-ai/dev-team/.venv/bin/python -m uvicorn routing_agent.api:app --host 127.0.0.1 --port 8090
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

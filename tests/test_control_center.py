@@ -33,3 +33,11 @@ def test_static_dashboard_contains_primary_operator_workflow():
     assert "Start a new job" in html
     assert all(stage in html for stage in ("Planner", "Coder", "Reviewer", "Verification", "Commit"))
     assert "/api/stream" in script and "Needs attention" in script
+
+def test_dashboard_uses_accessible_delegated_controls():
+    from importlib.resources import files
+    html = files("control_center.static").joinpath("index.html").read_text()
+    script = files("control_center.static").joinpath("app.js").read_text()
+    assert "aria-label=\"Primary navigation\"" in html
+    assert "onclick=" not in html and "onclick=\"" not in script
+    assert "data-action=\"job-action\"" in script

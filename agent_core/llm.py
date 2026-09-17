@@ -168,7 +168,7 @@ class InferenceRouter(Router):
             # External routing API uses one-based attempts.  Planner's first
             # call historically reports zero prior failures, so normalize it.
             "attempt": max(1, int(attempt)),
-            "complexity": "heavy" if needs_strong_model else "ordinary",
+            "complexity": "heavy" if needs_strong_model else "medium",
             "privacy_sensitive": self.privacy_sensitive,
             "needs_strong_model": bool(needs_strong_model),
         }
