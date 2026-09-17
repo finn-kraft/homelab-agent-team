@@ -30,6 +30,39 @@ def test_remove_requires_confirmation_and_returns_removed(app):
     with pytest.raises(PermissionError): app.perform_action(1, "remove", {})
     assert app.perform_action(1, "remove", {"confirm": True}) == {"status": "removed"}
 
+
+def test_control_actions_record_operation_lifecycle():
+    class OperationStore(Store):
+        def __init__(self):
+            super().__init__(); self.operation_updates = []
+        def begin_operation(self, job, action, requested_by):
+            self.calls.append((job, action, requested_by)); return "op-123"
+        def update_operation(self, operation_id, status, detail=None, error=None):
+            self.operation_updates.append((operation_id, status, detail, error))
+
+    store = OperationStore()
+    value = ControlCenter(store, Telemetry(), Auth()).perform_action(
+        7, "cancel", {"confirm": True}
+    )
+    assert value["operation_id"] == "op-123"
+    assert value["operation_status"] == "applied"
+    assert [item[1] for item in store.operation_updates] == ["accepted", "applied"]
+
+
+def test_control_action_failure_is_bound_to_operation():
+    class FailingStore(Store):
+        def begin_operation(self, *_args): return "op-failed"
+        def update_operation(self, operation_id, status, detail=None, error=None):
+            self.calls.append((operation_id, status, error))
+        def action(self, *_args): raise RuntimeError("lease is still held")
+
+    from control_center.app import OperationFailed
+    store = FailingStore()
+    with pytest.raises(OperationFailed) as raised:
+        ControlCenter(store, Telemetry(), Auth()).perform_action(7, "pause", {})
+    assert raised.value.operation_id == "op-failed"
+    assert store.calls[-1][1] == "failed"
+
 def test_dashboard_has_no_arbitrary_command_or_filesystem_api():
     from importlib.resources import files
     html = files("control_center.static").joinpath("index.html").read_text()

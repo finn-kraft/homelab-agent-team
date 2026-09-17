@@ -46,6 +46,13 @@ routing/privacy/cost/latency policies; persisted circuit breakers and health
 probes; fixed-fixture model evaluations; environment-aware verification
 discovery; and process-group termination with bounded, hashed command evidence.
 
+Items 21–25 are implemented in this checkout as the operator-control
+milestone: checkpoint failure-injection coverage, protected mission-branch
+integration with conflict escalation, durable operation IDs, recovery actions,
+and live lease / heartbeat / phase / model-call observability. Item 33
+(disposable PostgreSQL integration and failure-injection coverage) was completed
+by the operator and is recorded as complete below.
+
 ## P0 — reliability before unattended operation
 
 1. Fix durable phase truth so status, phase, current step, and the dashboard
@@ -96,18 +103,18 @@ discovery; and process-group termination with bounded, hashed command evidence.
     project-specific scripts.
 20. Terminate command process groups and persist bounded, reproducible test
     artifacts.
-21. Add checkpoint fault-injection tests for commit-before-database-update,
+21. [x] Add checkpoint fault-injection tests for commit-before-database-update,
     staging, push, and integration failures.
-22. Finish safe mission-branch integration with explicit conflict and human
+22. [x] Finish safe mission-branch integration with explicit conflict and human
     escalation states.
 
 ## P2 — Control Center and operations
 
-23. Return operation IDs and show submitted, accepted, applied, and failed
+23. [x] Return operation IDs and show submitted, accepted, applied, and failed
     states for every job action.
-24. Add retry, recover-lease, rerun-verification, refresh-planning, and
+24. [x] Add retry, recover-lease, rerun-verification, refresh-planning, and
     worktree-cleanup operator actions.
-25. Show heartbeat age, lease ownership, phase duration, model-call age,
+25. [x] Show heartbeat age, lease ownership, phase duration, model-call age,
     current command, and stale-data warnings.
 26. Add historical GPU/Ollama/inference charts, event correlation IDs, replayable
     SSE updates, and alerting.
@@ -125,7 +132,7 @@ discovery; and process-group termination with bounded, hashed command evidence.
 ## P3 — maintainability and polish
 
 32. Add CI for tests, linting, type checking, packaging, and migration checks.
-33. Add disposable PostgreSQL integration tests and failure-injection suites.
+33. [x] Add disposable PostgreSQL integration tests and failure-injection suites.
 34. Remove obsolete compatibility copies after migration is complete.
 35. Add structured logging, rotation, backup/restore, disaster recovery, and
     corrupted-worktree runbooks.

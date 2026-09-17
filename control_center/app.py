@@ -18,6 +18,15 @@ WORKFLOW_ACTION_ERROR = (
 )
 
 
+class OperationFailed(RuntimeError):
+    """An operator action was accepted but could not be applied."""
+
+    def __init__(self, operation_id: str, detail: str):
+        super().__init__(detail)
+        self.operation_id = operation_id
+        self.detail = detail
+
+
 class ControlCenter:
     def __init__(self, store, telemetry, auth: AuthManager):
         self.store, self.telemetry, self.auth = store, telemetry, auth
@@ -26,15 +35,63 @@ class ControlCenter:
         return {**self.store.overview(), "telemetry": self.telemetry.snapshot()}
 
     def perform_action(self, job_id, action, data):
-        if action not in {"pause", "resume", "cancel", "remove"}:
+        if action not in {"pause", "resume", "cancel", "remove", "retry",
+                          "recover-lease", "rerun-verification", "refresh-planning"}:
             raise ValueError("unsupported action")
         if action in {"cancel", "remove"} and data.get("confirm") is not True:
             raise PermissionError("confirmation_required")
-        if action == "remove":
-            self.store.remove_job(job_id)
-            return {"status": "removed"}
-        self.store.action(job_id, action)
-        return {"status": action}
+
+        # Older test doubles and pre-0011 databases do not expose operation
+        # tracking. Keep their compact response contract while the production
+        # store gets a durable submitted -> accepted -> applied record.
+        begin = getattr(self.store, "begin_operation", None)
+        if begin is None:
+            if action == "remove":
+                self.store.remove_job(job_id)
+                return {"status": "removed"}
+            if action in {"pause", "resume", "cancel"}:
+                self.store.action(job_id, action)
+                return {"status": action}
+            method = {
+                "retry": "retry", "recover-lease": "recover_lease",
+                "rerun-verification": "rerun_verification",
+                "refresh-planning": "refresh_planning",
+            }[action]
+            getattr(self.store, method)(job_id, data.get("step_id")) if action == "rerun-verification" else getattr(self.store, method)(job_id)
+            return {"status": action}
+
+        operation_id = begin(job_id, action, data.get("requested_by", "control-center"))
+        update = getattr(self.store, "update_operation", None)
+        try:
+            if update:
+                update(operation_id, "accepted")
+            if action == "remove":
+                self.store.remove_job(job_id)
+                result = {"status": "removed"}
+            elif action in {"pause", "resume", "cancel"}:
+                self.store.action(job_id, action)
+                result = {"status": action}
+            else:
+                method = {
+                    "retry": "retry", "recover-lease": "recover_lease",
+                    "rerun-verification": "rerun_verification",
+                    "refresh-planning": "refresh_planning",
+                }[action]
+                if action == "rerun-verification":
+                    detail = getattr(self.store, method)(job_id, data.get("step_id"))
+                else:
+                    detail = getattr(self.store, method)(job_id)
+                result = {"status": action, "detail": detail}
+            if update:
+                update(operation_id, "applied", detail=result)
+            return {**result, "operation_id": operation_id, "operation_status": "applied"}
+        except Exception as exc:
+            if update:
+                try:
+                    update(operation_id, "failed", error=str(exc))
+                except Exception:
+                    LOGGER.exception("control_operation_record_failed operation_id=%s", operation_id)
+            raise OperationFailed(operation_id, str(exc)) from exc
 
     @staticmethod
     def _cookie_token(header: str | None) -> str | None:
@@ -164,6 +221,15 @@ class ControlCenter:
                     if parsed.path == "/api/human-queue":
                         status = parse_qs(parsed.query).get("status", ["open"])[0]
                         return self.send_json(200, app.store.human_queue(status))
+                    if parsed.path == "/api/operations":
+                        job_id = parse_qs(parsed.query).get("job_id", [None])[0]
+                        return self.send_json(200, app.store.operations(int(job_id) if job_id else None))
+                    if parsed.path.startswith("/api/operations/"):
+                        operation_id = parsed.path.rsplit("/", 1)[1]
+                        result = app.store.operation(operation_id)
+                        if result is None:
+                            raise KeyError(operation_id)
+                        return self.send_json(200, result)
                     if parsed.path.startswith("/api/missions/"):
                         return self.send_json(200, app.store.mission(int(parsed.path.rsplit("/", 1)[1])))
                     if parsed.path == "/api/stream":
@@ -236,9 +302,38 @@ class ControlCenter:
                     if len(parts) == 4 and parts[:2] == ["api", "human-queue"] and parts[3] == "answer":
                         app.store.answer_human_request(int(parts[2]), data["answer"])
                         return self.send_json(200, {"status": "answered"})
+                    if parts == ["api", "worktrees", "cleanup"]:
+                        if data.get("confirm") is not True:
+                            return self.send_json(409, {"error": "confirmation_required"})
+                        begin = getattr(app.store, "begin_operation", None)
+                        if begin is None:
+                            return self.send_json(200, {"status": "cleaned", "detail": app.store.cleanup_worktrees()})
+                        operation_id = begin(None, "cleanup-worktrees", data.get("requested_by", "control-center"))
+                        update = getattr(app.store, "update_operation", None)
+                        try:
+                            if update:
+                                update(operation_id, "accepted")
+                            detail = app.store.cleanup_worktrees()
+                            result = {"status": "cleaned", "detail": detail}
+                            if update:
+                                update(operation_id, "applied", detail=result)
+                            return self.send_json(200, {**result, "operation_id": operation_id,
+                                                        "operation_status": "applied"})
+                        except Exception as exc:
+                            if update:
+                                update(operation_id, "failed", error=str(exc))
+                            return self.send_json(503, {"error": "workflow_action_failed",
+                                                        "operation_id": operation_id,
+                                                        "operation_status": "failed", "detail": str(exc)})
                     return self.send_json(404, {"error": "not_found"})
                 except (KeyError, ValueError, json.JSONDecodeError):
                     return self.send_json(400, {"error": "invalid_request"})
+                except OperationFailed as exc:
+                    LOGGER.exception("control_operation_failed operation_id=%s", exc.operation_id)
+                    return self.send_json(503, {
+                        "error": "workflow_action_failed", "operation_id": exc.operation_id,
+                        "operation_status": "failed", "detail": exc.detail,
+                    })
                 except Exception:
                     LOGGER.exception("control_center_write_failed path=%s", parsed.path)
                     return self.send_json(503, {
