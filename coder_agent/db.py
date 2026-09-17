@@ -123,14 +123,19 @@ class Store:
             row = connection.execute("""INSERT INTO engineering_sessions
                 (job_id,step_id,worker_id,starting_commit) VALUES(%s,%s,%s,%s) RETURNING id""",
                 (job_id, step_id, worker_id, starting_commit)).fetchone()
-            return row["id"]
+            # ``coder_agent.Store.connect`` intentionally uses psycopg's
+            # default tuple row factory (the legacy claim path relies on
+            # positional access).  Keep the V2 session helpers consistent
+            # with that contract; indexing a tuple by ``"id"`` crashes the
+            # orchestrator before the model gets its first turn.
+            return row[0]
 
     def resume_engineering_session(self, job_id, step_id=None):
         with self.connect() as connection:
             row = connection.execute("""SELECT id FROM engineering_sessions WHERE job_id=%s
                 AND (%s IS NULL OR step_id=%s) AND completed_at IS NULL
                 ORDER BY updated_at DESC LIMIT 1""", (job_id, step_id, step_id)).fetchone()
-            return row["id"] if row else None
+            return row[0] if row else None
 
     def record_engineering_action(self, session_id, sequence, action, observation="",
                                   model=None, progress_classification=None):
