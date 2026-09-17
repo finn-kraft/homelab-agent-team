@@ -53,6 +53,11 @@ and live lease / heartbeat / phase / model-call observability. Item 33
 (disposable PostgreSQL integration and failure-injection coverage) was completed
 by the operator and is recorded as complete below.
 
+Items 26–27 are implemented as the observability and session-hardening
+milestone: persisted one-second telemetry history with dashboard charts and
+alerts, correlation-aware resumable SSE, role-aware expiring sessions, write
+rate limiting, HSTS guidance, and a read-only secret-redaction audit.
+
 ## P0 — reliability before unattended operation
 
 1. Fix durable phase truth so status, phase, current step, and the dashboard
@@ -116,9 +121,9 @@ by the operator and is recorded as complete below.
     worktree-cleanup operator actions.
 25. [x] Show heartbeat age, lease ownership, phase duration, model-call age,
     current command, and stale-data warnings.
-26. Add historical GPU/Ollama/inference charts, event correlation IDs, replayable
+26. [x] Add historical GPU/Ollama/inference charts, event correlation IDs, replayable
     SSE updates, and alerting.
-27. Add stronger session management, roles, write rate limits, TLS guidance,
+27. [x] Add stronger session management, roles, write rate limits, TLS guidance,
     secret redaction audits, and production authentication options.
 
 ## P2 — missions and roadmap management

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import uuid
 from contextlib import contextmanager
 
 
@@ -131,4 +132,4 @@ class ReviewerStore:
     def issues(self,id):
         with self.connect() as c:return list(c.execute("SELECT * FROM review_issues WHERE step_id=%s ORDER BY id",(id,)).fetchall())
     @staticmethod
-    def _event(c,job,step,event,payload):c.execute("INSERT INTO events(job_id,step_id,agent,event_type,structured_payload) VALUES(%s,%s,'reviewer-agent',%s,%s)",(job,step,event,json.dumps(payload)))
+    def _event(c,job,step,event,payload):c.execute("INSERT INTO events(job_id,step_id,agent,event_type,structured_payload,correlation_id) VALUES(%s,%s,'reviewer-agent',%s,%s,%s)",(job,step,event,json.dumps(payload),str(uuid.uuid4())))

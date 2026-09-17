@@ -77,6 +77,9 @@ def test_static_dashboard_contains_primary_operator_workflow():
     assert "(Coder)" not in html and "EngineeringAgent" in script
     assert "data-job-action=\"cancel\" data-job-id" in script
     assert "/api/stream" in script and "Needs attention" in script
+    assert "/api/telemetry/history" in script and "Telemetry history" in script
+    assert "Last-Event-ID" in script and "lastEventId" in script
+    assert "/api/security/audit" in script or "security/audit" in html
     assert "/api/login" in script and "Control Center password" in html
     assert "Remove from queue" in script and "data-job-action=\"remove\"" in script
     assert "engineering-agent-v3-controls" in html

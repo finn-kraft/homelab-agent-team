@@ -40,6 +40,10 @@ again after login.
 
 `GET /health` is an unauthenticated readiness endpoint exposing only `ok` or `degraded`.
 All `/api/*` endpoints require the HttpOnly session cookie and CSRF header for writes.
+Sessions have configurable absolute and idle expiry (`CONTROL_CENTER_SESSION_TTL_SECONDS`
+and `CONTROL_CENTER_SESSION_IDLE_SECONDS`), bind to the client address, and expose a
+role (`admin`, `operator`, or read-only `viewer`) through `/api/session`. Authenticated
+writes are rate limited per session; a `429` response includes `Retry-After`.
 Cancel and Remove from queue require explicit confirmation. Remove is available for
 any job that is not already cancelled: it stops new claims, releases active leases,
 clears stale blockers and open human requests, and keeps the job's audit history while
@@ -48,12 +52,20 @@ removing it from the active queue.
 ## Live state
 
 The browser uses an authenticated streaming `fetch` to `/api/stream`. The server emits
-workflow snapshots every five seconds using Server-Sent Events. GPU and Ollama telemetry
+workflow snapshots every five seconds using Server-Sent Events, with monotonically
+increasing event IDs and `Last-Event-ID` replay of missed workflow events. GPU and Ollama telemetry
 has its own authenticated `/api/telemetry` endpoint and is polled by the dashboard every
 second, so fast-changing utilization, temperature, power, VRAM, model allocation, and
 Ollama process data do not wait for the slower workflow refresh. Reconnects read fresh
 PostgreSQL state; terminal output is never scraped. Orchestrator writes a durable worker
 heartbeat so online/offline is objective.
+
+Telemetry samples are persisted at one-second resolution and are available at
+`/api/telemetry/history`. The dashboard renders recent GPU utilization and temperature
+history and raises alerts for high temperature, capacity utilization, unavailable
+inference, and stale workflow leases. The read-only `/api/security/audit` endpoint
+scans recent event, command, and operator records for credential patterns without
+returning matched values.
 
 The job page combines steps with reviews, verification runs, safe command metadata,
 model routes, and checkpoint records. It shows the same-step `changes_requested` loop as
@@ -79,3 +91,12 @@ If `GPU_TELEMETRY_URL` is unset, a fixed local `nvidia-smi` query is used when p
 
 For a complete install-to-boot command sequence, including the routing service and the
 single `agent-team.target` lifecycle, see [`RUN_THE_TEAM.md`](RUN_THE_TEAM.md).
+
+## Production exposure
+
+Set `CONTROL_CENTER_COOKIE_SECURE=true` only when serving the dashboard over HTTPS;
+the service then emits HSTS and marks the session cookie `Secure`. Keep the listener
+on loopback behind a TLS reverse proxy where possible, or firewall a LAN binding to
+trusted operator addresses. The built-in server is not a replacement for a mature
+identity provider in multi-user deployments; use a reverse proxy and
+`CONTROL_CENTER_ROLE=viewer` for read-only access.
