@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 from orchestrator.checkpoint import CheckpointService
-from orchestrator.verification import VerificationService
+from orchestrator.verification import VerificationConfig, VerificationService
 
 
 def git(root: Path, *argv: str) -> str:
@@ -147,3 +148,44 @@ def test_checkpoint_refuses_unreviewed_and_secret_changes(tmp_path: Path):
     )
     assert not secret.success
     assert "secret scan found" in secret.message
+
+
+def test_verification_infers_python_environment_command(tmp_path: Path):
+    root, _ = repository(tmp_path)
+    (root / "pyproject.toml").write_text("[project]\nname='fixture'\n")
+    git(root, "add", "pyproject.toml")
+    git(root, "commit", "-qm", "declare python project")
+    start = git(root, "rev-parse", "HEAD").strip()
+    commands = VerificationService().discover_commands(root, starting_commit=start)
+    assert len(commands) == 1
+    assert commands[0].argv == ("pytest", "-q")
+    assert commands[0].source == "inferred:python"
+
+
+def test_verification_infers_node_rust_and_go_commands(tmp_path: Path):
+    for filename, contents, expected in (
+        ("package.json", '{"scripts":{"test":"node test.js"}}', ("npm", "test")),
+        ("Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n", ("cargo", "test")),
+        ("go.mod", "module example.invalid/fixture\n\ngo 1.22\n", ("go", "test", "./...")),
+    ):
+        root, _ = repository(tmp_path / filename.replace(".", "-"))
+        (root / filename).write_text(contents)
+        git(root, "add", filename)
+        git(root, "commit", "-qm", f"declare {filename} project")
+        start = git(root, "rev-parse", "HEAD").strip()
+        commands = VerificationService().discover_commands(root, starting_commit=start)
+        assert commands[0].argv == expected
+
+
+def test_verification_terminates_timeout_and_records_output_digests(tmp_path: Path):
+    root, start = repository(tmp_path)
+    service = VerificationService(VerificationConfig(timeout_seconds=1))
+    result = service._run(
+        root,
+        (sys.executable, "-c", "import time; print('started'); time.sleep(30)"),
+        source="test:timeout",
+    )
+    assert result.timed_out is True
+    assert result.exit_code == 124
+    assert result.stdout_sha256 and result.stderr_sha256
+    assert result.duration_seconds < 5

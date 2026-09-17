@@ -4,8 +4,15 @@ import json
 from typing import Any
 
 from agent_core.models import PlannerDecision
-from agent_core.prompt_budget import bounded_messages, bounded_text, message_chars
+from agent_core.prompt_budget import (
+    bounded_messages,
+    bounded_text,
+    estimate_tokens,
+    hash_text,
+    message_chars,
+)
 from agent_core.llm import BackendError
+from agent_core.trust import mark_untrusted
 from .decision import InvalidDecision, completion_is_supported, parse_decision
 from .inspector import InspectionError, ReadOnlyRepositoryInspector
 from .prompt import SYSTEM_PROMPT
@@ -15,13 +22,18 @@ class PlannerAgent:
     def __init__(self, store, router, inspector: ReadOnlyRepositoryInspector,
                  worker_id: str, lease_seconds: int = 300, decision_retries: int = 3,
                  escalation_attempt: int = 4, max_context_chars: int = 120_000,
-                 max_package_steps: int = 3):
+                 max_package_steps: int = 3, max_context_tokens: int | None = None):
         self.store, self.router, self.inspector = store, router, inspector
         self.worker_id, self.lease_seconds = worker_id, lease_seconds
         self.decision_retries, self.escalation_attempt = decision_retries, escalation_attempt
         self.max_context_chars = max(16_000, int(max_context_chars))
+        self.max_context_tokens = (
+            max(256, int(max_context_tokens)) if max_context_tokens is not None else None
+        )
         self.max_package_steps = max(1, min(5, int(max_package_steps)))
         self.last_prompt_chars = 0
+        self.last_prompt_tokens = 0
+        self.last_context_sha256: str | None = None
         # Observability only: the deterministic Orchestrator uses this after a
         # bounded call to persist model-routing metadata without scraping logs.
         self.last_job_id: int | None = None
@@ -29,6 +41,8 @@ class PlannerAgent:
     def plan_once(self) -> PlannerDecision | None:
         self.last_job_id = None
         self.last_prompt_chars = 0
+        self.last_prompt_tokens = 0
+        self.last_context_sha256 = None
         job = self.store.claim_job(self.worker_id, self.lease_seconds)
         if not job:
             return None
@@ -75,8 +89,12 @@ class PlannerAgent:
                     route_attempt = failed_attempts + repair_attempt + 1
                     backend = self.router.choose(
                         route_attempt, route_attempt >= self.escalation_attempt)
-                    request_messages = bounded_messages(messages, self.max_context_chars)
+                    request_messages = bounded_messages(
+                        messages, self.max_context_chars, self.max_context_tokens
+                    )
                     self.last_prompt_chars = message_chars(request_messages)
+                    self.last_prompt_tokens = estimate_tokens(request_messages)
+                    self.last_context_sha256 = hash_text(json.dumps(request_messages, default=str))
                     response = backend.complete(request_messages)
                 except BackendError as exc:
                     backend_errors.append(str(exc))
@@ -144,7 +162,7 @@ class PlannerAgent:
     def _context_json(self, context: dict[str, Any]) -> str:
         encoded = json.dumps(context, default=str)
         if len(encoded) <= self.max_context_chars:
-            return encoded
+            return self._finalize_context(encoded)
         compact = {
             "job": context.get("job", {}),
             "repository_evidence": {
@@ -161,7 +179,10 @@ class PlannerAgent:
                 "repository_files": context.get("repository_evidence", {}).get("repository_files", [])[:200],
             },
             "steps": context.get("steps", []),
-            "recent_events": context.get("recent_events", [])[-5:],
+            # ``context`` is loaded newest-first from PostgreSQL; preserve the
+            # newest evidence when compacting rather than retaining stale
+            # events merely because they happen to be at the list tail.
+            "recent_events": context.get("recent_events", [])[:5],
             "rules": context.get("rules", {}),
             "context_notice": "Large planning history was truncated; inspect the repository and active steps directly.",
         }
@@ -170,13 +191,18 @@ class PlannerAgent:
         # retain valid JSON if a caller supplies pathological metadata.
         encoded = json.dumps(compact, default=str)
         if len(encoded) <= self.max_context_chars:
-            return encoded
-        return json.dumps({
+            return self._finalize_context(encoded)
+        return self._finalize_context(json.dumps({
             "job_id": context.get("job", {}).get("id"),
             "step_count": len(context.get("steps", [])),
             "event_count": len(context.get("recent_events", [])),
             "context_notice": "Planning context was truncated to stay within the model budget.",
-        }, default=str)
+        }, default=str))
+
+    def _finalize_context(self, encoded: str) -> str:
+        """Record only a digest of the exact bounded context sent to a model."""
+        self.last_context_sha256 = hash_text(encoded)
+        return encoded
 
     @staticmethod
     def _bounded_text(value: Any, limit: int) -> str:
@@ -186,10 +212,18 @@ class PlannerAgent:
     def _bounded_repository(cls, repository: dict[str, Any]) -> dict[str, Any]:
         result = dict(repository)
         result["documents"] = {
-            str(name): cls._bounded_text(value, 10_000)
+            str(name): mark_untrusted(cls._bounded_text(value, 10_000), f"repository-document:{name}")
             for name, value in dict(repository.get("documents") or {}).items()
         }
-        result["repository_files"] = list(repository.get("repository_files") or [])[:500]
+        result["repository_files"] = mark_untrusted(
+            list(repository.get("repository_files") or [])[:500], "repository-inventory", 2_000
+        )
+        result["git_status"] = mark_untrusted(
+            list(repository.get("git_status") or [])[:100], "git-status", 2_000
+        )
+        result["recent_history"] = mark_untrusted(
+            list(repository.get("recent_history") or [])[:20], "git-history", 2_000
+        )
         return result
 
     @classmethod
@@ -209,7 +243,9 @@ class PlannerAgent:
         for event in list(events)[:20]:
             value = dict(event)
             if "structured_payload" in value:
-                value["structured_payload"] = cls._bounded_text(value["structured_payload"], 3_000)
+                value["structured_payload"] = mark_untrusted(
+                    cls._bounded_text(value["structured_payload"], 3_000), "event-payload", 3_000
+                )
             bounded.append(value)
         return bounded
 

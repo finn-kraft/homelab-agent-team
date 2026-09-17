@@ -4,7 +4,10 @@ from pathlib import Path
 import pytest
 
 from agent_core.llm import LLMResponse
-from agent_core.prompt_budget import bounded_json, bounded_messages, bounded_text, message_chars
+from agent_core.prompt_budget import (
+    bounded_json, bounded_messages, bounded_text, context_snapshot,
+    estimate_tokens, message_chars,
+)
 from coder_agent.agent import CoderAgent
 from coder_agent.cli import _engineering_turn_limit
 from coder_agent.db import Store
@@ -54,6 +57,17 @@ def test_prompt_budget_truncation_includes_marker_without_exceeding_limit():
     assert len(bounded_text("x" * 100, 8)) <= 8
     assert len(bounded_text("x" * 100, 1)) <= 1
     assert len(bounded_json({"payload": "x" * 100}, 32)) <= 32
+
+
+def test_prompt_budget_can_enforce_token_ceiling_and_hash_snapshot():
+    messages = [{"role": "system", "content": "rules"},
+                {"role": "user", "content": "x" * 10_000}]
+    bounded = bounded_messages(messages, 10_000, max_tokens=100)
+    assert estimate_tokens(bounded) <= 100
+    snapshot = context_snapshot({"messages": messages}, max_chars=10_000, max_tokens=100)
+    assert snapshot["truncated"] is True
+    assert len(snapshot["sha256"]) == 64
+    assert snapshot["tokens"] <= 100
 
 
 class _FakeCursor:

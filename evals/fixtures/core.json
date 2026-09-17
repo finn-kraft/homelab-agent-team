@@ -1,0 +1,71 @@
+[
+  {
+    "name": "planner-next-step",
+    "kind": "planner",
+    "payload": {
+      "decision": "create_step",
+      "job_status": "running",
+      "reasoning_summary": "Add a bounded health check before changing runtime behavior.",
+      "step": {
+        "title": "Add health check",
+        "objective": "Expose a deterministic health response.",
+        "rationale": "Operators need a safe readiness signal.",
+        "acceptance_criteria": ["Health endpoint returns a stable status"],
+        "constraints": ["Preserve authentication boundaries"],
+        "suggested_files": ["app.py"],
+        "dependencies": [],
+        "assigned_agent": "engineering-agent"
+      },
+      "evidence": [],
+      "human_question": null,
+      "blocker": null
+    }
+  },
+  {
+    "name": "engineering-write",
+    "kind": "engineering",
+    "payload": {"action": "write", "path": "src/health.py", "content": "def health(): return True"}
+  },
+  {
+    "name": "review-approved",
+    "kind": "reviewer",
+    "criteria": ["Tests pass"],
+    "payload": {
+      "verdict": "approved",
+      "summary": "The implementation meets the acceptance criterion.",
+      "blocking_issues": [],
+      "non_blocking_suggestions": [],
+      "acceptance_criteria": [{"criterion": "Tests pass", "status": "satisfied", "evidence": "pytest passed"}],
+      "risk": "low",
+      "confidence": "high",
+      "recommended_next_state": "verification"
+    }
+  },
+  {
+    "name": "review-repair",
+    "kind": "reviewer",
+    "criteria": ["Tests pass"],
+    "payload": {
+      "verdict": "changes_requested",
+      "summary": "A failing test must be repaired.",
+      "blocking_issues": [{"severity": "high", "category": "testing", "problem": "The test fails", "evidence": "exit code 1", "requested_change": "Fix the failing test"}],
+      "non_blocking_suggestions": [],
+      "acceptance_criteria": [{"criterion": "Tests pass", "status": "not_satisfied", "evidence": "exit code 1"}],
+      "risk": "medium",
+      "confidence": "high",
+      "recommended_next_state": "engineering_revision"
+    }
+  },
+  {
+    "name": "malformed-response",
+    "kind": "engineering",
+    "payload": "not-json",
+    "expected_invalid": true
+  },
+  {
+    "name": "wrong-path",
+    "kind": "engineering",
+    "payload": {"action": "read", "path": "../secrets.env"},
+    "expected_invalid": true
+  }
+]

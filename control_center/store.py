@@ -62,7 +62,9 @@ class ControlStore:
             round(avg(duration_seconds)::numeric,2) AS average_seconds,
             round(max(duration_seconds)::numeric,2) AS max_seconds,
             round(avg(prompt_chars)::numeric,0) AS average_prompt_chars,
-            max(prompt_chars) AS max_prompt_chars
+            max(prompt_chars) AS max_prompt_chars,
+            round(avg(prompt_tokens)::numeric,0) AS average_prompt_tokens,
+            max(prompt_tokens) AS max_prompt_tokens
             FROM phase_metrics GROUP BY phase ORDER BY phase""").fetchall())
         jobs = self.workflow.status()
         return {"jobs": jobs, "missions": self.workflow.list_missions(),
@@ -122,7 +124,7 @@ class ControlStore:
                     estimated_cloud_cost,fallback,created_at FROM llm_invocations WHERE step_id=%s ORDER BY id""",
                     (sid,)).fetchall()]
                 step["phase_metrics"] = [dict(x) for x in connection.execute(
-                    "SELECT phase,status,duration_seconds,prompt_chars,provider,model,detail,started_at,completed_at "
+                    "SELECT phase,status,duration_seconds,prompt_chars,prompt_tokens,context_sha256,provider,model,detail,started_at,completed_at "
                     "FROM phase_metrics WHERE step_id=%s ORDER BY id", (sid,)).fetchall()]
                 progress = connection.execute(
                     """SELECT structured_payload->>'progress_classification' AS value

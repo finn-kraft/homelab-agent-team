@@ -9,10 +9,51 @@ is reached.
 from __future__ import annotations
 
 import json
+import hashlib
 from typing import Any
 
 
 DEFAULT_PROMPT_CHARS = 120_000
+
+
+def estimate_tokens(value: Any) -> int:
+    """Estimate model tokens without requiring a provider-specific tokenizer.
+
+    Four UTF-8 characters per token is intentionally conservative for the
+    mixed code/prose prompts used by the team. Providers still enforce their
+    own hard limits; this keeps our request and telemetry budgets deterministic
+    across local Ollama and OpenRouter.
+    """
+    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+        text = "\n".join(str(item.get("content", "")) for item in value)
+    elif isinstance(value, (dict, list, tuple)):
+        text = json.dumps(value, default=str)
+    else:
+        text = str(value or "")
+    return max(0, (len(text.encode("utf-8", "replace")) + 3) // 4)
+
+
+def hash_text(value: Any) -> str:
+    """Return a stable digest for correlating bounded prompt snapshots."""
+    return hashlib.sha256(str(value or "").encode("utf-8", "replace")).hexdigest()
+
+
+def context_snapshot(value: Any, *, max_chars: int, max_tokens: int | None = None,
+                     label: str = "context") -> dict[str, Any]:
+    """Serialize bounded context and retain a non-sensitive correlation hash."""
+    char_limit = max(1, int(max_chars))
+    if max_tokens is not None:
+        char_limit = min(char_limit, max(1, int(max_tokens) * 4 - 4))
+    serialized = json.dumps(value, default=str)
+    bounded = bounded_text(serialized, char_limit)
+    return {
+        "text": bounded,
+        "sha256": hash_text(bounded),
+        "chars": len(bounded),
+        "tokens": estimate_tokens(bounded),
+        "truncated": bounded != serialized,
+        "label": label,
+    }
 
 
 def bounded_text(value: Any, limit: int, marker: str = "[TRUNCATED]") -> str:
@@ -53,7 +94,8 @@ def bounded_json(value: Any, limit: int, label: str = "context") -> str:
     return json.dumps({"context_notice": f"{label} omitted"})
 
 
-def bounded_messages(messages: list[dict[str, str]], limit: int) -> list[dict[str, str]]:
+def bounded_messages(messages: list[dict[str, str]], limit: int,
+                     max_tokens: int | None = None) -> list[dict[str, str]]:
     """Keep a message list within a strict character budget.
 
     The first system message and newest turns are the most useful. Older
@@ -61,6 +103,8 @@ def bounded_messages(messages: list[dict[str, str]], limit: int) -> list[dict[st
     truncated only if it cannot fit by itself.
     """
     limit = max(1, int(limit))
+    if max_tokens is not None:
+        limit = min(limit, max(1, int(max_tokens) * 4 - 4))
     if not messages:
         return []
 

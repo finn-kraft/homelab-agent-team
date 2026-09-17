@@ -7,7 +7,8 @@ from contextlib import contextmanager
 
 from .decision import InvalidReview, parse_review
 from .prompt import SYSTEM_PROMPT
-from agent_core.prompt_budget import bounded_messages, bounded_text, message_chars
+from agent_core.prompt_budget import bounded_messages, bounded_text, estimate_tokens, hash_text, message_chars
+from agent_core.trust import mark_untrusted
 
 
 LOG = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ class ReviewerAgent:
         max_attempts=5,
         large_diff_escalates=True,
         max_context_chars=120_000,
+        max_context_tokens: int | None = None,
     ):
         self.store = store
         self.router = router
@@ -33,11 +35,18 @@ class ReviewerAgent:
         self.max_attempts = max_attempts
         self.large_diff_escalates = large_diff_escalates
         self.max_context_chars = max(16_000, int(max_context_chars))
+        self.max_context_tokens = (
+            max(256, int(max_context_tokens)) if max_context_tokens is not None else None
+        )
         self.last_prompt_chars = 0
+        self.last_prompt_tokens = 0
+        self.last_context_sha256: str | None = None
 
     def review_once(self, step_id=None):
         """Review one item, optionally the exact step claimed by the coordinator."""
         self.last_prompt_chars = 0
+        self.last_prompt_tokens = 0
+        self.last_context_sha256 = None
         item = self.store.claim(
             self.worker_id,
             self.lease_seconds,
@@ -244,8 +253,10 @@ class ReviewerAgent:
                         "role": "user",
                         "content": self._context_json(context),
                     },
-                ], self.max_context_chars)
+                ], self.max_context_chars, self.max_context_tokens)
             self.last_prompt_chars = message_chars(request_messages)
+            self.last_prompt_tokens = estimate_tokens(request_messages)
+            self.last_context_sha256 = hash_text(json.dumps(request_messages, default=str))
             response = backend.complete(request_messages)
 
             try:
@@ -302,21 +313,33 @@ class ReviewerAgent:
             self._bounded_value(result, 8_000)
             for result in list(implementation.get("command_results") or [])[-20:]
         ]
+        implementation["command_results"] = mark_untrusted(
+            implementation["command_results"], "engineering-command-output", 8_000
+        )
         bounded["implementation"] = implementation
 
         evidence = dict(bounded.get("evidence") or {})
-        evidence["diff"] = self._bounded_text(evidence.get("diff", ""), 55_000)
+        evidence["diff"] = mark_untrusted(
+            self._bounded_text(evidence.get("diff", ""), 55_000), "review-diff", 55_000
+        )
         evidence["documents"] = {
-            str(name): self._bounded_text(value, 8_000)
+            str(name): mark_untrusted(
+                self._bounded_text(value, 8_000), f"review-document:{name}", 8_000
+            )
             for name, value in dict(evidence.get("documents") or {}).items()
         }
-        evidence["checks"] = self._bounded_value(evidence.get("checks", {}), 8_000)
+        evidence["checks"] = mark_untrusted(
+            self._bounded_value(evidence.get("checks", {}), 8_000), "verification-evidence", 8_000
+        )
         evidence["risk_flags"] = self._bounded_value(evidence.get("risk_flags", {}), 2_000)
         bounded["evidence"] = evidence
         bounded["prior_issues"] = [
             self._bounded_value(issue, 4_000)
             for issue in list(bounded.get("prior_issues") or [])[-20:]
         ]
+        bounded["prior_issues"] = mark_untrusted(
+            bounded["prior_issues"], "prior-review-issue", 4_000
+        )
         encoded = json.dumps(bounded, default=str)
         if len(encoded) <= self.max_context_chars:
             return encoded
