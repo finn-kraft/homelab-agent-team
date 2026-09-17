@@ -66,8 +66,8 @@ class AuthManager:
 
     def set_password(self, password: str) -> None:
         password = str(password)
-        if len(password) < 12 or len(password) > 256:
-            raise ValueError("password must be 12-256 characters")
+        if len(password) < 8 or len(password) > 256:
+            raise ValueError("password must be 8-256 characters")
         self.ensure_schema()
         password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("ascii")
         with self.connect() as connection:
@@ -136,4 +136,3 @@ class AuthManager:
         if token:
             with self._lock:
                 self._sessions.pop(self._digest(token), None)
-
