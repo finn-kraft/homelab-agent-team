@@ -162,6 +162,9 @@ CREATE TABLE IF NOT EXISTS work_packages (
   status TEXT NOT NULL DEFAULT 'ready',
   starting_commit TEXT,
   worktree TEXT,
+  worker_id TEXT,
+  lease_expires_at TIMESTAMPTZ,
+  resulting_commit TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -345,6 +348,33 @@ class OrchestratorStore:
                 query += " WHERE mission_id=%s"; params = (mission_id,)
             query += " ORDER BY id"
             return [dict(row) for row in connection.execute(query, params).fetchall()]
+
+    def claim_work_package(self, worker_id: str, lease_seconds: int = 900) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute("""WITH candidate AS (
+                SELECT p.id FROM work_packages p JOIN missions m ON m.id=p.mission_id
+                WHERE p.status='ready' AND m.status='active'
+                  AND (p.lease_expires_at IS NULL OR p.lease_expires_at < now())
+                  AND NOT EXISTS (SELECT 1 FROM work_packages d
+                    WHERE d.id = ANY(SELECT jsonb_array_elements_text(p.dependencies)::bigint)
+                    AND d.status <> 'complete')
+                ORDER BY p.id FOR UPDATE SKIP LOCKED LIMIT 1)
+                UPDATE work_packages p SET status='engineering',worker_id=%s,
+                  lease_expires_at=now()+(%s*interval '1 second'),updated_at=now()
+                FROM candidate WHERE p.id=candidate.id RETURNING p.*""", (worker_id, lease_seconds)).fetchone()
+            return dict(row) if row else None
+
+    def update_work_package(self, package_id: int, worker_id: str, status: str,
+                            resulting_commit: str | None = None) -> None:
+        if status not in {'engineering', 'review', 'verifying', 'complete', 'blocked'}:
+            raise ValueError('invalid work package status')
+        with self.connect() as connection:
+            result = connection.execute("""UPDATE work_packages SET status=%s,
+                resulting_commit=COALESCE(%s,resulting_commit),lease_expires_at=NULL,
+                updated_at=now() WHERE id=%s AND worker_id=%s""",
+                (status, resulting_commit, package_id, worker_id))
+            if result.rowcount != 1:
+                raise RuntimeError('work package lease is no longer owned')
 
     def start_engineering_session(self, job_id: int, step_id: int | None,
                                   worker_id: str, starting_commit: str | None = None) -> int:

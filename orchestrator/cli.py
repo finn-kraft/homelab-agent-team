@@ -52,6 +52,8 @@ def _parser() -> argparse.ArgumentParser:
     mission.add_argument("goal"); mission.add_argument("--repository", required=True); mission.add_argument("--branch", required=True)
     packages = subcommands.add_parser("packages", help="list durable V2 work packages")
     packages.add_argument("--mission-id", type=int)
+    claim = subcommands.add_parser("claim-package", help="claim one ready V2 package")
+    claim.add_argument("--worker-id", default="engineering-1"); claim.add_argument("--lease-seconds", type=int, default=900)
     inspect = subcommands.add_parser("inspect", help="show a job, its steps, and recent events")
     inspect.add_argument("job_id", type=int)
     for name in ("pause", "resume", "cancel"):
@@ -118,6 +120,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "packages":
             print(json.dumps(store.list_work_packages(args.mission_id), default=str, indent=2))
+            return 0
+        if args.command == "claim-package":
+            print(json.dumps(store.claim_work_package(args.worker_id, args.lease_seconds), default=str))
             return 0
         if args.command == "inspect":
             print(json.dumps(store.inspect(args.job_id), default=str, indent=2))
