@@ -113,6 +113,7 @@ function showView(name) {
     dashboard: ['Overview', 'Your autonomous development team at a glance.'],
     projects: ['Projects', 'Repositories the team is authorized to change.'],
     agents: ['Agents', 'Live assignments backed by durable workflow evidence.'],
+    jobs: ['Jobs', 'Track and manage every workflow in one place.'],
     events: ['Events', 'Technical workflow history, routes, and recovery evidence.'],
     job: ['Job detail', 'Progress, decisions, verification, and human gates.'],
   };
@@ -205,6 +206,7 @@ function render() {
   if (state.view === 'dashboard') renderDashboard();
   if (state.view === 'projects') renderProjects();
   if (state.view === 'agents') renderAgents();
+  if (state.view === 'jobs') $('#jobsView').innerHTML = `<div class="section-head"><div class="section-title"><h2>All jobs</h2><small>Running, waiting, blocked, and completed work</small></div></div>${jobsTable(state.overview.jobs || [])}`;
   if (state.view === 'events') renderEventView();
   if (state.view === 'job' && state.jobId) renderJob(state.jobId);
 }
@@ -502,3 +504,15 @@ document.addEventListener('keydown', event => {
 
 updateClock();
 setInterval(updateClock, 30_000);
+
+async function restoreSession() {
+  try {
+    const session = await api('/api/session');
+    if (!session.authenticated) return;
+    state.csrfToken = session.csrf_token;
+    [state.overview, state.projects] = await Promise.all([api('/api/overview'), api('/api/projects')]);
+    document.body.classList.add('connected'); $('#login').hidden = true; $('#app').hidden = false;
+    populateProjects(); showView('dashboard'); stream(++state.streamGeneration);
+  } catch (_) { /* no existing session */ }
+}
+restoreSession();
