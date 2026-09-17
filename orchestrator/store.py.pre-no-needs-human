@@ -658,11 +658,8 @@ class OrchestratorStore:
                 })
                 self._event(connection, work["job_id"], None, "planning_resumed", {})
                 return "complete"
-            # V1 autonomous policy: checkpoint failures never require routine
-            # human intervention. Return the step to coding with the checkpoint
-            # failure attached as reviewer feedback.
-            next_step_status = "changes_requested"
-            next_job_status = "running"
+            next_step_status = "changes_requested" if retryable else "needs_human"
+            next_job_status = "running" if retryable else "needs_human"
             connection.execute(
                 """UPDATE checkpoint_runs SET status='failed',error=%s,updated_at=now()
                 WHERE step_id=%s""", (str(error)[:30_000], work["id"])
@@ -676,7 +673,7 @@ class OrchestratorStore:
             if not controlled:
                 connection.execute(
                     "UPDATE jobs SET status=%s,current_phase=%s,updated_at=now() WHERE id=%s",
-                    (next_job_status, "coding", work["job_id"]),
+                    (next_job_status, "coding" if retryable else "needs_human", work["job_id"]),
                 )
             self._event(connection, work["job_id"], work["id"], "checkpoint_failed", {
                 "error": str(error)[:30_000], "retryable": retryable,
@@ -718,13 +715,13 @@ class OrchestratorStore:
             if not row:
                 return None
             connection.execute(
-                """UPDATE jobs SET status='blocked',current_phase='blocked',
+                """UPDATE jobs SET status='needs_human',current_phase='needs_human',
                 human_notes=COALESCE(human_notes || E'\n','') ||
-                  'Configured maximum planning iterations reached.',
+                  'Configured maximum planning iterations reached. Review the job before resuming.',
                 updated_at=now() WHERE id=%s""", (row["id"],)
             )
-            self._event(connection, row["id"], None, "iteration_limit_reached", {
-                "reason": "Configured maximum planning iterations reached.",
+            self._event(connection, row["id"], None, "human_input_requested", {
+                "question": "The configured iteration ceiling was reached. Should this job be extended, re-scoped, or completed?",
             })
             return int(row["id"])
 

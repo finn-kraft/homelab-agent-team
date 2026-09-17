@@ -165,13 +165,20 @@ def test_08_environment_blocker_can_choose_alternative_work():
     assert decision.decision == "create_step"
 
 
-def test_09_human_boundary_requires_specific_question():
+def test_09_needs_human_is_not_a_planner_decision():
     with pytest.raises(InvalidDecision):
-        parse_decision('{"decision":"needs_human","job_status":"needs_human","reasoning_summary":"ambiguous"}')
-    valid = parse_decision(json.dumps({"decision": "needs_human", "job_status": "needs_human",
-                                      "reasoning_summary": "Migration choice is destructive.",
-                                      "human_question": "Preserve aliases or migrate saved files?"}))
-    assert valid.human_question
+        parse_decision(
+            '{"decision":"needs_human","job_status":"needs_human",'
+            '"reasoning_summary":"ambiguous"}'
+        )
+
+    with pytest.raises(InvalidDecision):
+        parse_decision(json.dumps({
+            "decision": "needs_human",
+            "job_status": "needs_human",
+            "reasoning_summary": "Migration choice is destructive.",
+            "human_question": "Preserve aliases or migrate saved files?",
+        }))
 
 
 def test_10_paused_job_creates_no_work():

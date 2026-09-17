@@ -40,8 +40,6 @@ class HTTPBackend:
         self.retries = retries
 
     def _post(self, url: str, payload: dict) -> tuple[dict, float]:
-        if self._circuit_open_until > time.time():
-            raise BackendError("backend circuit open; retry window has not elapsed")
         headers = {"Content-Type": "application/json"}
 
         if self.api_key:
@@ -156,16 +154,14 @@ class Router:
         needs_strong_model: bool = False,
     ):
         attempt = max(1, int(attempt))
-        cycle_length = self.escalate_after + 1
-        cycle_attempt = ((attempt - 1) % cycle_length) + 1
 
-        if cycle_attempt < self.escalate_after:
+        if attempt < self.escalate_after:
             return self.local
 
-        if cycle_attempt == self.escalate_after and self.cloud:
+        if attempt == self.escalate_after and self.cloud:
             return self.cloud
 
-        if cycle_attempt == cycle_length and self.premium_cloud:
+        if attempt > self.escalate_after and self.premium_cloud:
             return self.premium_cloud
 
         if self.cloud:

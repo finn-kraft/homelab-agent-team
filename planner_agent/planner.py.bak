@@ -4,7 +4,6 @@ import json
 from typing import Any
 
 from agent_core.models import PlannerDecision
-from agent_core.llm import BackendError
 from .decision import InvalidDecision, completion_is_supported, parse_decision
 from .inspector import InspectionError, ReadOnlyRepositoryInspector
 from .prompt import SYSTEM_PROMPT
@@ -12,7 +11,7 @@ from .prompt import SYSTEM_PROMPT
 
 class PlannerAgent:
     def __init__(self, store, router, inspector: ReadOnlyRepositoryInspector,
-                 worker_id: str, lease_seconds: int = 300, decision_retries: int = 3,
+                 worker_id: str, lease_seconds: int = 300, decision_retries: int = 2,
                  escalation_attempt: int = 4):
         self.store, self.router, self.inspector = store, router, inspector
         self.worker_id, self.lease_seconds = worker_id, lease_seconds
@@ -31,13 +30,10 @@ class PlannerAgent:
             repository = self.inspector.inspect(job.repository, job.branch)
             if not repository["branch_matches"]:
                 decision = PlannerDecision(
-                    "blocked",
-                    "blocked",
+                    "needs_human", "needs_human",
                     "The configured worker branch is not currently checked out.",
-                    blocker=(
-                        f"Expected branch {job.branch!r}; "
-                        f"current branch is {repository['actual_branch']!r}."
-                    ),
+                    human_question=(f"Check out safe branch {job.branch!r} in {job.repository!r} "
+                                    f"before resuming; current branch is {repository['actual_branch']!r}."),
                 )
                 self.store.apply_decision(job, self.worker_id, decision)
                 return decision
@@ -56,24 +52,14 @@ class PlannerAgent:
                 (int(step.get("attempt_count", 0)) for step in steps
                  if step.get("status") in {"failed", "blocked"}), default=0
             )
+            backend = self.router.choose(failed_attempts,
+                                         failed_attempts >= self.escalation_attempt)
             messages = [{"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": json.dumps(context, default=str)}]
             decision = None
-            backend_errors = []
-            for repair_attempt in range(self.decision_retries + 1):
+            for _ in range(self.decision_retries + 1):
                 self.store.heartbeat(job.id, self.worker_id, self.lease_seconds)
-                try:
-                    route_attempt = failed_attempts + repair_attempt + 1
-                    backend = self.router.choose(
-                        route_attempt, route_attempt >= self.escalation_attempt)
-                    response = backend.complete(messages)
-                except BackendError as exc:
-                    backend_errors.append(str(exc))
-                    messages.append({
-                        "role": "user",
-                        "content": "Inference failed transiently. Retry the same JSON contract.",
-                    })
-                    continue
+                response = backend.complete(messages)
                 try:
                     candidate = parse_decision(response.text)
                     if candidate.decision == "complete" and not completion_is_supported(candidate, steps):
@@ -90,43 +76,17 @@ class PlannerAgent:
                         {"role": "user", "content": f"Decision rejected: {exc}. Return corrected JSON."},
                     ])
             if decision is None:
-                reason = "inference_unavailable" if backend_errors else "invalid_model_output"
-                self.store.defer(
-                    job.id, self.worker_id, reason,
-                    backend_errors[-1] if backend_errors else "structured repair exhausted",
-                )
-                return PlannerDecision(
-                    "blocked", "running",
-                    "Planning retry scheduled; the persistent job remains recoverable.",
-                    blocker=reason,
-                )
-            if decision.decision == "blocked" and self._recoverable_blocker(decision.blocker):
-                self.store.defer(job.id, self.worker_id, "planner_blocker",
-                                 json.dumps(decision.blocker, default=str))
-                return PlannerDecision(
-                    "blocked", "running", "Planning retry scheduled; the persistent job remains recoverable.",
-                    blocker="planner_blocker",
-                )
+                decision = PlannerDecision("blocked", "blocked",
+                                           "The planning model repeatedly returned an unsafe or invalid decision.",
+                                           blocker="invalid model decisions")
             self.store.apply_decision(job, self.worker_id, decision)
             return decision
-        except InspectionError as exc:
-            self.store.defer(job.id, self.worker_id, "repository_conflict", str(exc))
-            return PlannerDecision("blocked", "running", "Repository inspection will retry.",
-                                   blocker=str(exc))
-        except (RuntimeError, ValueError) as exc:
-            self.store.defer(job.id, self.worker_id, "planner_internal_error", str(exc))
-            return PlannerDecision("blocked", "running", "Planner failure will retry.",
-                                   blocker=str(exc))
+        except (InspectionError, RuntimeError, ValueError) as exc:
+            decision = PlannerDecision("blocked", "blocked",
+                                       "Planning could not safely continue.", blocker=str(exc))
+            self.store.apply_decision(job, self.worker_id, decision)
+            return decision
 
     @staticmethod
     def _serializable(job) -> dict[str, Any]:
         return {name: getattr(job, name) for name in job.__slots__}
-
-    @staticmethod
-    def _recoverable_blocker(blocker: Any) -> bool:
-        """Keep transient/environment blockers out of permanent job state."""
-        value = json.dumps(blocker, default=str).lower()
-        return any(term in value for term in (
-            "unavailable", "timeout", "timed_out", "transient", "connection",
-            "repository_conflict", "missing_external_resource",
-        ))

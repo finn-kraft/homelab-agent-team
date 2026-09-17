@@ -73,12 +73,14 @@ def test_privacy_policy_prevents_cloud_availability_backup():
         raise AssertionError("privacy-sensitive local failure must not leak to cloud")
 
 
-def test_legacy_router_default_does_not_escalate_attempt_three():
+def test_legacy_router_default_uses_five_local_attempts():
     local, cloud = object(), object()
     router = Router(local, cloud)
 
     assert router.choose(3, needs_strong_model=True) is local
-    assert router.choose(4) is cloud
+    assert router.choose(4) is local
+    assert router.choose(5) is local
+    assert router.choose(6) is cloud
 
 
 def test_normal_agent_route_uses_supported_medium_complexity(monkeypatch):
