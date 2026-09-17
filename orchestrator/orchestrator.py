@@ -76,6 +76,11 @@ class AgentOrchestrator:
     def run(self) -> None:
         """Run until SIGTERM/SIGINT asks for a graceful safe-boundary stop."""
         self._log("orchestrator_started", worker_id=self.config.worker_id)
+        readiness = getattr(self.store, "schema_readiness", None)
+        if readiness is not None:
+            report = readiness()
+            if not report.get("ready"):
+                self._log("schema_not_ready", level=logging.ERROR, **report)
         heartbeat = getattr(self.store, "heartbeat_worker", None)
         while not self._stop_requested.is_set():
             try:
@@ -235,10 +240,14 @@ class AgentOrchestrator:
             self._log("engineering_crashed", job_id=task.job_id, step_id=task.step_id,
                       attempt=task.attempt, error=str(exc), level=logging.ERROR)
             clean, evidence = self._repository_clean(task.repository)
-            if clean and hasattr(self.store, "safely_requeue_abandoned_coding"):
-                self.store.safely_requeue_abandoned_coding(task.step_id, evidence)
-            elif not clean and hasattr(self.store, "block_abandoned_coding"):
-                self.store.block_abandoned_coding(
+            requeue = getattr(self.store, "safely_requeue_abandoned_engineering", None)
+            requeue = requeue or getattr(self.store, "safely_requeue_abandoned_coding", None)
+            block = getattr(self.store, "block_abandoned_engineering", None)
+            block = block or getattr(self.store, "block_abandoned_coding", None)
+            if clean and requeue:
+                requeue(task.step_id, evidence)
+            elif not clean and block:
+                block(
                     task.step_id,
                     f"EngineeringAgent crashed with unclassified repository changes. {evidence}",
                 )
@@ -447,9 +456,13 @@ class AgentOrchestrator:
             return AdvanceResult("lease_recovered", stale["job_id"], step_id, status)
         clean, evidence = self._repository_clean(stale["repository"])
         if clean:
-            self.store.safely_requeue_abandoned_coding(step_id, evidence)
+            requeue = getattr(self.store, "safely_requeue_abandoned_engineering", None)
+            requeue = requeue or self.store.safely_requeue_abandoned_coding
+            requeue(step_id, evidence)
             return AdvanceResult("engineering_requeued", stale["job_id"], step_id, evidence)
-        self.store.block_abandoned_coding(
+        block = getattr(self.store, "block_abandoned_engineering", None)
+        block = block or self.store.block_abandoned_coding
+        block(
             step_id,
             f"EngineeringAgent lease expired with unclassified repository changes. {evidence}",
         )

@@ -1,10 +1,10 @@
 """Controlled Git checkpoints for reviewer-approved work.
 
-This module is intentionally separate from the Coder.  It never infers a
+This module is intentionally separate from the EngineeringAgent. It never infers a
 file list, never stages a repository wholesale, never commits a protected
 branch, and never pushes unless an operator explicitly enables that policy.
 The caller supplies the reviewed file list and any pre-existing human changes
-captured before the Coder started.
+captured before the EngineeringAgent started.
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ class CheckpointResult:
 
     @property
     def retryable(self) -> bool:
-        """Whether a Coder revision is a safe default next action.
+        """Whether an Engineering revision is a safe default next action.
 
         Repository ownership/branch/history conflicts need an operator, while
         whitespace or secret findings can be repaired and reviewed again.

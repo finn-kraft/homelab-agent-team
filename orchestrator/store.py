@@ -17,7 +17,24 @@ from typing import Any, Iterable
 from engineering_agent.models import Status, Task
 
 
-MIGRATION_VERSION = "orchestrator-0008"
+MIGRATION_VERSION = "orchestrator-0009"
+
+# Keep this list deliberately small and authoritative. Health checks should
+# answer whether the workflow can safely run, not whether every optional
+# reporting table happens to exist.
+REQUIRED_TABLE_COLUMNS = {
+    "jobs": {"id", "status", "current_phase", "planner_lease_expires_at"},
+    "steps": {"id", "job_id", "status", "lease_expires_at", "worker_id"},
+    "events": {"job_id", "event_type", "structured_payload"},
+    "command_runs": {"step_id", "timed_out", "cancelled"},
+    "reviews": {"step_id", "verdict", "review_lease_expires_at"},
+    "verification_runs": {"step_id", "status"},
+    "checkpoint_runs": {"step_id", "status"},
+    "engineering_sessions": {"job_id", "step_id", "turn_count"},
+    "engineering_actions": {"session_id", "sequence", "action"},
+    "worker_heartbeats": {"worker_id", "component", "heartbeat_at"},
+    "phase_metrics": {"phase", "duration_seconds", "prompt_chars"},
+}
 
 MIGRATION_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -138,12 +155,15 @@ CREATE TABLE IF NOT EXISTS engineering_actions (
   session_id BIGINT NOT NULL REFERENCES engineering_sessions(id),
   sequence INTEGER NOT NULL,
   model TEXT,
+  provider TEXT,
   action TEXT NOT NULL,
   observation TEXT,
   progress_classification TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE(session_id, sequence)
 );
+
+ALTER TABLE engineering_actions ADD COLUMN IF NOT EXISTS provider TEXT;
 
 CREATE TABLE IF NOT EXISTS missions (
   id BIGSERIAL PRIMARY KEY,
@@ -258,6 +278,56 @@ class OrchestratorStore:
             raise RuntimeError("install homelab-agent-team with PostgreSQL support") from exc
         with psycopg.connect(self.database_url, row_factory=dict_row) as connection:
             yield connection
+
+    def schema_readiness(self) -> dict[str, Any]:
+        """Return an actionable, read-only schema readiness report.
+
+        A missing migration must be visible to operators before a write action
+        fails deep inside a request. The report is intentionally safe to call
+        while the database is unavailable and never mutates schema state.
+        """
+        try:
+            with self.connect() as connection:
+                tables = {
+                    row["table_name"] for row in connection.execute(
+                        """SELECT table_name FROM information_schema.tables
+                        WHERE table_schema='public'"""
+                    ).fetchall()
+                }
+                missing_tables = sorted(set(REQUIRED_TABLE_COLUMNS) - tables)
+                missing_columns: dict[str, list[str]] = {}
+                for table in sorted(set(REQUIRED_TABLE_COLUMNS) & tables):
+                    columns = {
+                        row["column_name"] for row in connection.execute(
+                            """SELECT column_name FROM information_schema.columns
+                            WHERE table_schema='public' AND table_name=%s""", (table,)
+                        ).fetchall()
+                    }
+                    missing = sorted(REQUIRED_TABLE_COLUMNS[table] - columns)
+                    if missing:
+                        missing_columns[table] = missing
+                migration_row = connection.execute(
+                    "SELECT 1 FROM schema_migrations WHERE version=%s",
+                    (MIGRATION_VERSION,),
+                ).fetchone() if "schema_migrations" in tables else None
+                migration_required = migration_row is None
+                ready = not missing_tables and not missing_columns and not migration_required
+                return {
+                    "ready": ready,
+                    "migration": MIGRATION_VERSION if not migration_required else None,
+                    "migration_required": migration_required,
+                    "missing_tables": missing_tables,
+                    "missing_columns": missing_columns,
+                }
+        except Exception as exc:  # database outages belong in health output
+            return {
+                "ready": False,
+                "migration": None,
+                "migration_required": True,
+                "missing_tables": [],
+                "missing_columns": {},
+                "error": str(exc)[:500],
+            }
 
     def migrate(self) -> None:
         """Apply the base schema and additive orchestration migration safely."""
@@ -591,12 +661,12 @@ class OrchestratorStore:
                 package.update(worktree=str(worktree.path), starting_commit=worktree.starting_commit,
                                branch=worktree.branch)
             # A package is a complete admission decision. Move its linked V1
-            # row into the running coding state so the next coordinator pass
+            # row into the running Engineering state so the next coordinator pass
             # claims Engineering directly instead of handing the package back
             # to Planner because the synthetic job is still pending.
             if package.get("job_id") and package.get("step_id"):
                 connection.execute("""
-                    UPDATE jobs SET status='running',current_phase='coding',current_step=%s,updated_at=now()
+                    UPDATE jobs SET status='running',current_phase='engineering',current_step=%s,updated_at=now()
                     WHERE id=%s AND status IN ('pending','planning')
                 """, (package["step_id"], package["job_id"]))
                 self._event(connection, package["job_id"], package["step_id"], "package_claimed", {
@@ -605,8 +675,8 @@ class OrchestratorStore:
                 })
             return package
 
-    def claim_coding_for_step(self, step_id: int, worker_id: str, lease_seconds: int,
-                              repository_lock_seconds: int) -> Task | None:
+    def claim_engineering_for_step(self, step_id: int, worker_id: str, lease_seconds: int,
+                                   repository_lock_seconds: int) -> Task | None:
         """Claim the exact Engineering step admitted by a Work Package."""
         with self.connect() as connection:
             row = connection.execute(
@@ -645,8 +715,8 @@ class OrchestratorStore:
         package = self.claim_work_package(worker_id, lease_seconds, worktree_manager)
         if not package or not package.get("step_id"):
             return None
-        task = self.claim_coding_for_step(package["step_id"], worker_id,
-                                          lease_seconds, repository_lock_seconds)
+        task = self.claim_engineering_for_step(package["step_id"], worker_id,
+                                               lease_seconds, repository_lock_seconds)
         if task is None:
             with self.connect() as connection:
                 connection.execute("""UPDATE work_packages SET status='ready',worker_id=NULL,
@@ -655,12 +725,21 @@ class OrchestratorStore:
             return None
         return {"package": package, "task": task}
 
-    def resume_engineering_session(self, job_id: int, step_id: int | None = None) -> dict[str, Any] | None:
+    def claim_coding_for_step(self, step_id: int, worker_id: str, lease_seconds: int,
+                              repository_lock_seconds: int) -> Task | None:
+        """V1 compatibility alias for :meth:`claim_engineering_for_step`."""
+        return self.claim_engineering_for_step(
+            step_id, worker_id, lease_seconds, repository_lock_seconds
+        )
+
+    def resume_engineering_session(self, job_id: int, step_id: int | None = None) -> int | None:
         with self.connect() as connection:
             row = connection.execute("""SELECT * FROM engineering_sessions WHERE job_id=%s
                 AND (%s IS NULL OR step_id=%s) AND completed_at IS NULL
                 ORDER BY updated_at DESC LIMIT 1""", (job_id, step_id, step_id)).fetchone()
-            return dict(row) if row else None
+            # The agent transport expects the durable session identifier; the
+            # richer state is available through engineering_session_state().
+            return int(row["id"]) if row else None
 
     def update_work_package(self, package_id: int, worker_id: str, status: str,
                             resulting_commit: str | None = None) -> None:
@@ -725,7 +804,7 @@ class OrchestratorStore:
             connection.execute("""UPDATE steps SET status='queued',attempt_count=0,worker_id=NULL,
                 lease_expires_at=NULL,blocker=NULL,updated_at=now() WHERE job_id=%s
                 AND status IN ('failed','blocked')""", (job_id,))
-            connection.execute("UPDATE jobs SET status='running',current_phase='coding',updated_at=now() WHERE id=%s", (job_id,))
+            connection.execute("UPDATE jobs SET status='running',current_phase='engineering',updated_at=now() WHERE id=%s", (job_id,))
             self._event(connection, job_id, None, "job_retry_requested", {"previous_status": row["status"]})
 
     def start_engineering_session(self, job_id: int, step_id: int | None,
@@ -736,19 +815,41 @@ class OrchestratorStore:
                 RETURNING id""", (job_id, step_id, worker_id, starting_commit)).fetchone()
             return row["id"]
 
+    def engineering_session_state(self, job_id: int, step_id: int | None = None) -> dict[str, Any] | None:
+        """Return the last durable action needed to resume an Engineering turn."""
+        with self.connect() as connection:
+            row = connection.execute("""SELECT es.*,ea.model AS last_model,ea.provider AS last_provider,
+                ea.action AS last_action,ea.observation AS last_observation,
+                ea.progress_classification AS last_progress
+                FROM engineering_sessions es LEFT JOIN engineering_actions ea ON ea.id=(
+                  SELECT latest.id FROM engineering_actions latest
+                  WHERE latest.session_id=es.id ORDER BY latest.sequence DESC LIMIT 1)
+                WHERE es.job_id=%s AND (%s IS NULL OR es.step_id=%s)
+                  AND es.completed_at IS NULL ORDER BY es.updated_at DESC LIMIT 1""",
+                (job_id, step_id, step_id)).fetchone()
+            return dict(row) if row else None
+
     def record_engineering_action(self, session_id: int, sequence: int, action: str,
                                   observation: str = "", model: str | None = None,
-                                  progress_classification: str | None = None) -> None:
+                                  progress_classification: str | None = None, provider: str | None = None,
+                                  model_tier: str | None = None, stagnation_count: int | None = None,
+                                  last_test_result: dict[str, Any] | None = None,
+                                  current_problem: str | None = None) -> None:
         with self.connect() as connection:
             connection.execute("""INSERT INTO engineering_actions
-                (session_id,sequence,model,action,observation,progress_classification)
-                VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(session_id,sequence) DO UPDATE SET
-                model=EXCLUDED.model,action=EXCLUDED.action,observation=EXCLUDED.observation,
-                progress_classification=EXCLUDED.progress_classification""",
-                (session_id, sequence, model, action, observation[:30000], progress_classification))
+                (session_id,sequence,model,provider,action,observation,progress_classification)
+                VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(session_id,sequence) DO UPDATE SET
+                model=EXCLUDED.model,provider=EXCLUDED.provider,action=EXCLUDED.action,
+                observation=EXCLUDED.observation,progress_classification=EXCLUDED.progress_classification""",
+                (session_id, sequence, model, provider, action, observation[:30000], progress_classification))
             connection.execute("""UPDATE engineering_sessions SET turn_count=%s,
-                last_successful_action=CASE WHEN %s NOT IN ('invalid','no_progress') THEN %s ELSE last_successful_action END,
-                updated_at=now() WHERE id=%s""", (sequence, action, action, session_id))
+                current_model_tier=COALESCE(%s,current_model_tier),current_problem=COALESCE(%s,current_problem),
+                stagnation_count=COALESCE(%s,stagnation_count),last_test_result=COALESCE(%s::jsonb,last_test_result),
+                last_successful_action=CASE WHEN %s NOT IN ('invalid','no_progress','repeated_failure','oscillation')
+                    THEN %s ELSE last_successful_action END,updated_at=now() WHERE id=%s""",
+                (sequence, model_tier, current_problem, stagnation_count,
+                 json.dumps(last_test_result) if last_test_result is not None else None,
+                 action, action, session_id))
 
     def complete_engineering_session_for_step(self, step_id: int) -> None:
         """Close the Engineer session only after checkpoint completion."""
@@ -796,7 +897,7 @@ class OrchestratorStore:
                 (self._canonical_repository(repository), owner),
             )
 
-    def heartbeat_coding(self, step_id: int, worker_id: str, lease_seconds: int) -> bool:
+    def heartbeat_engineering(self, step_id: int, worker_id: str, lease_seconds: int) -> bool:
         with self.connect() as connection:
             result = connection.execute(
                 """UPDATE steps s SET lease_expires_at=now()+(%s*interval '1 second'),updated_at=now()
@@ -806,9 +907,9 @@ class OrchestratorStore:
             )
             return result.rowcount == 1
 
-    def heartbeat_engineering(self, step_id: int, worker_id: str, lease_seconds: int) -> bool:
-        """Preferred V2 name for the mutation-worker lease heartbeat."""
-        return self.heartbeat_coding(step_id, worker_id, lease_seconds)
+    def heartbeat_coding(self, step_id: int, worker_id: str, lease_seconds: int) -> bool:
+        """V1 compatibility alias for :meth:`heartbeat_engineering`."""
+        return self.heartbeat_engineering(step_id, worker_id, lease_seconds)
 
     def heartbeat_orchestration(self, step_id: int, worker_id: str,
                                 lease_seconds: int) -> bool:
@@ -822,10 +923,10 @@ class OrchestratorStore:
             return result.rowcount == 1
 
     # ------------------------------------------------------------------
-    # Coder and Reviewer hand-offs
+    # Engineering and Reviewer hand-offs
     # ------------------------------------------------------------------
-    def claim_coding(self, worker_id: str, lease_seconds: int,
-                     repository_lock_seconds: int) -> Task | None:
+    def claim_engineering(self, worker_id: str, lease_seconds: int,
+                          repository_lock_seconds: int) -> Task | None:
         """Claim exactly one mutation step and its repository lease atomically."""
         with self.connect() as connection:
             row = connection.execute(
@@ -861,13 +962,13 @@ class OrchestratorStore:
                 row.get("reviewer_feedback"),
             )
 
-    def claim_engineering(self, worker_id: str, lease_seconds: int,
-                          repository_lock_seconds: int) -> Task | None:
-        """Preferred V2 name for claiming one Engineering step."""
-        return self.claim_coding(worker_id, lease_seconds, repository_lock_seconds)
+    def claim_coding(self, worker_id: str, lease_seconds: int,
+                     repository_lock_seconds: int) -> Task | None:
+        """V1 compatibility alias for :meth:`claim_engineering`."""
+        return self.claim_engineering(worker_id, lease_seconds, repository_lock_seconds)
 
-    def finish_coding_handoff(self, step_id: int, worker_id: str) -> str | None:
-        """Synchronize a bounded Coder call with job-level workflow state."""
+    def finish_engineering_handoff(self, step_id: int, worker_id: str) -> str | None:
+        """Synchronize a bounded Engineering call with workflow state."""
         with self.connect() as connection:
             row = connection.execute(
                 "SELECT s.*,j.status AS job_status FROM steps s JOIN jobs j ON j.id=s.job_id "
@@ -910,9 +1011,9 @@ class OrchestratorStore:
                 })
             return status
 
-    def finish_engineering_handoff(self, step_id: int, worker_id: str) -> str | None:
-        """Preferred V2 name for completing the Engineering hand-off."""
-        return self.finish_coding_handoff(step_id, worker_id)
+    def finish_coding_handoff(self, step_id: int, worker_id: str) -> str | None:
+        """V1 compatibility alias for :meth:`finish_engineering_handoff`."""
+        return self.finish_engineering_handoff(step_id, worker_id)
 
     def next_review_step(self) -> int | None:
         """Mark one ready step as reviewing, then let Reviewer claim that exact ID."""
@@ -953,10 +1054,20 @@ class OrchestratorStore:
             elif status == "changes_requested":
                 if not controlled:
                     connection.execute(
-                        "UPDATE jobs SET status='running',current_phase='coding',updated_at=now() WHERE id=%s",
+                        "UPDATE jobs SET status='running',current_phase='engineering',updated_at=now() WHERE id=%s",
                         (row["job_id"],),
                     )
-                self._event(connection, row["job_id"], step_id, "changes_requested", {})
+                feedback = row.get("reviewer_feedback") or {}
+                connection.execute(
+                    """UPDATE engineering_sessions SET current_problem=%s,
+                    stagnation_count=0,updated_at=now()
+                    WHERE step_id=%s AND completed_at IS NULL""",
+                    (json.dumps(feedback)[:30_000], step_id),
+                )
+                self._event(connection, row["job_id"], step_id, "engineering_revision_requested", {
+                    "reviewer_feedback": feedback,
+                    "same_session": True,
+                })
             elif status in {"blocked", "needs_human"}:
                 job_status = "needs_human" if status == "needs_human" else "blocked"
                 if not controlled:
@@ -1086,7 +1197,7 @@ class OrchestratorStore:
             )
             if not controlled:
                 connection.execute(
-                    "UPDATE jobs SET status='running',current_phase='coding',updated_at=now() WHERE id=%s",
+                    "UPDATE jobs SET status='running',current_phase='engineering',updated_at=now() WHERE id=%s",
                     (work["job_id"],),
                 )
             self._event(connection, work["job_id"], work["id"], "verification_failed", {
@@ -1193,7 +1304,7 @@ class OrchestratorStore:
                 })
                 self._event(connection, work["job_id"], None, "planning_resumed", {})
                 return "complete"
-            # V1 autonomous policy: checkpoint failures never require routine
+            # Autonomous policy: checkpoint failures never require routine
             # human intervention. Return the step to coding with the checkpoint
             # failure attached as reviewer feedback.
             next_step_status = "changes_requested"
@@ -1211,7 +1322,7 @@ class OrchestratorStore:
             if not controlled:
                 connection.execute(
                     "UPDATE jobs SET status=%s,current_phase=%s,updated_at=now() WHERE id=%s",
-                    (next_job_status, "coding", work["job_id"]),
+                    (next_job_status, "engineering", work["job_id"]),
                 )
             self._event(connection, work["job_id"], work["id"], "checkpoint_failed", {
                 "error": str(error)[:30_000], "retryable": retryable,
@@ -1268,7 +1379,7 @@ class OrchestratorStore:
         """Return expired work without blindly replaying potentially mutating actions.
 
         Verification and checkpoint work is reclaimable (the checkpoint marker
-        makes the latter idempotent).  A Coder left mid-edit is returned to the
+        makes the latter idempotent). An Engineering worker left mid-edit is returned to the
         caller for repository inspection rather than automatically re-run.
         """
         with self.connect() as connection:
@@ -1327,7 +1438,7 @@ class OrchestratorStore:
                 })
             return [int(row["id"]) for row in rows]
 
-    def safely_requeue_abandoned_coding(self, step_id: int, evidence: str) -> None:
+    def safely_requeue_abandoned_engineering(self, step_id: int, evidence: str) -> None:
         with self.connect() as connection:
             row = connection.execute(
                 "SELECT s.*,j.status AS job_status FROM steps s JOIN jobs j ON j.id=s.job_id "
@@ -1340,12 +1451,12 @@ class OrchestratorStore:
                 blocker=NULL,updated_at=now() WHERE id=%s""", (step_id,)
             )
             connection.execute(
-                "UPDATE jobs SET status='running',current_phase='coding',updated_at=now() WHERE id=%s",
+                "UPDATE jobs SET status='running',current_phase='engineering',updated_at=now() WHERE id=%s",
                 (row["job_id"],),
             )
             self._event(connection, row["job_id"], step_id, "engineering_recovered", {"evidence": evidence})
 
-    def block_abandoned_coding(self, step_id: int, evidence: str) -> None:
+    def block_abandoned_engineering(self, step_id: int, evidence: str) -> None:
         with self.connect() as connection:
             row = connection.execute(
                 "SELECT s.*,j.status AS job_status FROM steps s JOIN jobs j ON j.id=s.job_id "
@@ -1362,6 +1473,14 @@ class OrchestratorStore:
                 (row["job_id"],),
             )
             self._event(connection, row["job_id"], step_id, "job_blocked", {"reason": evidence[:30_000]})
+
+    def safely_requeue_abandoned_coding(self, step_id: int, evidence: str) -> None:
+        """V1 compatibility alias for :meth:`safely_requeue_abandoned_engineering`."""
+        self.safely_requeue_abandoned_engineering(step_id, evidence)
+
+    def block_abandoned_coding(self, step_id: int, evidence: str) -> None:
+        """V1 compatibility alias for :meth:`block_abandoned_engineering`."""
+        self.block_abandoned_engineering(step_id, evidence)
 
     def control(self, job_id: int, action: str) -> None:
         mapping = {"pause": "paused", "resume": "running", "cancel": "cancelled"}
@@ -1407,7 +1526,7 @@ class OrchestratorStore:
                            WHERE step_id=%s AND status IN ('blocked','failed')""",
                         (requeued_step,),
                     )
-                phase = "'coding'" if requeued_step else "'planning'"
+                phase = "'engineering'" if requeued_step else "'planning'"
             connection.execute(
                 f"""UPDATE jobs SET status=%s,current_phase={phase},
                 current_step=COALESCE(%s,current_step),

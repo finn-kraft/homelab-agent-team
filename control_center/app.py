@@ -139,9 +139,11 @@ class ControlCenter:
                 if parsed.path == "/styles.css":
                     return self.send_asset("styles.css", "text/css; charset=utf-8")
                 if parsed.path == "/health":
-                    healthy = app.store.healthy()
+                    health = app.store.health()
+                    healthy = bool(health.get("ready"))
                     return self.send_json(200 if healthy else 503,
-                                          {"status": "ok" if healthy else "degraded"})
+                                          {"status": "ok" if healthy else "degraded",
+                                           "health": health})
                 session = self.require_session()
                 if not session:
                     return

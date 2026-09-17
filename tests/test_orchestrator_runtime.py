@@ -4,6 +4,7 @@ import signal
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,6 +13,7 @@ from coder_agent.models import Status, Task
 from orchestrator.cli import _install_stop_handlers
 from orchestrator.config import OrchestratorConfig
 from orchestrator.orchestrator import AdvanceResult, AgentOrchestrator
+from orchestrator.store import REQUIRED_TABLE_COLUMNS, OrchestratorStore
 
 
 def config() -> OrchestratorConfig:
@@ -71,6 +73,44 @@ def test_sigterm_handler_requests_graceful_stop():
     handlers[signal.SIGTERM](signal.SIGTERM, None)
 
     assert subject._stop_requested.is_set()
+
+
+def test_engineering_attempt_setting_is_canonical(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://unused")
+    monkeypatch.setenv("MAX_ENGINEERING_ATTEMPTS", "7")
+    monkeypatch.setenv("MAX_CODER_ATTEMPTS", "5")
+    loaded = OrchestratorConfig.from_env()
+    assert loaded.engineering_attempt_limit == 7
+    assert loaded.max_engineering_attempts == 7
+
+
+def test_schema_readiness_reports_missing_migration(monkeypatch):
+    store = OrchestratorStore("postgresql://unused")
+
+    class Cursor:
+        def __init__(self, rows): self.rows = rows
+        def fetchall(self): return self.rows
+        def fetchone(self): return self.rows[0] if self.rows else None
+
+    class Connection:
+        def execute(self, query, params=()):
+            if "information_schema.tables" in query:
+                return Cursor([{"table_name": table} for table in REQUIRED_TABLE_COLUMNS])
+            if "information_schema.columns" in query:
+                table = params[0]
+                columns = REQUIRED_TABLE_COLUMNS[table]
+                return Cursor([{"column_name": column} for column in columns])
+            return Cursor([])
+
+    @contextmanager
+    def connect():
+        yield Connection()
+
+    monkeypatch.setattr(store, "connect", connect)
+    report = store.schema_readiness()
+    assert report["ready"] is False
+    assert report["migration_required"] is True
+    assert report["migration"] is None
 
 
 class CrashStore(IdleStore):
