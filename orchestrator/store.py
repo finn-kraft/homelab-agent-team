@@ -433,6 +433,13 @@ class OrchestratorStore:
             raise ValueError("a verified commit SHA is required")
         self.advance_work_package(package_id, worker_id, "verifying", "complete", commit_sha)
 
+    def sync_package_for_step(self, step_id: int, status: str, commit_sha: str | None = None) -> None:
+        """Mirror V1 Step completion into its linked V2 package, when present."""
+        with self.connect() as connection:
+            connection.execute("""UPDATE work_packages SET status=%s,
+                resulting_commit=COALESCE(%s,resulting_commit),lease_expires_at=NULL,updated_at=now()
+                WHERE step_id=%s""", (status, commit_sha, step_id))
+
     def heartbeat_work_package(self, package_id: int, worker_id: str,
                                lease_seconds: int = 900) -> bool:
         with self.connect() as connection:

@@ -253,6 +253,9 @@ class AgentOrchestrator:
             result = SimpleNamespace(success=False, retryable=False, error=f"checkpoint service failed: {exc}")
         try:
             next_state = self.store.record_checkpoint(work, self.config.worker_id, result)
+            sync_package = getattr(self.store, "sync_package_for_step", None)
+            if sync_package and next_state == "complete":
+                sync_package(work["id"], "complete", getattr(result, "commit_sha", None))
             self._log("checkpoint_finished", job_id=work["job_id"], step_id=work["id"],
                       commit_sha=getattr(result, "commit_sha", None), next_state=next_state)
             return AdvanceResult("checkpoint", work["job_id"], work["id"], next_state)
