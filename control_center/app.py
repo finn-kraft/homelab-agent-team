@@ -1,7 +1,9 @@
 from __future__ import annotations
 import hmac
 import json
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.resources import files
 from urllib.parse import parse_qs, urlparse
 
 class ControlCenter:
@@ -17,6 +19,8 @@ class ControlCenter:
             raise PermissionError("confirmation_required")
         self.store.action(job_id, action)
         return {"status": action}
+    def snapshot(self):
+        return {**self.store.overview(), "telemetry": self.telemetry.snapshot()}
     def handler(self):
         app = self
         class Handler(BaseHTTPRequestHandler):
@@ -26,17 +30,35 @@ class ControlCenter:
                 self.send_response(status); self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body))); self.send_header("Cache-Control", "no-store")
                 self.end_headers(); self.wfile.write(body)
+            def send_asset(self, name, content_type):
+                body = files("control_center.static").joinpath(name).read_bytes()
+                self.send_response(200); self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+            def send_stream(self):
+                self.send_response(200); self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache"); self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                for _ in range(12):
+                    try:
+                        payload = json.dumps(app.snapshot(), default=str)
+                        self.wfile.write(f"event: snapshot\ndata: {payload}\n\n".encode()); self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError): break
+                    time.sleep(5)
             def do_GET(self):
                 parsed = urlparse(self.path)
                 if parsed.path == "/":
-                    body = HTML.encode(); self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
+                    return self.send_asset("index.html", "text/html; charset=utf-8")
+                if parsed.path == "/app.js": return self.send_asset("app.js", "text/javascript; charset=utf-8")
+                if parsed.path == "/styles.css": return self.send_asset("styles.css", "text/css; charset=utf-8")
+                if parsed.path == "/health":
+                    healthy = app.store.healthy()
+                    return self.send_json(200 if healthy else 503, {"status":"ok" if healthy else "degraded"})
                 if not app.authorized(self.headers.get("Authorization")):
                     return self.send_json(401, {"error": "unauthorized"})
                 try:
-                    if parsed.path == "/api/overview":
-                        return self.send_json(200, {**app.store.overview(), "telemetry": app.telemetry.snapshot()})
+                    if parsed.path == "/api/overview": return self.send_json(200, app.snapshot())
+                    if parsed.path == "/api/projects": return self.send_json(200, app.store.project_list())
+                    if parsed.path == "/api/stream": return self.send_stream()
                     if parsed.path == "/api/events":
                         return self.send_json(200, app.store.events({k:v[0] for k,v in parse_qs(parsed.query).items()}))
                     if parsed.path.startswith("/api/jobs/"):
@@ -54,6 +76,9 @@ class ControlCenter:
                     if parts == ["api", "jobs"]:
                         return self.send_json(201, {"job_id": app.store.create(data)})
                     if len(parts) == 4 and parts[:2] == ["api", "jobs"]:
+                        if parts[3] == "answer":
+                            app.store.answer(int(parts[2]), data["answer"])
+                            return self.send_json(200, {"status":"resumed"})
                         try: result = app.perform_action(int(parts[2]), parts[3], data)
                         except PermissionError: return self.send_json(409, {"error": "confirmation_required"})
                         return self.send_json(200, result)
@@ -63,8 +88,3 @@ class ControlCenter:
         return Handler
     def serve(self, host="127.0.0.1", port=8080):
         ThreadingHTTPServer((host, port), self.handler()).serve_forever()
-
-HTML = '''<!doctype html><meta charset="utf-8"><title>Agent Control Center</title><style>
-body{font:14px system-ui;background:#0b1020;color:#e8ecf4;margin:0}header{padding:20px;background:#151d35}main{padding:20px;max-width:1200px;margin:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}.card{background:#151d35;border:1px solid #2a3658;border-radius:10px;padding:14px}.flow{font-size:18px;margin:18px 0;color:#8bd5ff}button,input{padding:8px;background:#202c4b;color:white;border:1px solid #46577e;border-radius:5px}table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #2a3658;text-align:left}.ok{color:#8ff0a4}</style>
-<header><h1>Homelab Agent Control Center</h1><input id=t type=password placeholder="API token"><button onclick=load()>Connect</button></header><main><div class=flow>Planner → Coder → Reviewer ↩ Changes Requested → Verification → Commit → Planner</div><div id=cards class=grid></div><h2>Create job</h2><div class=card><input id=goal placeholder="Goal"><input id=repo placeholder="Repository"><input id=branch placeholder="Worker branch"><button onclick=createJob()>Create</button></div><h2>Jobs</h2><div class=card><table><thead><tr><th>ID</th><th>Goal</th><th>Status</th><th>Phase</th><th>Iteration</th><th>Controls</th></tr></thead><tbody id=jobs></tbody></table></div><h2>Recent durable events</h2><div id=events class=card></div></main><script>
-let token='';async function request(p,o={}){o.headers={...(o.headers||{}),Authorization:'Bearer '+token,'Content-Type':'application/json'};let r=await fetch(p,o);if(!r.ok)throw Error(r.status);return r.json()}async function load(){token=t.value;let o=await request('/api/overview');cards.innerHTML=`<div class=card><b>PostgreSQL</b><p class=ok>connected</p></div><div class=card><b>Ollama</b><pre>${JSON.stringify(o.telemetry.ollama,null,2)}</pre></div><div class=card><b>GPU</b><pre>${JSON.stringify(o.telemetry.gpu,null,2)}</pre></div><div class=card><b>Inference</b><pre>${JSON.stringify(o.inference,null,2)}</pre></div>`;jobs.innerHTML=o.jobs.map(j=>`<tr><td>${j.id}</td><td>${esc(j.goal)}</td><td>${j.status}</td><td>${j.current_phase||''}</td><td>${j.iteration_count}</td><td><button onclick=act(${j.id},'pause')>Pause</button> <button onclick=act(${j.id},'resume')>Resume</button> <button onclick=act(${j.id},'cancel')>Cancel</button></td></tr>`).join('');let e=await request('/api/events');events.innerHTML=e.slice(0,50).map(x=>`<p><b>${x.created_at}</b> ${esc(x.agent)}: ${esc(x.event_type)}</p>`).join('')}async function createJob(){await request('/api/jobs',{method:'POST',body:JSON.stringify({goal:goal.value,repository:repo.value,branch:branch.value})});load()}async function act(id,a){if(a==='cancel'&&!confirm('Cancel this job?'))return;await request(`/api/jobs/${id}/${a}`,{method:'POST',body:JSON.stringify({confirm:a==='cancel'})});load()}function esc(s){let d=document.createElement('div');d.textContent=s;return d.innerHTML}setInterval(()=>{if(token)load()},5000)</script>'''

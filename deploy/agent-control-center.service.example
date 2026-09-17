@@ -13,6 +13,9 @@ Restart=always
 RestartSec=10
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=strict
+ReadOnlyPaths=/home/finn/work
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

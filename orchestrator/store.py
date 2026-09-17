@@ -89,6 +89,18 @@ CREATE TABLE IF NOT EXISTS llm_invocations (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS worker_heartbeats (
+  worker_id TEXT PRIMARY KEY,
+  component TEXT NOT NULL,
+  status TEXT NOT NULL,
+  current_job_id BIGINT REFERENCES jobs(id),
+  current_step_id BIGINT REFERENCES steps(id),
+  current_action TEXT,
+  started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  metadata JSONB NOT NULL DEFAULT '{}'
+);
+
 CREATE INDEX IF NOT EXISTS steps_orchestrator_claim_idx
   ON steps (status, orchestrator_lease_expires_at, id);
 CREATE INDEX IF NOT EXISTS verification_runs_step_idx
@@ -828,3 +840,17 @@ class OrchestratorStore:
                     "fallback": fallback,
                     "estimated_cloud_cost": estimated_cloud_cost,
                 })
+
+    def heartbeat_worker(self, worker_id: str, component: str, status: str,
+                         *, job_id: int | None = None, step_id: int | None = None,
+                         action: str | None = None, metadata: dict[str, Any] | None = None) -> None:
+        with self.connect() as connection:
+            connection.execute("""INSERT INTO worker_heartbeats
+            (worker_id,component,status,current_job_id,current_step_id,current_action,metadata)
+            VALUES(%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(worker_id) DO UPDATE SET component=EXCLUDED.component,
+            status=EXCLUDED.status,current_job_id=EXCLUDED.current_job_id,
+            current_step_id=EXCLUDED.current_step_id,current_action=EXCLUDED.current_action,
+            heartbeat_at=now(),metadata=EXCLUDED.metadata""",
+            (worker_id, component, status, job_id, step_id, action,
+             json.dumps(metadata or {}, default=str)))

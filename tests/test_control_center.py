@@ -22,5 +22,14 @@ def test_cancel_requires_explicit_confirmation(app):
     assert app.perform_action(1, "cancel", {"confirm": True}) == {"status": "cancel"}
 
 def test_dashboard_has_no_arbitrary_command_or_filesystem_api():
-    from control_center.app import HTML
-    assert "shell" not in HTML.lower() and "filesystem" not in HTML.lower()
+    from importlib.resources import files
+    html = files("control_center.static").joinpath("index.html").read_text()
+    assert "shell" not in html.lower() and "filesystem" not in html.lower()
+
+def test_static_dashboard_contains_primary_operator_workflow():
+    from importlib.resources import files
+    html = files("control_center.static").joinpath("index.html").read_text()
+    script = files("control_center.static").joinpath("app.js").read_text()
+    assert "Start a new job" in html
+    assert all(stage in html for stage in ("Planner", "Coder", "Reviewer", "Verification", "Commit"))
+    assert "/api/stream" in script and "Needs attention" in script
