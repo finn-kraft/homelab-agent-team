@@ -394,6 +394,22 @@ class OrchestratorStore:
             if result.rowcount != 1:
                 raise RuntimeError('work package lease is no longer owned')
 
+    def heartbeat_work_package(self, package_id: int, worker_id: str,
+                               lease_seconds: int = 900) -> bool:
+        with self.connect() as connection:
+            result = connection.execute("""UPDATE work_packages SET lease_expires_at=
+                now()+(%s*interval '1 second'), updated_at=now()
+                WHERE id=%s AND worker_id=%s AND status IN ('engineering','review','verifying')""",
+                (lease_seconds, package_id, worker_id))
+            return result.rowcount == 1
+
+    def recover_work_packages(self) -> list[int]:
+        with self.connect() as connection:
+            rows = connection.execute("""UPDATE work_packages SET status='ready',worker_id=NULL,
+                lease_expires_at=NULL,updated_at=now() WHERE status IN ('engineering','review','verifying')
+                AND lease_expires_at < now() RETURNING id""").fetchall()
+            return [row["id"] for row in rows]
+
     def start_engineering_session(self, job_id: int, step_id: int | None,
                                   worker_id: str, starting_commit: str | None = None) -> int:
         with self.connect() as connection:
