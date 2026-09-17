@@ -61,6 +61,7 @@ class CommandResult:
     exit_code: int
     duration_seconds: float
     timed_out: bool = False
+    cancelled: bool = False
 
 
 @dataclass(slots=True)
@@ -70,5 +71,6 @@ class AgentResult:
     files_changed: list[str] = field(default_factory=list)
     commit_sha: str | None = None
     blocker: str | None = None
+    failure_class: str | None = None
     model: str | None = None
     completed_at: datetime | None = None

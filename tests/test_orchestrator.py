@@ -263,9 +263,9 @@ def test_revision_cycle_keeps_same_step_then_replans_after_checkpoint():
 
     assert actions == [
         "planning",
-        "coding",
+        "engineering",
         "review",
-        "coding",
+        "engineering",
         "review",
         "verification",
         "checkpoint",

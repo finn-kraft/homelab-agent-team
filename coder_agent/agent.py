@@ -7,7 +7,7 @@ from typing import Any
 
 from .commands import CommandRejected, CommandRunner
 from .db import Store
-from .git import GitRepository
+from .git import GitError, GitRepository
 from .llm import BackendError, Router
 from .models import AgentResult, Status, Task, WorkPackage
 from agent_core.prompt_budget import (
@@ -16,6 +16,11 @@ from agent_core.prompt_budget import (
     bounded_messages,
     message_chars,
 )
+
+
+# This module is the temporary V1 import location for the V2 EngineeringAgent.
+# New deployments use engineering_agent.cli and engineering_agent imports;
+# CoderAgent remains an explicit compatibility alias at the end of the file.
 from .workspace import Workspace, WorkspaceViolation
 
 
@@ -188,7 +193,7 @@ class EngineeringAgent:
                     controlled = self._controlled_result(task, last_model)
                     if controlled is not None:
                         return controlled
-                    raise RuntimeError("coder lease is no longer owned")
+                    raise RuntimeError("engineering lease is no longer owned")
                 if stagnation >= 3:
                     stagnation_episodes += 1
                     if stagnation_episodes > self.max_stagnation_episodes:
@@ -334,19 +339,45 @@ class EngineeringAgent:
                 coder_response={"reason": "compatibility_turn_limit", "turns": self.max_turns},
             )
             return result
-        except (BackendError, WorkspaceViolation, CommandRejected, RuntimeError, ValueError) as exc:
+        except Exception as exc:
             status = Status.FAILED
+            failure_class = self._classify_failure(exc)
+            blocker = str(exc)
             self.store.update_step(
                 task.step_id,
                 self.worker_id,
                 status,
-                blocker=str(exc),
+                blocker=blocker,
+                coder_response={"failure_class": failure_class, "error": self._redact(blocker)},
             )
+            self.store.event(task, "engineering_failed", {
+                "failure_class": failure_class,
+                "error": self._redact(blocker),
+            })
             return AgentResult(
                 status,
                 "task did not reach review; return step for autonomous recovery",
-                blocker=str(exc),
+                blocker=blocker,
+                failure_class=failure_class,
             )
+
+    @staticmethod
+    def _classify_failure(exc: BaseException) -> str:
+        """Map worker failures to stable operator/retry categories."""
+        if isinstance(exc, BackendError):
+            return "model"
+        if isinstance(exc, (CommandRejected,)):
+            return "tool_policy"
+        if isinstance(exc, (WorkspaceViolation, GitError)):
+            return "repository"
+        if isinstance(exc, ValueError):
+            return "model_action"
+        if isinstance(exc, OSError):
+            return "environment"
+        module = type(exc).__module__
+        if module == "psycopg" or module.startswith("psycopg."):
+            return "database"
+        return "internal"
 
     def _controlled_result(self, task: Task, model: str | None) -> AgentResult | None:
         """Stop at a safe turn boundary when an operator pauses or cancels."""
@@ -357,7 +388,7 @@ class EngineeringAgent:
         if status not in {"paused", "cancelled"}:
             return None
         result_status = Status.PAUSED if status == "paused" else Status.CANCELLED
-        summary = f"job {status}; coder stopped at a safe boundary"
+        summary = f"job {status}; EngineeringAgent stopped at a safe boundary"
         self.store.update_step(
             task.step_id,
             self.worker_id,
@@ -365,7 +396,7 @@ class EngineeringAgent:
             model_used=model,
             coder_response={"reason": f"job_{status}", "summary": summary},
         )
-        self.store.event(task, f"coding_{status}", {"reason": "operator_control", "model": model})
+        self.store.event(task, f"engineering_{status}", {"reason": "operator_control", "model": model})
         return AgentResult(result_status, summary, model=model)
 
     def _execute(self, action: dict[str, Any], workspace: Workspace,
@@ -396,13 +427,18 @@ class EngineeringAgent:
             argv = action.get("argv")
             if not isinstance(argv, list) or not all(isinstance(v, str) for v in argv):
                 raise ValueError("argv must be a string list")
-            result = runner.run(argv, min(int(action.get("timeout", 300)), 900))
+            result = runner.run(
+                argv,
+                min(int(action.get("timeout", 300)), 900),
+                cancel_check=lambda: self._job_controlled(task.job_id),
+            )
             self.store.record_command(task.step_id, result, task.attempt)
             return json.dumps({"stdout": self._redact(result.stdout)[:12_000],
                                "stderr": self._redact(result.stderr)[:12_000],
                                "exit_code": result.exit_code,
                                "duration_seconds": result.duration_seconds,
-                               "timed_out": result.timed_out})
+                               "timed_out": result.timed_out,
+                               "cancelled": result.cancelled})
         if kind == "inspect":
             inspect_kind = str(action["kind"])
             if inspect_kind == "status":
@@ -417,6 +453,13 @@ class EngineeringAgent:
         if kind in {"finish", "blocked"}:
             return kind
         raise ValueError(f"unknown action: {kind}")
+
+    def _job_controlled(self, job_id: int) -> bool:
+        """Return whether an in-flight command should stop at its boundary."""
+        get_status = getattr(self.store, "job_status", None)
+        if get_status is None:
+            return False
+        return get_status(job_id) in {"paused", "cancelled"}
 
     @staticmethod
     def _files_with_likely_secrets(workspace: Workspace, files: set[str]) -> list[str]:
