@@ -92,8 +92,11 @@ class CoderAgent:
             git = GitRepository(runner)
             starting_commit = git.head()
             session_id = None
+            resume_session = getattr(self.store, "resume_engineering_session", None)
+            if resume_session:
+                session_id = resume_session(task.job_id, task.step_id)
             start_session = getattr(self.store, "start_engineering_session", None)
-            if start_session:
+            if session_id is None and start_session:
                 session_id = start_session(task.job_id, task.step_id, self.worker_id, starting_commit)
             current_branch = git.branch()
             if current_branch != task.branch:
@@ -197,6 +200,10 @@ class CoderAgent:
                             coder_response={"summary": result.summary,
                                             "verification": action.get("verification", [])},
                         )
+                        if session_id is not None:
+                            complete_session = getattr(self.store, "complete_engineering_session", None)
+                            if complete_session:
+                                complete_session(session_id)
                         return result
                 messages.extend([{"role": "assistant", "content": response.text},
                                  {"role": "user", "content": observation}])

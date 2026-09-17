@@ -180,6 +180,11 @@ class AgentOrchestrator:
             self._clear_route(self.reviewer)
             decision = self.reviewer.review_once(step_id)
             status = self.store.finish_review_handoff(step_id)
+            sync_package = getattr(self.store, "sync_package_for_step", None)
+            if sync_package:
+                package_status = {"changes_requested": "engineering", "verifying": "verifying"}.get(status)
+                if package_status:
+                    sync_package(step_id, package_status)
             work = self.store.step(step_id) or {}
             self._record_route(
                 self.reviewer, work.get("job_id"), step_id,
@@ -217,6 +222,10 @@ class AgentOrchestrator:
             )
         try:
             next_state = self.store.record_verification(work, self.config.worker_id, result)
+            sync_package = getattr(self.store, "sync_package_for_step", None)
+            if sync_package:
+                package_status = "complete" if next_state == "complete" else ("engineering" if not getattr(result, "passed", False) else "verifying")
+                sync_package(work["id"], package_status, getattr(result, "commit_sha", None))
             self._log("verification_finished", job_id=work["job_id"], step_id=work["id"],
                       passed=bool(getattr(result, "passed", False)), next_state=next_state)
             return AdvanceResult("verification", work["job_id"], work["id"], next_state)

@@ -125,6 +125,13 @@ class Store:
                 (job_id, step_id, worker_id, starting_commit)).fetchone()
             return row["id"]
 
+    def resume_engineering_session(self, job_id, step_id=None):
+        with self.connect() as connection:
+            row = connection.execute("""SELECT id FROM engineering_sessions WHERE job_id=%s
+                AND (%s IS NULL OR step_id=%s) AND completed_at IS NULL
+                ORDER BY updated_at DESC LIMIT 1""", (job_id, step_id, step_id)).fetchone()
+            return row["id"] if row else None
+
     def record_engineering_action(self, session_id, sequence, action, observation="",
                                   model=None, progress_classification=None):
         with self.connect() as connection:
@@ -136,3 +143,8 @@ class Store:
                 (session_id, sequence, model, action, observation[:30000], progress_classification))
             connection.execute("UPDATE engineering_sessions SET turn_count=%s,updated_at=now() WHERE id=%s",
                                (sequence, session_id))
+
+    def complete_engineering_session(self, session_id):
+        with self.connect() as connection:
+            connection.execute("UPDATE engineering_sessions SET completed_at=now(),updated_at=now() WHERE id=%s",
+                               (session_id,))
