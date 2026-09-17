@@ -6,7 +6,7 @@ import hashlib
 import secrets
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from contextlib import contextmanager
 
 import bcrypt
@@ -14,6 +14,8 @@ import bcrypt
 
 SESSION_COOKIE = "control_center_session"
 SESSION_TTL_SECONDS = 12 * 60 * 60
+SESSION_IDLE_TTL_SECONDS = 6 * 60 * 60
+WRITE_RATE_LIMIT = 120
 CSRF_HEADER = "X-CSRF-Token"
 
 
@@ -29,23 +31,40 @@ class RateLimitError(AuthenticationError):
         self.retry_after = retry_after
 
 
+class WriteRateLimitError(RateLimitError):
+    """Raised when one authenticated session sends too many writes."""
+
+
 @dataclass(frozen=True, slots=True)
 class Session:
     token: str
     csrf_token: str
     expires_at: float
+    created_at: float = 0.0
+    last_seen: float = field(default=0.0, compare=False)
+    client_key: str = ""
+    role: str = "operator"
 
 
 class AuthManager:
     """Store only a bcrypt password hash in PostgreSQL; keep opaque sessions in memory."""
 
     def __init__(self, database_url: str, *, secure_cookie: bool = False,
-                 session_ttl: int = SESSION_TTL_SECONDS):
+                 session_ttl: int = SESSION_TTL_SECONDS,
+                 session_idle_ttl: int = SESSION_IDLE_TTL_SECONDS,
+                 write_rate_limit: int = WRITE_RATE_LIMIT,
+                 role: str = "operator"):
         self.database_url = database_url
         self.secure_cookie = secure_cookie
-        self.session_ttl = session_ttl
+        self.session_ttl = max(60, int(session_ttl))
+        self.session_idle_ttl = max(60, int(session_idle_ttl))
+        self.write_rate_limit = max(0, int(write_rate_limit))
+        self.role = str(role or "operator").lower()
+        if self.role not in {"admin", "operator", "viewer"}:
+            raise ValueError("role must be admin, operator, or viewer")
         self._sessions: dict[str, Session] = {}
         self._failures: dict[str, list[float]] = {}
+        self._writes: dict[str, list[float]] = {}
         self._lock = threading.RLock()
 
     @contextmanager
@@ -112,11 +131,12 @@ class AuthManager:
         with self._lock:
             self._failures.pop(client_key, None)
             token = secrets.token_urlsafe(32)
-            session = Session(token, secrets.token_urlsafe(24), now + self.session_ttl)
+            session = Session(token, secrets.token_urlsafe(24), now + self.session_ttl,
+                              now, now, str(client_key), self.role)
             self._sessions[self._digest(token)] = session
             return session
 
-    def authenticate(self, token: str | None) -> Session | None:
+    def authenticate(self, token: str | None, client_key: str | None = None) -> Session | None:
         if not token:
             return None
         digest = self._digest(token)
@@ -124,10 +144,17 @@ class AuthManager:
             session = self._sessions.get(digest)
             if not session:
                 return None
-            if session.expires_at <= time.time():
+            now = time.time()
+            if session.expires_at <= now or (
+                session.last_seen and now - session.last_seen > self.session_idle_ttl
+            ):
                 self._sessions.pop(digest, None)
                 return None
-            return session
+            if client_key and session.client_key and not secrets.compare_digest(session.client_key, str(client_key)):
+                return None
+            refreshed = replace(session, last_seen=now)
+            self._sessions[digest] = refreshed
+            return refreshed
 
     def check_csrf(self, session: Session, value: str | None) -> bool:
         return bool(value) and secrets.compare_digest(session.csrf_token, value)
@@ -136,3 +163,29 @@ class AuthManager:
         if token:
             with self._lock:
                 self._sessions.pop(self._digest(token), None)
+
+    def check_write(self, session: Session) -> None:
+        """Enforce role and per-session write limits before CSRF-protected writes."""
+        if session.role == "viewer":
+            raise AuthenticationError("read_only_session")
+        if not self.write_rate_limit:
+            return
+        now = time.time()
+        digest = self._digest(session.token)
+        with self._lock:
+            writes = [value for value in self._writes.get(digest, []) if now - value < 60]
+            if len(writes) >= self.write_rate_limit:
+                retry_after = max(1, int(60 - (now - writes[0])))
+                self._writes[digest] = writes
+                raise WriteRateLimitError(retry_after)
+            writes.append(now)
+            self._writes[digest] = writes
+
+    def session_info(self, session: Session) -> dict[str, object]:
+        return {
+            "role": session.role,
+            "created_at": session.created_at,
+            "last_seen": session.last_seen,
+            "expires_at": session.expires_at,
+            "idle_timeout_seconds": self.session_idle_ttl,
+        }

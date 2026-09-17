@@ -9,6 +9,7 @@ transactional, and accompanied by an append-only event.
 
 import json
 import os
+import re
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -17,13 +18,21 @@ from typing import Any, Iterable
 from engineering_agent.models import Status, Task
 
 
-MIGRATION_VERSION = "orchestrator-0011"
+MIGRATION_VERSION = "orchestrator-0012"
+
+_REDACTION_PATTERNS = (
+    re.compile(r"(?i)(?:api[_-]?key|token|password|secret)\s*[=:]\s*[^\s,}]+"),
+    re.compile(r"\bpostgres(?:ql)?(?:\+[A-Za-z0-9_-]+)?://[^\s]+"),
+    re.compile(r"\bsk-(?:or-v1-)?[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+)
 
 # Keep this list deliberately small and authoritative. Health checks should
 # answer whether the workflow can safely run, not whether every optional
 # reporting table happens to exist.
 REQUIRED_TABLE_COLUMNS = {
     "jobs": {"id", "status", "current_phase", "planner_lease_expires_at"},
+<<<<<<< HEAD
     "steps": {
         "id",
         "job_id",
@@ -33,6 +42,10 @@ REQUIRED_TABLE_COLUMNS = {
         "review_lease_expires_at",
     },
     "events": {"job_id", "event_type", "structured_payload"},
+=======
+    "steps": {"id", "job_id", "status", "lease_expires_at", "worker_id"},
+    "events": {"job_id", "event_type", "structured_payload", "correlation_id"},
+>>>>>>> d1d5d766c27317542f46380d9c2f4c44414ce79a
     "command_runs": {"step_id", "timed_out", "cancelled"},
     "reviews": {"step_id", "verdict"},
     "verification_runs": {"step_id", "status"},
@@ -42,6 +55,7 @@ REQUIRED_TABLE_COLUMNS = {
     "worker_heartbeats": {"worker_id", "component", "heartbeat_at"},
     "phase_metrics": {"phase", "duration_seconds", "prompt_chars", "prompt_tokens", "context_sha256"},
     "control_operations": {"operation_id", "job_id", "action", "status", "created_at", "updated_at"},
+    "telemetry_samples": {"id", "sampled_at", "gpu", "ollama", "routing_agent", "inference"},
 }
 
 MIGRATION_SQL = """
@@ -237,6 +251,11 @@ ALTER TABLE phase_metrics ADD COLUMN IF NOT EXISTS context_sha256 TEXT;
 CREATE INDEX IF NOT EXISTS phase_metrics_job_idx
   ON phase_metrics (job_id, completed_at DESC);
 
+ALTER TABLE events ADD COLUMN IF NOT EXISTS correlation_id TEXT;
+UPDATE events SET correlation_id=md5(id::text || created_at::text)
+  WHERE correlation_id IS NULL;
+ALTER TABLE events ALTER COLUMN correlation_id SET DEFAULT '';
+
 CREATE TABLE IF NOT EXISTS control_operations (
   operation_id TEXT PRIMARY KEY,
   job_id BIGINT REFERENCES jobs(id) ON DELETE SET NULL,
@@ -252,6 +271,19 @@ CREATE TABLE IF NOT EXISTS control_operations (
 );
 CREATE INDEX IF NOT EXISTS control_operations_job_idx
   ON control_operations (job_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS telemetry_samples (
+  id BIGSERIAL PRIMARY KEY,
+  sampled_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  observed_at TIMESTAMPTZ,
+  gpu JSONB NOT NULL DEFAULT '{}',
+  ollama JSONB NOT NULL DEFAULT '{}',
+  routing_agent JSONB NOT NULL DEFAULT '{}',
+  inference JSONB NOT NULL DEFAULT '{}'
+);
+ALTER TABLE telemetry_samples ADD COLUMN IF NOT EXISTS inference JSONB NOT NULL DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS telemetry_samples_sampled_idx
+  ON telemetry_samples (sampled_at DESC);
 
 CREATE TABLE IF NOT EXISTS human_queue (
   id BIGSERIAL PRIMARY KEY,
@@ -380,11 +412,13 @@ class OrchestratorStore:
         payload: dict[str, Any],
         *,
         agent: str = "agent-orchestrator",
+        correlation_id: str | None = None,
     ) -> None:
         connection.execute(
-            """INSERT INTO events(job_id,step_id,agent,event_type,structured_payload)
-            VALUES(%s,%s,%s,%s,%s)""",
-            (job_id, step_id, agent, event_type, json.dumps(payload, default=str)),
+            """INSERT INTO events(job_id,step_id,agent,event_type,structured_payload,correlation_id)
+            VALUES(%s,%s,%s,%s,%s,%s)""",
+            (job_id, step_id, agent, event_type, json.dumps(payload, default=str),
+             correlation_id or str(uuid.uuid4())),
         )
 
     @staticmethod
@@ -440,12 +474,84 @@ class OrchestratorStore:
                 "SELECT * FROM steps WHERE job_id=%s ORDER BY sequence", (job_id,)
             ).fetchall())
             events = list(connection.execute(
-                """SELECT id,step_id,agent,event_type,structured_payload,created_at
+                """SELECT id,step_id,agent,event_type,structured_payload,correlation_id,created_at
                 FROM events WHERE job_id=%s ORDER BY id DESC LIMIT 100""",
                 (job_id,),
             ).fetchall())
             return {"job": dict(job), "steps": [dict(row) for row in steps],
                     "events": [dict(row) for row in events]}
+
+    def event_cursor(self) -> int:
+        """Return the append-only event position used by resumable SSE clients."""
+        with self.connect() as connection:
+            row = connection.execute("SELECT COALESCE(MAX(id), 0) AS cursor FROM events").fetchone()
+            return int(row["cursor"] or 0)
+
+    def events_since(self, after_id: int = 0, limit: int = 500) -> list[dict[str, Any]]:
+        limit = max(1, min(2_000, int(limit)))
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT id,job_id,step_id,agent,event_type,structured_payload,
+                          correlation_id,created_at
+                   FROM events WHERE id>%s ORDER BY id LIMIT %s""",
+                (max(0, int(after_id)), limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def record_telemetry(self, sample: dict[str, Any], min_interval_seconds: int = 1) -> bool:
+        """Persist a redacted, bounded telemetry sample at most once per interval."""
+        if not isinstance(sample, dict):
+            return False
+
+        def allow(value: Any, keys: set[str]) -> dict[str, Any]:
+            return {key: value[key] for key in keys if isinstance(value, dict) and key in value}
+
+        gpu = allow(sample.get("gpu", {}), {
+            "status", "name", "utilization_percent", "vram_used_mb", "vram_total_mb",
+            "temperature_c", "power_w", "context_length",
+        })
+        ollama = allow(sample.get("ollama", {}), {
+            "status", "online", "version", "model", "context_length", "size",
+            "size_vram", "processor", "loaded_count", "model_count", "expires_at",
+        })
+        routing = allow(sample.get("routing_agent", {}), {"status", "service", "model", "provider"})
+        inference = allow(sample.get("inference", {}), {
+            "local_requests", "cloud_requests", "fallback_requests", "estimated_cloud_spend",
+            "local_average_latency",
+        })
+        observed_at = sample.get("observed_at")
+        with self.connect() as connection:
+            recent = connection.execute(
+                "SELECT 1 FROM telemetry_samples WHERE sampled_at >= now()-(%s*interval '1 second') LIMIT 1",
+                (max(0, int(min_interval_seconds)),),
+            ).fetchone()
+            if recent:
+                return False
+            connection.execute(
+                """INSERT INTO telemetry_samples(observed_at,gpu,ollama,routing_agent,inference)
+                   VALUES(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb)""",
+                (observed_at, json.dumps(gpu, default=str), json.dumps(ollama, default=str),
+                 json.dumps(routing, default=str), json.dumps(inference, default=str)),
+            )
+            # Keep the one-second stream useful without allowing the history
+            # table to grow forever on long-lived homelab installations.
+            connection.execute(
+                "DELETE FROM telemetry_samples WHERE sampled_at < now() - interval '30 days'"
+            )
+            return True
+
+    def telemetry_history(self, hours: int = 24, limit: int = 1_440) -> list[dict[str, Any]]:
+        hours = max(1, min(24 * 7, int(hours)))
+        limit = max(1, min(10_000, int(limit)))
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT id,sampled_at,observed_at,gpu,ollama,routing_agent,inference
+                   FROM telemetry_samples
+                   WHERE sampled_at >= now()-(%s*interval '1 hour')
+                   ORDER BY sampled_at DESC LIMIT %s""",
+                (hours, limit),
+            ).fetchall()
+            return [dict(row) for row in reversed(rows)]
 
     def status(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -1773,15 +1879,24 @@ class OrchestratorStore:
             raise ValueError("invalid control operation status")
         completed = "now()" if status in {"applied", "failed"} else "NULL"
         with self.connect() as connection:
+            safe_detail = (json.dumps(detail, default=str) if detail is not None else None)
+            safe_detail = self._redact_sensitive(safe_detail) if safe_detail is not None else None
+            safe_error = self._redact_sensitive(str(error)[:30_000]) if error else None
             result = connection.execute(
                 f"""UPDATE control_operations SET status=%s,
                     detail=COALESCE(%s::jsonb,detail),error=%s,updated_at=now(),
                     completed_at={completed} WHERE operation_id=%s""",
-                (status, json.dumps(detail, default=str) if detail is not None else None,
-                 str(error)[:30_000] if error else None, operation_id),
+                (status, safe_detail, safe_error, operation_id),
             )
             if result.rowcount != 1:
                 raise KeyError(operation_id)
+
+    @staticmethod
+    def _redact_sensitive(value: str) -> str:
+        redacted = str(value)
+        for pattern in _REDACTION_PATTERNS:
+            redacted = pattern.sub("[REDACTED]", redacted)
+        return redacted
 
     def control_operation(self, operation_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:

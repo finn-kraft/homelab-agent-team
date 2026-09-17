@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -234,9 +235,9 @@ class PlannerStore:
     def _event(connection, job_id: int, step_id: int | None,
                event_type: str, payload: dict) -> None:
         connection.execute(
-            """INSERT INTO events(job_id,step_id,agent,event_type,structured_payload)
-            VALUES(%s,%s,'planner-agent',%s,%s)""",
-            (job_id, step_id, event_type, json.dumps(payload, default=str)),
+            """INSERT INTO events(job_id,step_id,agent,event_type,structured_payload,correlation_id)
+            VALUES(%s,%s,'planner-agent',%s,%s,%s)""",
+            (job_id, step_id, event_type, json.dumps(payload, default=str), str(uuid.uuid4())),
         )
 
     @staticmethod

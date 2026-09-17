@@ -3,6 +3,7 @@ import json
 import os
 from datetime import datetime, timezone
 from orchestrator.store import OrchestratorStore
+from orchestrator.verification import SecretScanner
 from planner_agent.store import PlannerStore
 from orchestrator.worktrees import WorktreeManager
 
@@ -52,7 +53,7 @@ class ControlStore:
             EXTRACT(EPOCH FROM (now()-heartbeat_at))::double precision heartbeat_age_seconds
             FROM worker_heartbeats ORDER BY component,worker_id""").fetchall())
             agent_events = list(connection.execute("""SELECT DISTINCT ON(agent) agent,event_type,
-            structured_payload,created_at FROM events ORDER BY agent,created_at DESC""").fetchall())
+            structured_payload,correlation_id,created_at FROM events ORDER BY agent,created_at DESC""").fetchall())
             active_work = list(connection.execute("""SELECT s.id step_id,s.job_id,s.status,s.title,
             s.attempt_count,s.files_changed,j.goal,j.current_phase,s.worker_id,
             s.lease_expires_at,s.reviewer_worker_id,s.review_lease_expires_at,
@@ -102,6 +103,9 @@ class ControlStore:
                 "SELECT operation_id,job_id,action,status,requested_by,detail,error,created_at,updated_at,completed_at "
                 "FROM control_operations ORDER BY created_at DESC LIMIT 100"
             ).fetchall())
+            event_cursor = connection.execute(
+                "SELECT COALESCE(MAX(id), 0) AS cursor FROM events"
+            ).fetchone()["cursor"]
         jobs = self.workflow.status()
         for work in active_work:
             status = work.get("status")
@@ -125,6 +129,7 @@ class ControlStore:
                 "inference": dict(inference),
                 "phase_metrics": [dict(x) for x in phase_metrics],
                 "operations": [dict(x) for x in operations],
+                "event_cursor": int(event_cursor or 0),
                 "recent_commits": [dict(x) for x in commits],
                 "attention_count": sum(j["status"] in {"needs_human","blocked","failed"} for j in jobs)}
     def project_list(self):
@@ -264,12 +269,58 @@ class ControlStore:
         clauses, values = [], []
         for key in ("job_id","step_id","agent","event_type"):
             if filters.get(key): clauses.append(f"{key}=%s"); values.append(filters[key])
+        if filters.get("after_id"):
+            clauses.append("id>%s"); values.append(max(0, int(filters["after_id"])))
         if filters.get("failures"): clauses.append("(event_type LIKE '%%failed%%' OR event_type LIKE '%%blocked%%' OR event_type LIKE '%%crashed%%')")
         if filters.get("routing"): clauses.append("event_type IN ('model_escalated','model_route_fallback')")
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self.workflow.connect() as connection:
             return [dict(x) for x in connection.execute(
                 "SELECT * FROM events" + where + " ORDER BY id DESC LIMIT 500", values).fetchall()]
+
+    def events_since(self, after_id=0, limit=500):
+        return self.workflow.events_since(int(after_id), int(limit))
+
+    def telemetry_history(self, hours=24, limit=1440):
+        return self.workflow.telemetry_history(hours, limit)
+
+    def record_telemetry(self, sample):
+        return self.workflow.record_telemetry(sample)
+
+    def inference_snapshot(self):
+        with self.workflow.connect() as connection:
+            row = connection.execute("""SELECT count(*) FILTER(WHERE provider='openrouter') cloud_requests,
+                count(*) FILTER(WHERE provider<>'openrouter') local_requests,
+                count(*) FILTER(WHERE fallback) fallback_requests,
+                COALESCE(sum(estimated_cloud_cost),0) estimated_cloud_spend,
+                avg(latency_seconds) FILTER(WHERE provider<>'openrouter') local_average_latency
+                FROM llm_invocations""").fetchone()
+            return dict(row) if row else {}
+
+    def secret_redaction_audit(self, limit=500):
+        """Report possible credential leaks without returning their contents."""
+        scanner = SecretScanner()
+        limit = max(1, min(2_000, int(limit)))
+        checked = 0
+        findings: set[str] = set()
+        with self.workflow.connect() as connection:
+            rows = connection.execute(
+                """SELECT structured_payload AS value FROM events ORDER BY id DESC LIMIT %s""",
+                (limit,),
+            ).fetchall()
+            rows += connection.execute(
+                """SELECT stdout || E'\n' || stderr AS value FROM command_runs
+                   ORDER BY id DESC LIMIT %s""", (limit,)
+            ).fetchall()
+            rows += connection.execute(
+                """SELECT detail::text || COALESCE(error,'') AS value FROM control_operations
+                   ORDER BY created_at DESC LIMIT %s""", (limit,)
+            ).fetchall()
+        for row in rows:
+            checked += 1
+            findings.update(scanner.scan_text(str(row.get("value") or "")))
+        return {"checked": checked, "clean": not findings, "findings": sorted(findings),
+                "redaction_policy": "command output and operator details are redacted before persistence"}
     def create(self, data):
         project = self.projects.get(data["project_id"]); goal = str(data["goal"]).strip()
         if len(goal) < 10 or len(goal) > 12_000: raise ValueError("goal must be 10-12000 characters")

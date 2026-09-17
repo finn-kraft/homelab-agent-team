@@ -8,7 +8,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from urllib.parse import parse_qs, urlparse
 
-from .auth import AuthManager, AuthenticationError, CSRF_HEADER, RateLimitError, SESSION_COOKIE
+from .auth import (AuthManager, AuthenticationError, CSRF_HEADER, RateLimitError,
+                   SESSION_COOKIE, WriteRateLimitError)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -32,7 +33,61 @@ class ControlCenter:
         self.store, self.telemetry, self.auth = store, telemetry, auth
 
     def snapshot(self):
-        return {**self.store.overview(), "telemetry": self.telemetry.snapshot()}
+        overview = self.store.overview()
+        telemetry = self.telemetry_snapshot(overview)
+        return {**overview, "telemetry": telemetry,
+                "alerts": self._telemetry_alerts(telemetry, overview)}
+
+    def telemetry_snapshot(self, overview=None):
+        telemetry = self.telemetry.snapshot()
+        inference = (overview or {}).get("inference") if isinstance(overview, dict) else None
+        if inference is None:
+            getter = getattr(self.store, "inference_snapshot", None)
+            inference = getter() if getter is not None else {}
+        sample = {**telemetry, "inference": inference}
+        record = getattr(self.store, "record_telemetry", None)
+        if record is not None:
+            try:
+                record(sample)
+            except Exception:
+                LOGGER.debug("telemetry_persist_failed", exc_info=True)
+        return telemetry
+
+    @staticmethod
+    def _telemetry_alerts(telemetry, overview):
+        alerts = []
+        gpu = telemetry.get("gpu", {}) if isinstance(telemetry, dict) else {}
+        ollama = telemetry.get("ollama", {}) if isinstance(telemetry, dict) else {}
+        router = telemetry.get("routing_agent", {}) if isinstance(telemetry, dict) else {}
+        try:
+            temperature = float(gpu.get("temperature_c"))
+            if temperature >= 85:
+                alerts.append({"severity": "critical" if temperature >= 90 else "warning",
+                               "source": "gpu", "message": f"GPU temperature is {temperature:.0f}°C."})
+        except (TypeError, ValueError):
+            pass
+        try:
+            utilization = float(gpu.get("utilization_percent"))
+            if utilization >= 98:
+                alerts.append({"severity": "warning", "source": "gpu",
+                               "message": "GPU utilization has been at capacity."})
+        except (TypeError, ValueError):
+            pass
+        if ollama.get("status") not in {None, "online", "not_configured"}:
+            alerts.append({"severity": "warning", "source": "ollama",
+                           "message": "Ollama is unavailable; local inference may be delayed."})
+        if router.get("status") == "offline":
+            alerts.append({"severity": "warning", "source": "routing-agent",
+                           "message": "Routing Agent is offline; fallback policy is active."})
+        for worker in overview.get("workers", []):
+            if worker.get("component") == "orchestrator" and worker.get("online") is False:
+                alerts.append({"severity": "warning", "source": "orchestrator",
+                               "message": "Orchestrator heartbeat is stale."})
+        for work in overview.get("active_work", []):
+            if work.get("stale_warning"):
+                alerts.append({"severity": "warning", "source": "workflow",
+                               "message": f"Step {work.get('step_id')} is stale: {work['stale_warning']}"})
+        return alerts
 
     def perform_action(self, job_id, action, data):
         if action not in {"pause", "resume", "cancel", "remove", "retry",
@@ -122,6 +177,8 @@ class ControlCenter:
                     "connect-src 'self'; img-src 'self' data:; object-src 'none'; "
                     "base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
                 )
+                if app.auth.secure_cookie:
+                    self.send_header("Strict-Transport-Security", "max-age=31536000")
                 super().end_headers()
 
             def send_json(self, status, payload, headers=None):
@@ -146,6 +203,8 @@ class ControlCenter:
 
             def session_cookie_header(self, token, *, expires=False):
                 value = f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax"
+                if not expires:
+                    value += f"; Max-Age={max(60, int(getattr(app.auth, 'session_ttl', 43200)))}"
                 if app.auth.secure_cookie:
                     value += "; Secure"
                 if expires:
@@ -156,7 +215,13 @@ class ControlCenter:
                 self.send_header("Set-Cookie", self.session_cookie_header(token, expires=expires))
 
             def session(self):
-                return app.auth.authenticate(app._cookie_token(self.headers.get("Cookie")))
+                token = app._cookie_token(self.headers.get("Cookie"))
+                try:
+                    return app.auth.authenticate(token, self.client_address[0])
+                except TypeError:
+                    # Compatibility with small test doubles and older auth
+                    # implementations that do not bind sessions to a client.
+                    return app.auth.authenticate(token)
 
             def require_session(self):
                 value = self.session()
@@ -170,19 +235,51 @@ class ControlCenter:
                     return False
                 return True
 
+            def require_write(self, session):
+                check = getattr(app.auth, "check_write", None)
+                if check is None:
+                    return True
+                try:
+                    check(session)
+                except WriteRateLimitError as exc:
+                    self.send_json(429, {"error": "write_rate_limited"},
+                                   {"Retry-After": str(exc.retry_after)})
+                    return False
+                except AuthenticationError:
+                    self.send_json(403, {"error": "read_only_session"})
+                    return False
+                return True
+
             def send_stream(self, session):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "keep-alive")
+                self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
+                try:
+                    last_id = max(0, int(self.headers.get("Last-Event-ID", "0")))
+                except ValueError:
+                    last_id = 0
+                events_since = getattr(app.store, "events_since", None)
                 for _ in range(12):
                     if not app.auth.authenticate(session.token):
                         break
                     try:
-                        payload = json.dumps(app.snapshot(), default=str)
-                        self.wfile.write(f"event: snapshot\ndata: {payload}\n\n".encode())
+                        snapshot = app.snapshot()
+                        cursor = int(snapshot.get("event_cursor", 0) or 0)
+                        if events_since is not None and last_id and cursor > last_id:
+                            for event in events_since(last_id):
+                                event_id = int(event.get("id", 0))
+                                payload = json.dumps(event, default=str)
+                                self.wfile.write(
+                                    f"id: {event_id}\nevent: workflow\ndata: {payload}\n\n".encode()
+                                )
+                                last_id = max(last_id, event_id)
+                        payload = json.dumps(snapshot, default=str)
+                        self.wfile.write(f"id: {cursor}\nevent: snapshot\ndata: {payload}\n\n".encode())
                         self.wfile.flush()
+                        last_id = max(last_id, cursor)
                     except (BrokenPipeError, ConnectionResetError):
                         break
                     time.sleep(5)
@@ -206,11 +303,19 @@ class ControlCenter:
                     return
                 try:
                     if parsed.path == "/api/session":
-                        return self.send_json(200, {"authenticated": True, "csrf_token": session.csrf_token})
+                        return self.send_json(200, {"authenticated": True, "csrf_token": session.csrf_token,
+                                                    **getattr(app.auth, "session_info", lambda value: {})(session)})
                     if parsed.path == "/api/overview":
                         return self.send_json(200, app.snapshot())
                     if parsed.path == "/api/telemetry":
-                        return self.send_json(200, app.telemetry.snapshot())
+                        return self.send_json(200, app.telemetry_snapshot())
+                    if parsed.path == "/api/telemetry/history":
+                        query = parse_qs(parsed.query)
+                        hours = int(query.get("hours", [24])[0])
+                        limit = int(query.get("limit", [1440])[0])
+                        return self.send_json(200, app.store.telemetry_history(hours, limit))
+                    if parsed.path == "/api/security/audit":
+                        return self.send_json(200, app.store.secret_redaction_audit())
                     if parsed.path == "/api/projects":
                         return self.send_json(200, app.store.project_list())
                     if parsed.path == "/api/missions":
@@ -286,6 +391,8 @@ class ControlCenter:
                     app.auth.logout(session.token)
                     return self.send_json(200, {"status": "logged_out"},
                                           {"Set-Cookie": self.session_cookie_header("", expires=True)})
+                if not self.require_write(session):
+                    return
                 try:
                     parts = parsed.path.strip("/").split("/")
                     if parts == ["api", "jobs"]:
