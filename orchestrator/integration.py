@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import tempfile
 from pathlib import Path
+import re
 from typing import Any
 
 
@@ -21,6 +22,51 @@ class IntegrationManager:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git command failed")
         return result.stdout.strip()
 
+    @staticmethod
+    def _mark_roadmap_item(worktree: Path, reference: str | None,
+                           objective: str | None = None) -> str | None:
+        """Check off one roadmap line in the branch being integrated.
+
+        The reference is stored as ``path/to/roadmap.md:line`` by the
+        deterministic roadmap parser.  Only that exact checkbox is changed,
+        and the resulting marker is committed in the mission branch so the
+        completion is reviewable and reversible.
+        """
+        if not reference:
+            return None
+        match = re.match(r"^(?P<path>.+):(?P<line>[0-9]+)$", str(reference))
+        if not match:
+            raise ValueError(f"invalid roadmap reference: {reference}")
+        relative = Path(match.group("path"))
+        roadmap = (worktree / relative).resolve()
+        root = worktree.resolve()
+        if not roadmap.is_relative_to(root):
+            raise ValueError("roadmap reference escapes the integration worktree")
+        if not roadmap.is_file():
+            raise ValueError(f"roadmap file does not exist: {relative}")
+        lines = roadmap.read_text(encoding="utf-8").splitlines(keepends=True)
+        index = int(match.group("line")) - 1
+        if index < 0 or index >= len(lines):
+            raise ValueError(f"roadmap line is out of range: {reference}")
+        if objective:
+            normalise = lambda value: " ".join(str(value).split()).casefold()
+            if normalise(objective) not in normalise(lines[index]):
+                raise ValueError(f"roadmap reference does not match package objective: {reference}")
+        if not re.search(r"\[[ xX]\]", lines[index]):
+            raise ValueError(f"roadmap line is not a checkbox: {reference}")
+        updated = re.sub(r"\[[ ]\]", "[x]", lines[index], count=1)
+        if updated == lines[index]:
+            return None
+        lines[index] = updated
+        roadmap.write_text("".join(lines), encoding="utf-8")
+        IntegrationManager._git(worktree, "add", "--", str(relative))
+        IntegrationManager._git(
+            worktree, "-c", "user.name=Homelab Agent Team",
+            "-c", "user.email=agent@homelab.local", "commit", "-m",
+            f"chore: mark roadmap item complete ({reference})",
+        )
+        return IntegrationManager._git(worktree, "rev-parse", "HEAD")
+
     def integrate(self, package: dict[str, Any], repository: str | Path,
                   *, target_branch: str | None = None) -> dict[str, Any]:
         package_id = int(package["id"])
@@ -30,6 +76,14 @@ class IntegrationManager:
             raise ValueError(
                 f"package {package_id} is not verified and complete (status={package_status})"
             )
+        evidence_getter = getattr(self.store, "package_completion_evidence", None)
+        if evidence_getter is not None:
+            evidence = evidence_getter(package_id)
+            if not evidence.get("ready_for_integration", evidence.get("eligible")):
+                missing = [name for name, present in evidence.get("checks", {}).items() if not present]
+                raise ValueError(
+                    f"package {package_id} lacks completion evidence: {', '.join(missing)}"
+                )
         source_branch = str(package.get("branch") or "")
         target = target_branch or str(package.get("target_branch") or "")
         if not target:
@@ -87,13 +141,25 @@ class IntegrationManager:
                     update_mission(mission_id, "blocked")
                 return {"status": "conflict", "package_id": package_id,
                         "target_branch": target, "error": (merge.stderr or merge.stdout).strip()}
+            roadmap_commit = self._mark_roadmap_item(
+                worktree, package.get("roadmap_reference"), package.get("objective")
+            )
             merged = self._git(worktree, "rev-parse", "HEAD")
             self._git(root, "update-ref", f"refs/heads/{target}", merged, base)
             self.store.upsert_integration(mission_id=mission_id, package_id=package_id,
                                           source_branch=source_branch, target_branch=target,
                                           status="complete", commit_sha=merged)
+            try:
+                from .mission import MissionManager
+                roadmap = str(package.get("roadmap_reference") or "docs/roadmap.md").rsplit(":", 1)[0]
+                MissionManager(self.store).refresh_status(mission_id, roadmap=roadmap)
+            except Exception:
+                # Integration is durable and authoritative; a read-model
+                # refresh can safely be retried by the next mission pass.
+                pass
             return {"status": "complete", "package_id": package_id,
-                    "target_branch": target, "commit_sha": merged}
+                    "target_branch": target, "commit_sha": merged,
+                    "roadmap_marked": bool(roadmap_commit)}
         except Exception as exc:
             self.store.upsert_integration(mission_id=mission_id, package_id=package_id,
                                           source_branch=source_branch, target_branch=target,

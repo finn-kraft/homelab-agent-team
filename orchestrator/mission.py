@@ -86,10 +86,27 @@ class MissionManager:
         if not mission:
             raise KeyError(mission_id)
         packages = mission.get("packages", [])
-        if packages and all(p.get("status") == "complete" for p in packages):
-            existing_refs = {str(p.get("roadmap_reference")) for p in packages if p.get("roadmap_reference")}
+        evidence_getter = getattr(self.store, "package_completion_evidence", None)
+        evidence_by_package: dict[int, dict[str, Any]] = {}
+        if evidence_getter is not None:
+            for package in packages:
+                try:
+                    evidence_by_package[int(package["id"])] = evidence_getter(int(package["id"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+        def is_complete(package: dict[str, Any]) -> bool:
+            if package.get("status") != "complete":
+                return False
+            evidence = evidence_by_package.get(int(package["id"])) if evidence_getter is not None else None
+            return bool(evidence["eligible"]) if evidence is not None else evidence_getter is None
+
+        completed_refs = {
+            str(package.get("roadmap_reference"))
+            for package in packages if package.get("roadmap_reference") and is_complete(package)
+        }
+        if packages and all(is_complete(package) for package in packages):
             remaining = [item for item in self.discover(mission["repository"], roadmap)
-                         if item.reference not in existing_refs]
+                         if item.reference not in completed_refs]
             status = "active" if remaining else "complete"
         elif any(p.get("status") in {"blocked", "failed"} for p in packages):
             status = "blocked"

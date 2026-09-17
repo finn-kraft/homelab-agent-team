@@ -58,6 +58,11 @@ milestone: persisted one-second telemetry history with dashboard charts and
 alerts, correlation-aware resumable SSE, role-aware expiring sessions, write
 rate limiting, HSTS guidance, and a read-only secret-redaction audit.
 
+Item 28 is implemented with a single completion gate: roadmap entries count as
+complete only when the package, independent review, verification, checkpoint,
+and mission-branch integration all have durable evidence. Integration commits
+the exact roadmap checkbox and records the resulting branch commit.
+
 ## P0 — reliability before unattended operation
 
 1. Fix durable phase truth so status, phase, current step, and the dashboard
@@ -128,7 +133,7 @@ rate limiting, HSTS guidance, and a read-only secret-redaction audit.
 
 ## P2 — missions and roadmap management
 
-28. Mark roadmap items complete only after review, verification, checkpoint, and
+28. [x] Mark roadmap items complete only after review, verification, checkpoint, and
     integration evidence.
 29. Add dependency visualization and mission pause/resume/cancel controls.
 30. Expand human-queue history with evidence, ownership, answer, and outcome.

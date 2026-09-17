@@ -600,13 +600,22 @@ class OrchestratorStore:
         """Return missions with package counts for operators and the UI."""
         with self.connect() as connection:
             rows = connection.execute("""
-                SELECT m.*, count(p.id)::integer AS package_count,
-                  count(p.id) FILTER (WHERE p.status='complete')::integer AS completed_packages,
-                  count(p.id) FILTER (WHERE p.status IN ('ready','engineering','review','verifying'))::integer AS active_packages,
-                  count(p.id) FILTER (WHERE p.status IN ('blocked','failed'))::integer AS blocked_packages,
-                  count(h.id) FILTER (WHERE h.status='open')::integer AS open_human_requests
+                SELECT m.*, count(DISTINCT p.id)::integer AS package_count,
+                  count(DISTINCT p.id) FILTER (WHERE p.status='complete' AND evidence.roadmap_complete)::integer AS completed_packages,
+                  count(DISTINCT p.id) FILTER (WHERE p.status='complete' AND NOT evidence.roadmap_complete)::integer AS roadmap_pending_packages,
+                  count(DISTINCT p.id) FILTER (WHERE p.status IN ('ready','engineering','review','verifying'))::integer AS active_packages,
+                  count(DISTINCT p.id) FILTER (WHERE p.status IN ('blocked','failed'))::integer AS blocked_packages,
+                  count(DISTINCT h.id) FILTER (WHERE h.status='open')::integer AS open_human_requests
                 FROM missions m LEFT JOIN work_packages p ON p.mission_id=m.id
                 LEFT JOIN human_queue h ON h.mission_id=m.id
+                LEFT JOIN LATERAL (
+                  SELECT (
+                    EXISTS (SELECT 1 FROM reviews r WHERE r.step_id=p.step_id AND r.verdict='approved')
+                    AND EXISTS (SELECT 1 FROM verification_runs v WHERE v.step_id=p.step_id AND v.status='passed')
+                    AND EXISTS (SELECT 1 FROM checkpoint_runs c WHERE c.step_id=p.step_id AND c.status='complete' AND c.commit_sha IS NOT NULL)
+                    AND EXISTS (SELECT 1 FROM mission_integrations i WHERE i.package_id=p.id AND i.status='complete' AND i.commit_sha IS NOT NULL)
+                  ) AS roadmap_complete
+                ) evidence ON TRUE
                 GROUP BY m.id ORDER BY m.updated_at DESC, m.id DESC
             """).fetchall()
             return [dict(row) for row in rows]
@@ -765,6 +774,76 @@ class OrchestratorStore:
                 "SELECT * FROM work_packages WHERE step_id=%s LIMIT 1", (step_id,)
             ).fetchone()
             return dict(row) if row else None
+
+    def package_completion_evidence(self, package_id: int) -> dict[str, Any]:
+        """Return the independent evidence required before roadmap completion.
+
+        A package's ``complete`` state is intentionally not sufficient: the
+        reviewer, verifier, checkpoint writer, and mission integration each
+        have an independent durable record.  Keeping this check in the store
+        gives the CLI, orchestrator, and Control Center one authoritative gate.
+        """
+        with self.connect() as connection:
+            package = connection.execute(
+                "SELECT * FROM work_packages WHERE id=%s", (package_id,)
+            ).fetchone()
+            if not package:
+                raise KeyError(package_id)
+            package = dict(package)
+            step_id = package.get("step_id")
+            review = connection.execute(
+                """SELECT id,review_attempt,verdict,completed_at FROM reviews
+                   WHERE step_id=%s ORDER BY review_attempt DESC LIMIT 1""",
+                (step_id,),
+            ).fetchone() if step_id else None
+            verification = connection.execute(
+                """SELECT id,attempt,status,completed_at FROM verification_runs
+                   WHERE step_id=%s ORDER BY attempt DESC LIMIT 1""",
+                (step_id,),
+            ).fetchone() if step_id else None
+            checkpoint = connection.execute(
+                """SELECT step_id,status,marker,commit_sha,completed_at
+                   FROM checkpoint_runs WHERE step_id=%s""",
+                (step_id,),
+            ).fetchone() if step_id else None
+            integration = connection.execute(
+                """SELECT id,status,commit_sha,completed_at FROM mission_integrations
+                   WHERE package_id=%s LIMIT 1""",
+                (package_id,),
+            ).fetchone()
+
+        review = dict(review) if review else None
+        verification = dict(verification) if verification else None
+        checkpoint = dict(checkpoint) if checkpoint else None
+        integration = dict(integration) if integration else None
+        checks = {
+            "package_complete": package.get("status") == "complete",
+            "review_approved": bool(review and review.get("verdict") == "approved"),
+            "verification_passed": bool(verification and verification.get("status") == "passed"),
+            "checkpoint_complete": bool(
+                checkpoint and checkpoint.get("status") == "complete" and checkpoint.get("commit_sha")
+            ),
+            "integration_complete": bool(
+                integration and integration.get("status") == "complete" and integration.get("commit_sha")
+            ),
+        }
+        ready_for_integration = all(
+            checks[name] for name in
+            ("package_complete", "review_approved", "verification_passed", "checkpoint_complete")
+        )
+        return {
+            "package_id": int(package["id"]),
+            "mission_id": int(package["mission_id"]),
+            "step_id": int(step_id) if step_id is not None else None,
+            "roadmap_reference": package.get("roadmap_reference"),
+            "eligible": all(checks.values()),
+            "ready_for_integration": ready_for_integration,
+            "checks": checks,
+            "review": review,
+            "verification": verification,
+            "checkpoint": checkpoint,
+            "integration": integration,
+        }
 
     def reconcile_worktrees(self, worktree_manager, *, remove_orphans: bool = False) -> dict[str, list[str]]:
         """Detect managed worktrees no longer represented by active packages.
