@@ -195,10 +195,11 @@ class AgentOrchestrator:
         phase_detail = ""
         try:
             self._clear_route(self.engineer)
+            package = package or self._work_package_for_step(task)
             with self._lease_heartbeat(
-                task.repository, owner, task.step_id, "coder", self.engineer.worker_id
+                task.repository, owner, task.step_id, "coder", self.engineer.worker_id,
+                package_id=(package or {}).get("id"),
             ):
-                package = package or self._work_package_for_step(task)
                 run_package = getattr(self.engineer, "run_work_package", None)
                 if package is not None and run_package is not None:
                     result = run_package(package, step_id=task.step_id, attempt=task.attempt)
@@ -560,6 +561,7 @@ class AgentOrchestrator:
         step_id: int,
         lease_kind: str,
         lease_worker_id: str,
+        package_id: int | None = None,
     ):
         """Renew durable ownership while a bounded action is still executing."""
         stop = threading.Event()
@@ -582,7 +584,14 @@ class AgentOrchestrator:
                         work_ok = self.store.heartbeat_orchestration(
                             step_id, lease_worker_id, self.config.lease_seconds
                         )
-                    if not repository_ok or not work_ok:
+                    package_ok = True
+                    if package_id is not None:
+                        heartbeat_package = getattr(self.store, "heartbeat_work_package", None)
+                        if heartbeat_package:
+                            package_ok = heartbeat_package(
+                                package_id, lease_worker_id, self.config.lease_seconds
+                            )
+                    if not repository_ok or not work_ok or not package_ok:
                         self._log(
                             "lease_heartbeat_lost", level=logging.ERROR,
                             step_id=step_id, owner=owner, phase=lease_kind,
