@@ -28,9 +28,10 @@ def parse_decision(text: str) -> PlannerDecision:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
         raise InvalidDecision("planner response is not valid JSON") from exc
-    if not isinstance(payload, dict) or payload.get("decision") not in VALID_DECISIONS:
+    decision_name = payload.get("decision") if isinstance(payload, dict) else None
+    if not isinstance(decision_name, str) or decision_name not in VALID_DECISIONS:
         raise InvalidDecision("planner returned an unknown decision")
-    if payload.get("decision") in {"create_step", "replace_step"}:
+    if decision_name in {"create_step", "replace_step"}:
         required_top = {"decision", "job_status", "reasoning_summary", "step",
                         "evidence", "human_question", "blocker"}
         if set(payload) != required_top:
