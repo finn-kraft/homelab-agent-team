@@ -43,6 +43,12 @@ def test_password_hash_and_opaque_session():
     auth.logout(session.token)
     assert auth.authenticate(session.token) is None
 
+def test_password_minimum_is_eight_characters():
+    auth, writer = bound_auth()
+    with pytest.raises(ValueError):
+        auth.set_password("short7")
+    auth.set_password("eight888")
+
 
 def test_failed_login_is_rate_limited():
     import bcrypt
