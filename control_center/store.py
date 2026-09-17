@@ -8,10 +8,27 @@ class ControlStore:
         self.workflow, self.planner, self.projects = (
             OrchestratorStore(database_url), PlannerStore(database_url), projects)
     def healthy(self):
+        report = self.health()
+        return bool(report.get("ready"))
+
+    def health(self):
+        readiness = getattr(self.workflow, "schema_readiness", None)
+        if readiness is not None:
+            report = readiness() if callable(readiness) else readiness
+            # schema_readiness deliberately converts connection failures into a
+            # report, so preserve that distinction for operators and probes.
+            return {
+                "database": "unavailable" if report.get("error") else "reachable",
+                **report,
+            }
         try:
             with self.workflow.connect() as connection:
-                return connection.execute("SELECT 1 ok").fetchone()["ok"] == 1
-        except Exception: return False
+                ok = connection.execute("SELECT 1 ok").fetchone()["ok"] == 1
+                return {"ready": ok, "database": "reachable" if ok else "unavailable",
+                        "migration_required": not ok}
+        except Exception as exc:
+            return {"ready": False, "database": "unavailable",
+                    "migration_required": True, "error": str(exc)[:500]}
     def overview(self):
         with self.workflow.connect() as connection:
             workers = list(connection.execute("""SELECT *,heartbeat_at > now()-interval '30 seconds' online

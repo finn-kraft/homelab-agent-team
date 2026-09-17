@@ -58,7 +58,11 @@ class OrchestratorConfig:
     auto_push: bool = False
     verification_commands: tuple[tuple[str, ...], ...] = field(default_factory=tuple)
     verification_timeout_seconds: int = 900
+    # ``max_coder_attempts`` remains for callers that construct the V1 config
+    # directly. Environment/configuration reads use the canonical Engineering
+    # name below.
     max_coder_attempts: int = 5
+    max_engineering_attempts: int | None = None
     max_review_attempts: int = 5
     mission_package_limit: int = 3
     auto_integrate: bool = False
@@ -72,6 +76,8 @@ class OrchestratorConfig:
         if poll_seconds <= 0:
             raise ValueError("ORCHESTRATOR_POLL_SECONDS must be greater than zero")
         worker_default = f"orchestrator-{socket.gethostname()}"
+        legacy_attempts = _positive_int("MAX_CODER_ATTEMPTS", 5)
+        engineering_attempts = _positive_int("MAX_ENGINEERING_ATTEMPTS", legacy_attempts)
         return cls(
             database_url=database_url,
             worker_id=os.getenv("ORCHESTRATOR_WORKER_ID", worker_default),
@@ -85,8 +91,14 @@ class OrchestratorConfig:
             verification_timeout_seconds=_positive_int(
                 "ORCHESTRATOR_VERIFICATION_TIMEOUT_SECONDS", 900
             ),
-            max_coder_attempts=_positive_int("MAX_CODER_ATTEMPTS", 5),
+            max_coder_attempts=engineering_attempts,
+            max_engineering_attempts=engineering_attempts,
             max_review_attempts=_positive_int("MAX_REVIEW_ATTEMPTS", 5),
             mission_package_limit=_positive_int("MISSION_PACKAGE_LIMIT", 3),
             auto_integrate=_bool("AUTO_INTEGRATE", False),
         )
+
+    @property
+    def engineering_attempt_limit(self) -> int:
+        """Return the canonical Engineering attempt limit."""
+        return self.max_engineering_attempts or self.max_coder_attempts

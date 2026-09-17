@@ -59,12 +59,14 @@ class Store:
               session_id BIGINT NOT NULL REFERENCES engineering_sessions(id),
               sequence INTEGER NOT NULL,
               model TEXT,
+              provider TEXT,
               action TEXT NOT NULL,
               observation TEXT,
               progress_classification TEXT,
               created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
               UNIQUE(session_id, sequence)
             );
+            ALTER TABLE engineering_actions ADD COLUMN IF NOT EXISTS provider TEXT;
             """)
 
     def claim(self, worker_id: str, lease_seconds: int = 300) -> Task | None:
@@ -208,17 +210,46 @@ class Store:
                 if isinstance(payload, dict) else [],
             }
 
+    def engineering_session_state(self, job_id, step_id=None):
+        """Return the last durable action needed to resume an Engineering turn."""
+        with self.connect() as connection:
+            row = connection.execute("""SELECT es.id,es.turn_count,es.stagnation_count,
+                es.current_model_tier,es.current_problem,es.last_test_result,
+                ea.model,ea.provider,ea.action,ea.observation,ea.progress_classification
+                FROM engineering_sessions es LEFT JOIN engineering_actions ea ON ea.id=(
+                  SELECT latest.id FROM engineering_actions latest
+                  WHERE latest.session_id=es.id ORDER BY latest.sequence DESC LIMIT 1)
+                WHERE es.job_id=%s AND (%s IS NULL OR es.step_id=%s)
+                  AND es.completed_at IS NULL ORDER BY es.updated_at DESC LIMIT 1""",
+                (job_id, step_id, step_id)).fetchone()
+            if not row:
+                return None
+            keys = ("id", "turn_count", "stagnation_count", "current_model_tier",
+                    "current_problem", "last_test_result", "last_model", "last_provider",
+                    "last_action", "last_observation", "last_progress")
+            return dict(zip(keys, row))
+
     def record_engineering_action(self, session_id, sequence, action, observation="",
-                                  model=None, progress_classification=None):
+                                  model=None, progress_classification=None, provider=None,
+                                  model_tier=None, stagnation_count=None,
+                                  last_test_result=None, current_problem=None):
         with self.connect() as connection:
             connection.execute("""INSERT INTO engineering_actions
-                (session_id,sequence,model,action,observation,progress_classification)
-                VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(session_id,sequence) DO UPDATE SET
-                model=EXCLUDED.model, action=EXCLUDED.action, observation=EXCLUDED.observation,
-                progress_classification=EXCLUDED.progress_classification""",
-                (session_id, sequence, model, action, observation[:30000], progress_classification))
-            connection.execute("UPDATE engineering_sessions SET turn_count=%s,updated_at=now() WHERE id=%s",
-                               (sequence, session_id))
+                (session_id,sequence,model,provider,action,observation,progress_classification)
+                VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(session_id,sequence) DO UPDATE SET
+                model=EXCLUDED.model, provider=EXCLUDED.provider, action=EXCLUDED.action,
+                observation=EXCLUDED.observation, progress_classification=EXCLUDED.progress_classification""",
+                (session_id, sequence, model, provider, action, observation[:30000], progress_classification))
+            connection.execute("""UPDATE engineering_sessions SET turn_count=%s,
+                current_model_tier=COALESCE(%s,current_model_tier),
+                current_problem=COALESCE(%s,current_problem),
+                stagnation_count=COALESCE(%s,stagnation_count),
+                last_test_result=COALESCE(%s::jsonb,last_test_result),
+                last_successful_action=CASE WHEN %s NOT IN ('invalid','no_progress','repeated_failure','oscillation')
+                    THEN %s ELSE last_successful_action END,updated_at=now() WHERE id=%s""",
+                (sequence, model_tier, current_problem, stagnation_count,
+                 json.dumps(last_test_result) if last_test_result is not None else None,
+                 action, action, session_id))
 
     def complete_engineering_session(self, session_id):
         with self.connect() as connection:

@@ -102,14 +102,14 @@ class ReviewerAgent:
             [],
         )
 
-        # Only evidence from this Coder revision is relevant. A prior failed
+        # Only evidence from this Engineering revision is relevant. A prior failed
         # verification must not permanently poison a corrected same-step retry.
         commands = self.store.commands(
             item["id"],
             item["attempt_count"],
         )
 
-        # Failed Coder commands are review evidence, not an automatic rejection.
+        # Failed Engineering commands are review evidence, not an automatic rejection.
         # Secret findings and an invalid Git diff remain deterministic gates.
         if (
             evidence["secret_hits"]

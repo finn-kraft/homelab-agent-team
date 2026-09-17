@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import UTC, datetime
@@ -125,9 +126,13 @@ class EngineeringAgent:
             starting_commit = git.head()
             session_id = None
             session_baseline: dict[str, Any] = {}
+            session_state: dict[str, Any] = {}
             resume_session = getattr(self.store, "resume_engineering_session", None)
             if resume_session:
                 session_id = resume_session(task.job_id, task.step_id)
+            load_session = getattr(self.store, "engineering_session_state", None)
+            if session_id is not None and load_session:
+                session_state = load_session(task.job_id, task.step_id) or {}
             get_baseline = getattr(self.store, "engineering_baseline", None)
             if session_id is not None and get_baseline:
                 session_baseline = get_baseline(task.job_id, task.step_id) or {}
@@ -144,7 +149,7 @@ class EngineeringAgent:
                 initial_changes = set(session_baseline.get("preexisting_changes") or [])
             else:
                 initial_changes = set(git.changed_files())
-            self.store.event(task, "resumed" if session_baseline else "started", {
+            self.store.event(task, "resumed" if (session_baseline or session_state) else "started", {
                 "starting_commit": starting_commit,
                 "preexisting_changes": sorted(initial_changes),
                 "session_id": session_id,
@@ -158,6 +163,13 @@ class EngineeringAgent:
             else:
                 repository_files = []
             backend = self.router.choose(task.attempt)
+            if session_state.get("current_model_tier") in {"standard", "premium", "openrouter"}:
+                # Resume the last selected tier when possible. The router may
+                # still fall back to local if cloud credentials are absent.
+                route_attempt = int(getattr(self.router, "escalate_after", task.attempt + 2))
+                if session_state.get("current_model_tier") == "premium":
+                    route_attempt += 1
+                backend = self.router.choose(route_attempt, True)
             context = {
                 "task": {
                     "job_id": task.job_id, "step_id": task.step_id,
@@ -171,18 +183,41 @@ class EngineeringAgent:
                 "starting_commit": starting_commit,
                 "preexisting_changes": sorted(initial_changes),
                 "project_instructions": workspace.project_instructions(),
+                "session_resume": {
+                    "turn_count": int(session_state.get("turn_count") or 0),
+                    "last_action": session_state.get("last_action"),
+                    "last_observation": self._redact(
+                        str(session_state.get("last_observation") or "")
+                    )[:12_000],
+                    "last_progress": session_state.get("last_progress"),
+                    "stagnation_count": int(session_state.get("stagnation_count") or 0),
+                    "model_tier": session_state.get("current_model_tier") or "local",
+                    "last_test_result": session_state.get("last_test_result"),
+                } if session_state else None,
             }
             messages = [{"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": bounded_json(
                             context, self.max_prompt_chars, "engineering context"
                         )}]
-            last_model = backend.model
-            verified = False
-            previous_observation = ""
-            stagnation = 0
+            last_model = session_state.get("last_model") or backend.model
+            last_test_result = session_state.get("last_test_result") or {}
+            if isinstance(last_test_result, str):
+                try:
+                    last_test_result = json.loads(last_test_result)
+                except json.JSONDecodeError:
+                    last_test_result = {}
+            verified = bool(last_test_result.get("passed")) if isinstance(last_test_result, dict) else False
+            previous_observation = str(session_state.get("last_observation") or "")
+            previous_fingerprint = self._fingerprint(previous_observation) if previous_observation else None
+            previous_repo_signature = self._repository_signature(git)
+            recent_fingerprints: list[str] = []
+            if previous_fingerprint:
+                recent_fingerprints.append(previous_fingerprint)
+            repeated_failures: dict[str, int] = {}
+            stagnation = max(0, int(session_state.get("stagnation_count") or 0))
             stagnation_episodes = 0
             escalation_level = 0
-            turn = 0
+            turn = max(0, int(session_state.get("turn_count") or 0))
             while self.max_turns is None or turn < self.max_turns:
                 turn += 1
                 controlled = self._controlled_result(task, last_model)
@@ -242,21 +277,68 @@ class EngineeringAgent:
                     messages.extend([{"role": "assistant", "content": response.text},
                                      {"role": "user", "content": observation}])
                 run_succeeded = False
+                run_result: dict[str, Any] = {}
+                repeated_failure = False
                 if action.get("action") == "run":
                     try:
-                        run_succeeded = json.loads(observation).get("exit_code") == 0
+                        run_result = json.loads(observation)
+                        run_succeeded = run_result.get("exit_code") == 0
+                        if not run_succeeded:
+                            run_key = json.dumps({
+                                "argv": action.get("argv", []),
+                                "exit_code": run_result.get("exit_code"),
+                                "timed_out": run_result.get("timed_out", False),
+                                "cancelled": run_result.get("cancelled", False),
+                            }, sort_keys=True)
+                            repeated_failures[run_key] = repeated_failures.get(run_key, 0) + 1
+                            repeated_failure = repeated_failures[run_key] >= 2
                     except (TypeError, json.JSONDecodeError, AttributeError):
                         run_succeeded = False
+                fingerprint = self._fingerprint(observation)
+                oscillation = (
+                    len(recent_fingerprints) >= 2
+                    and fingerprint == recent_fingerprints[-2]
+                    and fingerprint != recent_fingerprints[-1]
+                )
+                repo_signature = self._repository_signature(git)
+                repository_progress = (
+                    repo_signature is not None
+                    and previous_repo_signature is not None
+                    and repo_signature != previous_repo_signature
+                )
+                same_observation = (
+                    fingerprint is not None and fingerprint == previous_fingerprint
+                )
                 if action.get("action") == "invalid":
                     progress_classification = "invalid_action"
                 elif run_succeeded:
                     progress_classification = "verification_progress"
+                elif run_result.get("cancelled"):
+                    progress_classification = "cancelled"
+                elif repeated_failure:
+                    progress_classification = "repeated_failure"
+                elif oscillation:
+                    progress_classification = "oscillation"
+                elif action.get("action") == "finish" and not verified:
+                    progress_classification = "no_verification_progress"
+                elif repository_progress:
+                    progress_classification = "repository_change"
                 elif action.get("action") in {"write", "delete"}:
                     progress_classification = "repository_change"
-                elif observation != previous_observation and action.get("action") in {"read", "inspect"}:
+                elif not same_observation and action.get("action") in {"read", "inspect"}:
                     progress_classification = "inspection_progress"
                 else:
                     progress_classification = "no_progress"
+                stagnation_next = (
+                    stagnation + 1
+                    if (
+                        action.get("action") in {"invalid", "blocked"}
+                        or progress_classification in {
+                            "no_progress", "repeated_failure", "oscillation",
+                            "no_verification_progress", "cancelled",
+                        }
+                    ) else 0
+                )
                 if action["action"] == "run":
                     try:
                         verified = verified or json.loads(observation)["exit_code"] == 0
@@ -266,15 +348,29 @@ class EngineeringAgent:
                     "turn": turn, "model": response.model,
                     "action": action.get("action"), "observation": self._redact(observation),
                     "progress_classification": progress_classification,
+                    "failure_class": (
+                        "environment" if run_result.get("exit_code") == 127 else "test"
+                    ) if run_result and not run_succeeded else None,
                 })
                 if session_id is not None:
                     record_action = getattr(self.store, "record_engineering_action", None)
                     if record_action:
-                        record_action(session_id, turn, action.get("action", "invalid"),
-                                      self._redact(observation), response.model,
-                                      progress_classification)
-                if observation == previous_observation or action.get("action") == "invalid":
-                    stagnation += 1
+                        record_action(
+                            session_id, turn, action.get("action", "invalid"),
+                            self._redact(observation), response.model,
+                            progress_classification,
+                            provider=getattr(response, "backend", None),
+                            model_tier=self._model_tier(response, backend),
+                            stagnation_count=stagnation_next,
+                            last_test_result=run_result if run_result else None,
+                            current_problem=(self._redact(observation)
+                                             if progress_classification in {
+                                                 "repeated_failure", "no_verification_progress",
+                                                 "oscillation", "invalid_action"
+                                             } else None),
+                        )
+                if stagnation_next:
+                    stagnation = stagnation_next
                 else:
                     stagnation = 0
                     if escalation_level:
@@ -286,6 +382,11 @@ class EngineeringAgent:
                         escalation_level = 0
                         stagnation_episodes = 0
                 previous_observation = observation
+                previous_fingerprint = fingerprint
+                if repo_signature is not None:
+                    previous_repo_signature = repo_signature
+                recent_fingerprints.append(fingerprint)
+                del recent_fingerprints[:-8]
                 if action["action"] == "blocked":
                     result = AgentResult(Status.BLOCKED, "implementation blocked",
                                          blocker=str(action.get("reason", "unspecified")),
@@ -460,6 +561,36 @@ class EngineeringAgent:
         if get_status is None:
             return False
         return get_status(job_id) in {"paused", "cancelled"}
+
+    @staticmethod
+    def _fingerprint(value: str) -> str:
+        """Hash normalized observations so harmless whitespace cannot hide loops."""
+        normalized = " ".join(str(value).split())
+        return hashlib.sha256(normalized.encode("utf-8", "replace")).hexdigest()
+
+    @staticmethod
+    def _repository_signature(git: GitRepository) -> str | None:
+        """Build a cheap semantic worktree signature for progress detection."""
+        try:
+            changed = sorted(git.changed_files())
+            diff = git.diff()
+        except Exception:
+            # A failed diagnostic must not make an otherwise safe action crash;
+            # the observation/action signals still provide stagnation evidence.
+            return None
+        material = json.dumps({"changed": changed, "diff": diff}, sort_keys=True)
+        return hashlib.sha256(material.encode("utf-8", "replace")).hexdigest()
+
+    @staticmethod
+    def _model_tier(response: Any, backend: Any) -> str:
+        """Persist a coarse local/standard/premium tier for session resume."""
+        provider = str(getattr(response, "backend", "") or "").lower()
+        model = str(getattr(response, "model", "") or getattr(backend, "model", ""))
+        if provider != "openrouter":
+            return "local"
+        if "premium" in model.lower() or "gpt-5" in model.lower() or "claude" in model.lower():
+            return "premium"
+        return "standard"
 
     @staticmethod
     def _files_with_likely_secrets(workspace: Workspace, files: set[str]) -> list[str]:
