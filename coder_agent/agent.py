@@ -99,8 +99,14 @@ class CoderAgent:
                         {"role": "user", "content": json.dumps(context)}]
             last_model = backend.model
             verified = False
+            previous_observation = ""
+            stagnation = 0
             for turn in range(self.max_turns):
                 self.store.heartbeat(task.step_id, self.worker_id)
+                if stagnation >= 3:
+                    backend = self.router.choose(task.attempt + stagnation, True)
+                    last_model = backend.model
+                    stagnation = 0
                 response = backend.complete(messages)
                 last_model = response.model
                 try:
@@ -125,6 +131,11 @@ class CoderAgent:
                     "turn": turn + 1, "model": response.model,
                     "action": action.get("action"), "observation": self._redact(observation),
                 })
+                if observation == previous_observation or action.get("action") == "invalid":
+                    stagnation += 1
+                else:
+                    stagnation = 0
+                previous_observation = observation
                 if action["action"] == "blocked":
                     result = AgentResult(Status.BLOCKED, "implementation blocked",
                                          blocker=str(action.get("reason", "unspecified")),
