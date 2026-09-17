@@ -32,7 +32,6 @@ _REDACTION_PATTERNS = (
 # reporting table happens to exist.
 REQUIRED_TABLE_COLUMNS = {
     "jobs": {"id", "status", "current_phase", "planner_lease_expires_at"},
-<<<<<<< HEAD
     "steps": {
         "id",
         "job_id",
@@ -41,11 +40,12 @@ REQUIRED_TABLE_COLUMNS = {
         "worker_id",
         "review_lease_expires_at",
     },
-    "events": {"job_id", "event_type", "structured_payload"},
-=======
-    "steps": {"id", "job_id", "status", "lease_expires_at", "worker_id"},
-    "events": {"job_id", "event_type", "structured_payload", "correlation_id"},
->>>>>>> d1d5d766c27317542f46380d9c2f4c44414ce79a
+    "events": {
+        "job_id",
+        "event_type",
+        "structured_payload",
+        "correlation_id",
+    },
     "command_runs": {"step_id", "timed_out", "cancelled"},
     "reviews": {"step_id", "verdict"},
     "verification_runs": {"step_id", "status"},
