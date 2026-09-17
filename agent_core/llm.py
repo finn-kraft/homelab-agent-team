@@ -40,6 +40,8 @@ class HTTPBackend:
         self.retries = retries
 
     def _post(self, url: str, payload: dict) -> tuple[dict, float]:
+        if self._circuit_open_until > time.time():
+            raise BackendError("backend circuit open; retry window has not elapsed")
         headers = {"Content-Type": "application/json"}
 
         if self.api_key:
