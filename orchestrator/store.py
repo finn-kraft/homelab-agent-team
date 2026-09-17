@@ -533,8 +533,9 @@ class OrchestratorStore:
     def heartbeat_coding(self, step_id: int, worker_id: str, lease_seconds: int) -> bool:
         with self.connect() as connection:
             result = connection.execute(
-                """UPDATE steps SET lease_expires_at=now()+(%s*interval '1 second'),updated_at=now()
-                WHERE id=%s AND worker_id=%s AND status='running'""",
+                """UPDATE steps s SET lease_expires_at=now()+(%s*interval '1 second'),updated_at=now()
+                FROM jobs j WHERE s.id=%s AND s.worker_id=%s AND s.status='running'
+                AND j.id=s.job_id AND j.status='running'""",
                 (lease_seconds, step_id, worker_id),
             )
             return result.rowcount == 1

@@ -59,11 +59,18 @@ class Store:
     def heartbeat(self, step_id: int, worker_id: str, lease_seconds: int = 300) -> bool:
         with self.connect() as connection:
             cursor = connection.execute(
-                """UPDATE steps SET lease_expires_at=now()+(%s*interval '1 second'),
-                updated_at=now() WHERE id=%s AND worker_id=%s AND status='running'""",
+                """UPDATE steps s SET lease_expires_at=now()+(%s*interval '1 second'),
+                updated_at=now() FROM jobs j WHERE s.id=%s AND s.worker_id=%s
+                AND s.status='running' AND j.id=s.job_id AND j.status='running'""",
                 (lease_seconds, step_id, worker_id),
             )
             return cursor.rowcount == 1
+
+    def job_status(self, job_id: int) -> str | None:
+        """Read the workflow control state for cooperative pause/cancel."""
+        with self.connect() as connection:
+            row = connection.execute("SELECT status FROM jobs WHERE id=%s", (job_id,)).fetchone()
+            return row[0] if row else None
 
     def update_step(self, step_id: int, worker_id: str, status: Status,
                     **fields: Any) -> None:

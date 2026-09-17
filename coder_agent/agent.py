@@ -127,7 +127,15 @@ class CoderAgent:
             previous_observation = ""
             stagnation = 0
             for turn in range(self.max_turns):
-                self.store.heartbeat(task.step_id, self.worker_id)
+                controlled = self._controlled_result(task, last_model)
+                if controlled is not None:
+                    return controlled
+                heartbeat_ok = self.store.heartbeat(task.step_id, self.worker_id)
+                if not heartbeat_ok:
+                    controlled = self._controlled_result(task, last_model)
+                    if controlled is not None:
+                        return controlled
+                    raise RuntimeError("coder lease is no longer owned")
                 if stagnation >= 3:
                     backend = self.router.choose(task.attempt + stagnation, True)
                     last_model = backend.model
@@ -207,7 +215,28 @@ class CoderAgent:
                         return result
                 messages.extend([{"role": "assistant", "content": response.text},
                                  {"role": "user", "content": observation}])
-            raise RuntimeError("maximum agent turns exceeded")
+            controlled = self._controlled_result(task, last_model)
+            if controlled is not None:
+                return controlled
+            blocker = (
+                f"agent turn budget exhausted after {self.max_turns} turns; "
+                "review progress before resuming"
+            )
+            result = AgentResult(
+                Status.BLOCKED,
+                "implementation paused at the configured turn budget",
+                blocker=blocker,
+                model=last_model,
+            )
+            self.store.update_step(
+                task.step_id,
+                self.worker_id,
+                result.status,
+                blocker=result.blocker,
+                model_used=last_model,
+                coder_response={"reason": "turn_budget_exhausted", "turns": self.max_turns},
+            )
+            return result
         except (BackendError, WorkspaceViolation, CommandRejected, RuntimeError, ValueError) as exc:
             status = Status.FAILED
             self.store.update_step(
@@ -221,6 +250,26 @@ class CoderAgent:
                 "task did not reach review; return step for autonomous recovery",
                 blocker=str(exc),
             )
+
+    def _controlled_result(self, task: Task, model: str | None) -> AgentResult | None:
+        """Stop at a safe turn boundary when an operator pauses or cancels."""
+        get_status = getattr(self.store, "job_status", None)
+        if get_status is None:
+            return None
+        status = get_status(task.job_id)
+        if status not in {"paused", "cancelled"}:
+            return None
+        result_status = Status.PAUSED if status == "paused" else Status.CANCELLED
+        summary = f"job {status}; coder stopped at a safe boundary"
+        self.store.update_step(
+            task.step_id,
+            self.worker_id,
+            Status.QUEUED,
+            model_used=model,
+            coder_response={"reason": f"job_{status}", "summary": summary},
+        )
+        self.store.event(task, f"coding_{status}", {"reason": "operator_control", "model": model})
+        return AgentResult(result_status, summary, model=model)
 
     def _execute(self, action: dict[str, Any], workspace: Workspace,
                  runner: CommandRunner, git: GitRepository, task: Task,
