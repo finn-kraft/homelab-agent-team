@@ -13,6 +13,13 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+def _nonnegative_int(name: str, default: int) -> int:
+    value = int(os.getenv(name, str(default)))
+    if value < 0:
+        raise ValueError(f"{name} must not be negative")
+    return value
+
+
 def _bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -66,6 +73,9 @@ class OrchestratorConfig:
     max_review_attempts: int = 5
     mission_package_limit: int = 3
     auto_integrate: bool = False
+    max_concurrent_jobs_per_repository: int = 1
+    queue_backpressure: int = 0
+    worktree_cleanup_seconds: int = 60
 
     @classmethod
     def from_env(cls) -> "OrchestratorConfig":
@@ -96,6 +106,15 @@ class OrchestratorConfig:
             max_review_attempts=_positive_int("MAX_REVIEW_ATTEMPTS", 5),
             mission_package_limit=_positive_int("MISSION_PACKAGE_LIMIT", 3),
             auto_integrate=_bool("AUTO_INTEGRATE", False),
+            max_concurrent_jobs_per_repository=_positive_int(
+                "ORCHESTRATOR_MAX_CONCURRENT_PER_REPOSITORY", 1
+            ),
+            queue_backpressure=_nonnegative_int(
+                "ORCHESTRATOR_QUEUE_BACKPRESSURE", 0
+            ),
+            worktree_cleanup_seconds=_positive_int(
+                "ORCHESTRATOR_WORKTREE_CLEANUP_SECONDS", 60
+            ),
         )
 
     @property

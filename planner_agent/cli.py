@@ -6,7 +6,7 @@ import logging
 import os
 import sys
 
-from agent_core.llm import InferenceRouter, OllamaBackend, OpenRouterBackend
+from agent_core.llm import InferenceRouter, OllamaBackend, OpenRouterBackend, routing_policy_from_env
 from .inspector import ReadOnlyRepositoryInspector
 from .planner import PlannerAgent
 from .store import PlannerStore
@@ -67,6 +67,7 @@ def build_planner() -> PlannerAgent:
             timeout=float(os.getenv("ROUTER_TIMEOUT_SECONDS", "3")),
             privacy_sensitive=os.getenv("INFERENCE_PRIVACY_SENSITIVE", "false").lower()
             in {"1", "true", "yes", "on"},
+            policy=routing_policy_from_env("PLANNER"),
         ),
         ReadOnlyRepositoryInspector(
             roots,
@@ -79,6 +80,7 @@ def build_planner() -> PlannerAgent:
         escalation_attempt,
         int(os.getenv("PLANNER_MAX_CONTEXT_CHARS", "120000")),
         int(os.getenv("PLANNER_PACKAGE_STEPS", "3")),
+        int(os.getenv("PLANNER_MAX_PROMPT_TOKENS", "0")) or None,
     )
 
 
