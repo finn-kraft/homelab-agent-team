@@ -394,6 +394,25 @@ class OrchestratorStore:
             if result.rowcount != 1:
                 raise RuntimeError('work package lease is no longer owned')
 
+    def advance_work_package(self, package_id: int, worker_id: str, current: str,
+                             next_status: str, resulting_commit: str | None = None) -> None:
+        allowed = {"engineering": {"review", "blocked"}, "review": {"verifying", "engineering", "blocked"},
+                   "verifying": {"complete", "engineering", "blocked"}}
+        if next_status not in allowed.get(current, set()):
+            raise ValueError(f"invalid package transition: {current} -> {next_status}")
+        with self.connect() as connection:
+            result = connection.execute("""UPDATE work_packages SET status=%s,
+                resulting_commit=COALESCE(%s,resulting_commit),lease_expires_at=NULL,updated_at=now()
+                WHERE id=%s AND worker_id=%s AND status=%s""",
+                (next_status, resulting_commit, package_id, worker_id, current))
+            if result.rowcount != 1:
+                raise RuntimeError("work package transition lost its lease")
+
+    def complete_work_package(self, package_id: int, worker_id: str, commit_sha: str) -> None:
+        if not commit_sha or len(commit_sha) < 7:
+            raise ValueError("a verified commit SHA is required")
+        self.advance_work_package(package_id, worker_id, "verifying", "complete", commit_sha)
+
     def heartbeat_work_package(self, package_id: int, worker_id: str,
                                lease_seconds: int = 900) -> bool:
         with self.connect() as connection:

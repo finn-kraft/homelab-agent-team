@@ -55,6 +55,9 @@ def _parser() -> argparse.ArgumentParser:
     claim = subcommands.add_parser("claim-package", help="claim one ready V2 package")
     claim.add_argument("--worker-id", default="engineering-1"); claim.add_argument("--lease-seconds", type=int, default=900)
     subcommands.add_parser("recover-packages", help="return expired V2 package leases to ready")
+    advance = subcommands.add_parser("advance-package", help="advance a leased V2 package lifecycle state")
+    advance.add_argument("package_id", type=int); advance.add_argument("current"); advance.add_argument("next_status")
+    advance.add_argument("--worker-id", default="engineering-1"); advance.add_argument("--commit")
     inspect = subcommands.add_parser("inspect", help="show a job, its steps, and recent events")
     inspect.add_argument("job_id", type=int)
     for name in ("pause", "resume", "cancel"):
@@ -127,6 +130,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "recover-packages":
             print(json.dumps({"recovered": store.recover_work_packages()}))
+            return 0
+        if args.command == "advance-package":
+            store.advance_work_package(args.package_id, args.worker_id, args.current,
+                                       args.next_status, args.commit)
+            print(json.dumps({"status": args.next_status, "package_id": args.package_id}))
             return 0
         if args.command == "inspect":
             print(json.dumps(store.inspect(args.job_id), default=str, indent=2))
