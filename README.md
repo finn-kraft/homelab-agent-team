@@ -318,13 +318,18 @@ See [`.env.example`](.env.example). The principal values are:
 | `*_ALLOWED_PROVIDERS`, `*_REQUIRED_CAPABILITIES` | Per-agent routing allowlists and capability requirements |
 | `*_MAX_CLOUD_COST`, `*_MAX_LATENCY_SECONDS` | Per-agent cloud spend and recent-latency guardrails (`0` disables) |
 | `AUTO_INTEGRATE` | Opt-in integration of verified package commits into a non-protected mission branch |
+| `CONTROL_CENTER_ROLE` | Dashboard role: `operator`, `admin`, or read-only `viewer` |
+| `CONTROL_CENTER_SESSION_TTL_SECONDS` | Absolute session lifetime (default `43200`) |
+| `CONTROL_CENTER_SESSION_IDLE_SECONDS` | Idle session expiry (default `21600`) |
+| `CONTROL_CENTER_WRITE_RATE_LIMIT` | Authenticated writes per session per minute (default `120`) |
 
 V2 operations are also available from the orchestrator CLI: `missions`,
 `expand-mission`, `packages`, `human-queue`, `answer-human`, and
 `integrate-package`. The Control Center exposes the same mission/package and human
 queue read models after running the current additive migration (recorded in the
-database as `orchestrator-0011`). Operator actions are tracked with durable
-operation IDs and can be inspected from the Control Center job detail view.
+database as `orchestrator-0012`). Operator actions are tracked with durable
+operation IDs and telemetry history/correlation data can be inspected from the
+Control Center.
 The dashboard's `/api/telemetry` path is independent of the workflow stream and polls
 Ollama/GPU data once per second, including loaded and installed model details.
 

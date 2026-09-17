@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS events (
   agent TEXT NOT NULL,
   event_type TEXT NOT NULL,
   structured_payload JSONB NOT NULL,
+  correlation_id TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

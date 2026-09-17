@@ -2,7 +2,7 @@ from contextlib import contextmanager
 
 import pytest
 
-from control_center.auth import AuthManager, AuthenticationError, RateLimitError
+from control_center.auth import AuthManager, AuthenticationError, RateLimitError, WriteRateLimitError
 
 
 class Result:
@@ -56,3 +56,31 @@ def test_failed_login_is_rate_limited():
     for _ in range(5):
         with pytest.raises(AuthenticationError): auth.login("wrong password", "client")
     with pytest.raises(RateLimitError): auth.login("wrong password", "client")
+
+
+def test_session_role_and_authenticated_write_limit():
+    import bcrypt
+    auth, _ = bound_auth(bcrypt.hashpw(b"correct horse battery staple", bcrypt.gensalt()).decode())
+    auth.write_rate_limit = 1
+    session = auth.login("correct horse battery staple", "client")
+    assert session.role == "operator"
+    auth.check_write(session)
+    with pytest.raises(WriteRateLimitError):
+        auth.check_write(session)
+
+
+def test_viewer_session_is_read_only():
+    import bcrypt
+    auth, _ = bound_auth(bcrypt.hashpw(b"correct horse battery staple", bcrypt.gensalt()).decode())
+    auth.role = "viewer"
+    session = auth.login("correct horse battery staple", "client")
+    with pytest.raises(AuthenticationError, match="read_only_session"):
+        auth.check_write(session)
+
+
+def test_session_is_bound_to_login_client():
+    import bcrypt
+    auth, _ = bound_auth(bcrypt.hashpw(b"correct horse battery staple", bcrypt.gensalt()).decode())
+    session = auth.login("correct horse battery staple", "client-a")
+    assert auth.authenticate(session.token, "client-a") is not None
+    assert auth.authenticate(session.token, "client-b") is None

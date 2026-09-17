@@ -2,6 +2,8 @@ const state = {
   csrfToken: '', overview: null, projects: [], events: [], view: 'dashboard',
   jobId: null, streamGeneration: 0, eventFilter: '', eventSearch: {}, humanDraft: '',
   telemetry: null, telemetryTimer: null, telemetryInFlight: false,
+  telemetryHistory: [], telemetryHistoryTimer: null, telemetryHistoryInFlight: false,
+  lastEventId: 0,
 };
 
 const $ = selector => document.querySelector(selector);
@@ -153,7 +155,7 @@ async function connect() {
   try {
     const login = await api('/api/login', {method: 'POST', body: JSON.stringify({password})});
     state.csrfToken = login.csrf_token;
-    [state.overview, state.projects, state.telemetry] = await Promise.all([api('/api/overview'), api('/api/projects'), api('/api/telemetry')]);
+    [state.overview, state.projects, state.telemetry, state.telemetryHistory] = await Promise.all([api('/api/overview'), api('/api/projects'), api('/api/telemetry'), api('/api/telemetry/history?hours=6')]);
     $('#password').value = '';
     document.body.classList.add('connected');
     $('#login').hidden = true;
@@ -177,10 +179,14 @@ async function disconnect() {
   state.csrfToken = '';
   state.overview = null;
   state.telemetry = null;
+  state.telemetryHistory = [];
   state.projects = [];
   state.events = [];
+  state.lastEventId = 0;
   if (state.telemetryTimer) clearInterval(state.telemetryTimer);
+  if (state.telemetryHistoryTimer) clearInterval(state.telemetryHistoryTimer);
   state.telemetryTimer = null;
+  state.telemetryHistoryTimer = null;
   document.body.classList.remove('connected');
   $('#app').hidden = true;
   $('#login').hidden = false;
@@ -192,7 +198,10 @@ async function disconnect() {
 async function stream(generation) {
   if (!state.csrfToken || generation !== state.streamGeneration) return;
   try {
-    const response = await fetch('/api/stream', {credentials: 'same-origin'});
+    const response = await fetch('/api/stream', {
+      credentials: 'same-origin',
+      headers: state.lastEventId ? {'Last-Event-ID': String(state.lastEventId)} : {},
+    });
     if (!response.ok) throw new Error('stream unavailable');
     setConnection('online', 'Live');
     const reader = response.body.getReader();
@@ -207,6 +216,13 @@ async function stream(generation) {
       for (const frame of frames) {
         const line = frame.split('\n').find(item => item.startsWith('data: '));
         if (!line) continue;
+        const idLine = frame.split('\n').find(item => item.startsWith('id: '));
+        if (idLine) state.lastEventId = Number(idLine.slice(4)) || state.lastEventId;
+        const typeLine = frame.split('\n').find(item => item.startsWith('event: '));
+        if (typeLine && typeLine.slice(7) !== 'snapshot') {
+          if (state.view === 'events') loadEvents(true);
+          continue;
+        }
         state.overview = JSON.parse(line.slice(6));
         if (state.overview.telemetry) state.telemetry = state.overview.telemetry;
         render();
@@ -236,10 +252,25 @@ async function refreshTelemetry(generation) {
   }
 }
 
+async function refreshTelemetryHistory(generation) {
+  if (!state.csrfToken || generation !== state.streamGeneration || state.telemetryHistoryInFlight) return;
+  state.telemetryHistoryInFlight = true;
+  try {
+    state.telemetryHistory = await api('/api/telemetry/history?hours=6');
+    if (state.view === 'dashboard') renderDashboard();
+  } catch (_) {
+    // Historical data is additive; retain the last successful chart.
+  } finally {
+    state.telemetryHistoryInFlight = false;
+  }
+}
+
 function startTelemetry(generation) {
   if (state.telemetryTimer) clearInterval(state.telemetryTimer);
   refreshTelemetry(generation);
   state.telemetryTimer = setInterval(() => refreshTelemetry(generation), 1000);
+  refreshTelemetryHistory(generation);
+  state.telemetryHistoryTimer = setInterval(() => refreshTelemetryHistory(generation), 10_000);
 }
 
 function render() {
@@ -319,10 +350,82 @@ function renderDashboard() {
       <article class="card metric"><div class="metric-head"><span>Thermals</span><span class="metric-icon">${icon('thermometer')}</span></div><div><div class="metric-value"><strong>${esc(gpu.temperature_c ?? '—')}</strong><em>°C</em></div><small>${gpu.power_w ? `${esc(gpu.power_w)} watts` : 'Power data unavailable'}</small></div></article>
       <article class="card metric"><div class="metric-head"><span>Inference routes</span><span class="metric-icon">${icon('route')}</span></div><div class="routing-split"><div><b>${overview.inference?.local_requests || 0}</b><small>Local</small></div><div><b>${overview.inference?.cloud_requests || 0}</b><small>Cloud</small></div><div><b>${overview.inference?.fallback_requests || 0}</b><small>Fallback</small></div></div></article>
     </div>
+    ${telemetryChart(state.telemetryHistory || [])}
+    ${ollamaHistoryChart(state.telemetryHistory || [])}
+    ${inferenceChart(state.telemetryHistory || [])}
+    ${alertsPanel(overview.alerts || [])}
     <div class="section-head"><div class="section-title"><h2>Ollama detail</h2><small>Read-only data refreshed every second</small></div><span>${esc(ollama.loaded_count || 0)} loaded · ${esc(ollama.model_count || ollamaModels.length || 0)} installed</span></div>
     <div class="card telemetry-detail"><div class="facts"><div class="fact"><span>API</span>${badge(ollama.status || 'unavailable')}</div><div class="fact"><span>Version</span><strong>${esc(ollama.version || '—')}</strong></div><div class="fact"><span>Loaded model</span><strong>${esc(model)}</strong></div><div class="fact"><span>Processor</span><strong>${esc(loaded.processor || ollama.processor || '—')}</strong></div><div class="fact"><span>Model size</span><strong>${bytes(loaded.size || ollama.size) || '—'}</strong></div><div class="fact"><span>VRAM used by model</span><strong>${bytes(modelVram) || '—'}</strong></div><div class="fact"><span>Context</span><strong>${esc(context || '—')}</strong></div><div class="fact"><span>Keep-alive until</span><strong>${esc(ollama.expires_at || '—')}</strong></div></div><div class="chips">${ollamaModels.slice(0, 24).map(item => `<span class="chip">${esc(item.name || item.model || item.digest || 'model')}</span>`).join('') || '<span class="muted">No installed models reported</span>'}</div></div>
     <div class="section-head"><div class="section-title"><h2>Recent autonomous commits</h2><small>Reviewer-approved checkpoints produced by the team</small></div></div>
     ${commitsList(overview.recent_commits || [])}`;
+}
+
+function telemetryChart(samples) {
+  const values = (samples || []).slice(-180).map(item => ({
+    utilization: Number(item.gpu?.utilization_percent),
+    temperature: Number(item.gpu?.temperature_c),
+    time: item.sampled_at || item.observed_at,
+  })).filter(item => Number.isFinite(item.utilization) || Number.isFinite(item.temperature));
+  if (values.length < 2) return '<div class="section-head"><div class="section-title"><h2>Telemetry history</h2><small>GPU history appears after the first few samples.</small></div></div>';
+  const width = 720, height = 160, pad = 18;
+  const line = (key, color, max) => {
+    const points = values.map((item, index) => {
+      const value = Number.isFinite(item[key]) ? item[key] : 0;
+      return `${pad + index * (width - pad * 2) / Math.max(1, values.length - 1)},${height - pad - Math.min(1, Math.max(0, value / max)) * (height - pad * 2)}`;
+    }).join(' ');
+    return `<polyline points="${points}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`;
+  };
+  return `<div class="section-head"><div class="section-title"><h2>Telemetry history</h2><small>Last ${values.length} samples · up to six hours</small></div><span>Live + persisted</span></div><article class="card telemetry-chart"><div class="chart-legend"><span><i class="legend-util"></i>GPU utilization</span><span><i class="legend-temp"></i>Temperature</span></div><svg viewBox="0 0 ${width} ${height}" role="img" aria-label="GPU utilization and temperature history"><line x1="${pad}" y1="${height - pad}" x2="${width - pad}" y2="${height - pad}" class="chart-axis"/>${line('utilization', '#55d9d1', 100)}${line('temperature', '#f5bc67', 100)}</svg><div class="chart-caption"><span>${esc(age(values[0].time))}</span><span>Now</span></div></article>`;
+}
+
+function inferenceChart(samples) {
+  const values = (samples || []).slice(-180).map(item => ({
+    local: Number(item.inference?.local_requests),
+    cloud: Number(item.inference?.cloud_requests),
+    fallback: Number(item.inference?.fallback_requests),
+    time: item.sampled_at || item.observed_at,
+  })).filter(item => Number.isFinite(item.local) || Number.isFinite(item.cloud) || Number.isFinite(item.fallback));
+  const latest = values.at(-1);
+  if (!latest) return '';
+  const routes = [
+    ['Local', Number(latest.local || 0), 'var(--cyan)'],
+    ['Cloud', Number(latest.cloud || 0), 'var(--violet)'],
+    ['Fallback', Number(latest.fallback || 0), 'var(--amber)'],
+  ];
+  const max = Math.max(1, ...routes.map(item => item[1]));
+  const width = 720, height = 120, pad = 18;
+  const routeLine = (key, color) => {
+    const points = values.map((item, index) => {
+      const value = Number.isFinite(item[key]) ? item[key] : 0;
+      const x = pad + index * (width - pad * 2) / Math.max(1, values.length - 1);
+      const y = height - pad - Math.min(1, Math.max(0, value / max)) * (height - pad * 2);
+      return `${x},${y}`;
+    }).join(' ');
+    return `<polyline points="${points}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`;
+  };
+  const history = values.length > 1 ? `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Inference route history"><line x1="${pad}" y1="${height - pad}" x2="${width - pad}" y2="${height - pad}" class="chart-axis"/>${routeLine('local', '#55d9d1')}${routeLine('cloud', '#a98bff')}${routeLine('fallback', '#f5bc67')}</svg><div class="chart-caption"><span>${esc(age(values[0].time))}</span><span>Now</span></div>` : '';
+  return `<div class="section-head"><div class="section-title"><h2>Inference history</h2><small>Persisted route totals from the workflow database</small></div><span>Latest sample · ${values.length} points</span></div><article class="card inference-chart"><div class="chart-legend"><span><i class="legend-util"></i>Local</span><span><i class="legend-temp"></i>Cloud</span><span><i class="legend-cloud"></i>Fallback</span></div>${history}${routes.map(item => `<div class="inference-bar"><span>${item[0]}</span><div class="bar"><i style="width:${Math.min(100, item[1] / max * 100)}%;background:${item[2]}"></i></div><strong>${item[1].toLocaleString()}</strong></div>`).join('')}</article>`;
+}
+
+function ollamaHistoryChart(samples) {
+  const values = (samples || []).slice(-180).map(item => ({
+    loaded: Number(item.ollama?.loaded_count ?? item.ollama?.model_count),
+    time: item.sampled_at || item.observed_at,
+  })).filter(item => Number.isFinite(item.loaded));
+  if (values.length < 2) return '';
+  const width = 720, height = 120, pad = 18;
+  const max = Math.max(1, ...values.map(item => item.loaded));
+  const points = values.map((item, index) => {
+    const x = pad + index * (width - pad * 2) / Math.max(1, values.length - 1);
+    const y = height - pad - Math.min(1, Math.max(0, item.loaded / max)) * (height - pad * 2);
+    return `${x},${y}`;
+  }).join(' ');
+  return `<div class="section-head"><div class="section-title"><h2>Ollama history</h2><small>Loaded model count · last ${values.length} samples</small></div><span>${values.at(-1).loaded} loaded now</span></div><article class="card telemetry-chart"><div class="chart-legend"><span><i class="legend-util"></i>Loaded models</span></div><svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Ollama loaded model history"><line x1="${pad}" y1="${height - pad}" x2="${width - pad}" y2="${height - pad}" class="chart-axis"/><polyline points="${points}" fill="none" stroke="#55d9d1" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><div class="chart-caption"><span>${esc(age(values[0].time))}</span><span>Now</span></div></article>`;
+}
+
+function alertsPanel(alerts) {
+  if (!alerts?.length) return '';
+  return `<div class="section-head"><div class="section-title"><h2>Alerts</h2><small>Actionable health warnings from the latest observation</small></div><span>${alerts.length}</span></div><div class="card alert-list">${alerts.map(alert => `<div class="alert-row"><span class="status ${alert.severity === 'critical' ? 'failed' : 'changes_requested'}">${esc(alert.severity)}</span><strong>${esc(alert.message)}</strong><small>${esc(alert.source)}</small></div>`).join('')}</div>`;
 }
 
 function humanQueuePanel(items) {
@@ -423,13 +526,13 @@ function renderAgents() {
 function renderEventView() {
   const search = state.eventSearch;
   $('#eventsView').innerHTML = `<div class="card">
-    <div class="filters"><button data-action="event-filter" data-filter="" class="${state.eventFilter === '' ? 'active' : ''}">All</button><button data-action="event-filter" data-filter="failures=1" class="${state.eventFilter === 'failures=1' ? 'active' : ''}">Failures</button><button data-action="event-filter" data-filter="routing=1" class="${state.eventFilter === 'routing=1' ? 'active' : ''}">Model routes</button><form class="filter-search" id="eventSearch"><input name="job_id" inputmode="numeric" placeholder="Job ID" value="${esc(search.job_id || '')}"><input name="agent" placeholder="Agent" value="${esc(search.agent || '')}"><button type="submit">Filter</button></form></div>
+    <div class="filters"><button data-action="event-filter" data-filter="" class="${state.eventFilter === '' ? 'active' : ''}">All</button><button data-action="event-filter" data-filter="failures=1" class="${state.eventFilter === 'failures=1' ? 'active' : ''}">Failures</button><button data-action="event-filter" data-filter="routing=1" class="${state.eventFilter === 'routing=1' ? 'active' : ''}">Model routes</button><form class="filter-search" id="eventSearch"><input name="job_id" inputmode="numeric" placeholder="Job ID" value="${esc(search.job_id || '')}"><input name="agent" placeholder="Agent" value="${esc(search.agent || '')}"><button type="submit">Filter</button></form><button data-action="security-audit">Security audit</button></div>
     <div class="event-list" id="eventList">${eventRows(state.events)}</div>
   </div>`;
 }
 
 function eventRows(events) {
-  return events.map(event => `<div class="event"><span class="event-dot"></span><time>${age(event.created_at)}</time><b>${esc(event.agent)}</b><div><span class="event-name">${esc(String(event.event_type || '').replaceAll('_', ' '))}</span><details><summary>Technical context</summary><pre class="code">${esc(JSON.stringify(event.structured_payload, null, 2))}</pre></details></div></div>`).join('') || '<div class="empty"><div><strong>No matching events</strong>Try a different filter.</div></div>';
+  return events.map(event => `<div class="event"><span class="event-dot"></span><time>${age(event.created_at)}</time><b>${esc(event.agent)}</b><div><span class="event-name">${esc(String(event.event_type || '').replaceAll('_', ' '))}</span>${event.correlation_id ? `<small class="event-correlation">correlation ${esc(String(event.correlation_id).slice(0, 12))}</small>` : ''}<details><summary>Technical context</summary><pre class="code">${esc(JSON.stringify(event.structured_payload, null, 2))}</pre></details></div></div>`).join('') || '<div class="empty"><div><strong>No matching events</strong>Try a different filter.</div></div>';
 }
 
 async function loadEvents(silent = false) {
@@ -439,6 +542,16 @@ async function loadEvents(silent = false) {
     state.events = await api(`/api/events${suffix ? `?${suffix}` : ''}`);
     if (state.view === 'events') renderEventView();
   } catch (error) { if (!silent) toast('Could not load events', error.message, true); }
+}
+
+async function securityAudit(button) {
+  setBusy(button, true, 'Scanning…');
+  try {
+    const result = await api('/api/security/audit');
+    if (result.clean) toast('Security audit passed', `Checked ${result.checked} recent records.`);
+    else toast('Security audit found patterns', result.findings.join(', '), true);
+  } catch (error) { toast('Security audit failed', error.message, true); }
+  finally { setBusy(button, false); }
 }
 
 async function openJob(id) {
@@ -614,6 +727,7 @@ document.addEventListener('click', event => {
   }
   if (action === 'answer-job') return answerJob(Number(target.dataset.jobId), target);
   if (action === 'worktree-cleanup') return cleanupWorktrees(target);
+  if (action === 'security-audit') return securityAudit(target);
 });
 document.addEventListener('input', event => { if (event.target.id === 'humanAnswer') state.humanDraft = event.target.value; });
 
@@ -654,7 +768,7 @@ async function restoreSession() {
     const session = await api('/api/session');
     if (!session.authenticated) return;
     state.csrfToken = session.csrf_token;
-    [state.overview, state.projects, state.telemetry] = await Promise.all([api('/api/overview'), api('/api/projects'), api('/api/telemetry')]);
+    [state.overview, state.projects, state.telemetry, state.telemetryHistory] = await Promise.all([api('/api/overview'), api('/api/projects'), api('/api/telemetry'), api('/api/telemetry/history?hours=6')]);
     document.body.classList.add('connected'); $('#login').hidden = true; $('#app').hidden = false;
     populateProjects(); showView('dashboard'); stream(++state.streamGeneration); startTelemetry(state.streamGeneration);
   } catch (_) { /* no existing session */ }

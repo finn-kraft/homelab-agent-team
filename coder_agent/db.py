@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -161,9 +162,9 @@ class Store:
     def event(self, task: Task, kind: str, payload: dict[str, Any]) -> None:
         with self.connect() as connection:
             connection.execute(
-                """INSERT INTO events(job_id,step_id,agent,event_type,structured_payload)
-                VALUES(%s,%s,'engineering-agent',%s,%s)""",
-                (task.job_id, task.step_id, kind, json.dumps(payload)),
+                """INSERT INTO events(job_id,step_id,agent,event_type,structured_payload,correlation_id)
+                VALUES(%s,%s,'engineering-agent',%s,%s,%s)""",
+                (task.job_id, task.step_id, kind, json.dumps(payload), str(uuid.uuid4())),
             )
 
     def start_engineering_session(self, job_id, step_id, worker_id, starting_commit=None):

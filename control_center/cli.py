@@ -21,7 +21,11 @@ def main(argv=None):
     if not database_url: raise SystemExit("DATABASE_URL is required")
     auth = AuthManager(database_url,
                        secure_cookie=os.getenv("CONTROL_CENTER_COOKIE_SECURE", "false").lower()
-                       in {"1", "true", "yes", "on"})
+                       in {"1", "true", "yes", "on"},
+                       session_ttl=int(os.getenv("CONTROL_CENTER_SESSION_TTL_SECONDS", "43200")),
+                       session_idle_ttl=int(os.getenv("CONTROL_CENTER_SESSION_IDLE_SECONDS", "21600")),
+                       write_rate_limit=int(os.getenv("CONTROL_CENTER_WRITE_RATE_LIMIT", "120")),
+                       role=os.getenv("CONTROL_CENTER_ROLE", "operator"))
     if args.command == "set-password":
         password = sys.stdin.read().rstrip("\r\n") if args.password_stdin else getpass.getpass("New Control Center password: ")
         if not args.password_stdin:
