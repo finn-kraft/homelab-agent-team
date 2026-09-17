@@ -20,13 +20,15 @@ class ControlStore:
             structured_payload,created_at FROM events ORDER BY agent,created_at DESC""").fetchall())
             active_work = list(connection.execute("""SELECT s.id step_id,s.job_id,s.status,s.title,
             s.attempt_count,s.files_changed,j.goal,j.current_phase,r.verdict,
-            m.provider,m.model,m.latency_seconds,
+            m.provider,m.model,m.latency_seconds,p.progress_classification,
             (SELECT count(*) FROM command_runs c WHERE c.step_id=s.id) command_count,
             (SELECT count(*) FROM review_issues i WHERE i.step_id=s.id AND i.status='open') open_issue_count
             FROM steps s JOIN jobs j ON j.id=s.job_id LEFT JOIN LATERAL
             (SELECT verdict FROM reviews WHERE step_id=s.id ORDER BY review_attempt DESC LIMIT 1) r ON true
             LEFT JOIN LATERAL (SELECT provider,model,latency_seconds FROM llm_invocations
             WHERE step_id=s.id ORDER BY id DESC LIMIT 1) m ON true
+            LEFT JOIN LATERAL (SELECT structured_payload->>'progress_classification' progress_classification
+            FROM events WHERE step_id=s.id AND event_type='agent_action' ORDER BY id DESC LIMIT 1) p ON true
             WHERE s.status NOT IN ('complete','cancelled') ORDER BY s.updated_at DESC""").fetchall())
             inference = connection.execute("""SELECT count(*) FILTER(WHERE provider='openrouter') cloud_requests,
             count(*) FILTER(WHERE provider<>'openrouter') local_requests,count(*) FILTER(WHERE fallback) fallback_requests,
@@ -75,6 +77,12 @@ class ControlStore:
                     """SELECT caller_agent,provider,model,route_reason,attempt,latency_seconds,usage,
                     estimated_cloud_cost,fallback,created_at FROM llm_invocations WHERE step_id=%s ORDER BY id""",
                     (sid,)).fetchall()]
+                progress = connection.execute(
+                    """SELECT structured_payload->>'progress_classification' AS value
+                    FROM events WHERE step_id=%s AND event_type='agent_action'
+                    ORDER BY id DESC LIMIT 1""", (sid,)
+                ).fetchone()
+                step["progress_classification"] = progress["value"] if progress else None
                 step["review_issues"] = [dict(x) for x in connection.execute(
                     "SELECT * FROM review_issues WHERE step_id=%s ORDER BY id", (sid,)).fetchall()]
                 checkpoint = connection.execute("SELECT * FROM checkpoint_runs WHERE step_id=%s", (sid,)).fetchone()
