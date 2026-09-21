@@ -386,6 +386,18 @@ pre { max-height: 300px; overflow: auto; padding: 11px; border: 1px solid var(--
 .operation-row { display: flex; align-items: center; gap: 10px; min-height: 42px; border-bottom: 1px solid var(--line); }
 .operation-row:last-child { border-bottom: 0; }
 .operation-row small { margin-left: auto; color: var(--muted); }
+.mission-head { align-items: flex-start; }
+.mission-head h2 { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-top: 4px; }
+.dependency-graph { display: grid; grid-template-columns: repeat(auto-fit, minmax(245px, 1fr)); gap: 12px; }
+.dependency-node { position: relative; min-height: 145px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
+.dependency-node::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--green); }
+.dependency-node.dependency-waiting::before { background: var(--amber); }
+.dependency-node-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+.dependency-node > strong { display: block; min-height: 38px; font-size: 13px; }
+.dependency-links { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 13px; color: var(--faint); font-size: 9px; text-transform: uppercase; letter-spacing: .05em; }
+.dependency-link, .dependency-root { padding: 4px 7px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: rgba(255,255,255,.025); font-size: 9px; letter-spacing: 0; text-transform: none; }
+.dependency-link.satisfied { color: var(--green); border-color: rgba(91,221,160,.18); }
+.dependency-link.waiting { color: var(--amber); border-color: rgba(245,188,103,.18); }
 .stale-warning { display: flex; align-items: center; gap: 8px; margin: -4px 0 12px; color: var(--amber); font-size: 12px; }
 .stale-warning svg { width: 16px; height: 16px; }
 .telemetry-chart { padding: 14px 18px 10px; }
@@ -512,6 +524,7 @@ textarea { min-height: 122px; resize: vertical; }
   .filter-search { width: 100%; margin-left: 0; }
   .filter-search input { flex: 1; min-width: 0; }
   .job-hero .section-head { display: block; }
+  .mission-head { display: block; }
   .job-actions { justify-content: flex-start; margin-top: 14px; }
   dialog form { padding: 19px; }
 }

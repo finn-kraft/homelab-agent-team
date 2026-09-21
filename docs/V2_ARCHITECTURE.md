@@ -53,6 +53,13 @@ package commits into a non-protected mission branch using a detached temporary
 worktree. The `human_queue` and `mission_integrations` tables are included in
 `orchestrator-0005`, with CLI and Control Center read/write access.
 
+Mission controls are an additive projection over that state machine. Dependency
+visibility is calculated from `work_packages.dependencies`; Pause/Resume/Cancel update
+the mission plus linked jobs/packages transactionally and emit per-job events. In-flight
+phase leases and repository locks remain authoritative until their safe boundary or
+expiry. `control_operation_events` is the append-only audit of every operation lifecycle
+(migration `orchestrator-0013`).
+
 `AUTO_INTEGRATE` remains opt-in. The remaining acceptance gate is live: run one
 coordinator against a disposable repository and observe at least three packages,
 including one deliberate Reviewer revision, reach verified checkpoints without

@@ -63,6 +63,44 @@ def test_control_action_failure_is_bound_to_operation():
     assert raised.value.operation_id == "op-failed"
     assert store.calls[-1][1] == "failed"
 
+
+def test_mission_controls_record_operation_lifecycle_and_confirmation():
+    class MissionStore(Store):
+        def __init__(self):
+            super().__init__(); self.operation_updates = []
+        def begin_mission_operation(self, mission_id, action, requested_by):
+            self.calls.append((mission_id, action, requested_by)); return "mission-op-1"
+        def update_operation(self, operation_id, status, detail=None, error=None):
+            self.operation_updates.append((operation_id, status, detail, error))
+        def mission_action(self, mission_id, action):
+            self.calls.append((mission_id, action))
+            return {"mission_id": mission_id, "status": "paused"}
+
+    store = MissionStore()
+    app = ControlCenter(store, Telemetry(), Auth())
+    with pytest.raises(PermissionError):
+        app.perform_mission_action(4, "cancel", {})
+    result = app.perform_mission_action(4, "pause", {})
+    assert result["operation_id"] == "mission-op-1"
+    assert result["operation_status"] == "applied"
+    assert [item[1] for item in store.operation_updates] == ["accepted", "applied"]
+
+
+def test_mission_invalid_transition_is_durably_rejected():
+    class MissionStore(Store):
+        def __init__(self): self.operation_updates = []
+        def begin_mission_operation(self, *_args): return "mission-op-rejected"
+        def update_operation(self, operation_id, status, detail=None, error=None):
+            self.operation_updates.append((operation_id, status, detail, error))
+        def mission_action(self, *_args): raise ValueError("cannot resume active mission")
+
+    from control_center.app import OperationRejected
+    store = MissionStore()
+    with pytest.raises(OperationRejected) as raised:
+        ControlCenter(store, Telemetry(), Auth()).perform_mission_action(4, "resume", {})
+    assert raised.value.operation_id == "mission-op-rejected"
+    assert store.operation_updates[-1][1] == "rejected"
+
 def test_dashboard_has_no_arbitrary_command_or_filesystem_api():
     from importlib.resources import files
     html = files("control_center.static").joinpath("index.html").read_text()
@@ -83,6 +121,8 @@ def test_static_dashboard_contains_primary_operator_workflow():
     assert "/api/login" in script and "Control Center password" in html
     assert "Remove from queue" in script and "data-job-action=\"remove\"" in script
     assert "engineering-agent-v3-controls" in html
+    assert "dependency-graph" in script
+    assert "mission-action" in script
 
 def test_dashboard_uses_accessible_delegated_controls():
     from importlib.resources import files

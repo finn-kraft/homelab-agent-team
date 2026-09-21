@@ -438,6 +438,34 @@ function renderMissions() {
   $('#missionsView').innerHTML = `<div class="section-head"><div class="section-title"><h2>Mission control</h2><small>Roadmap work is materialized into bounded packages before engineering starts.</small></div><span>${missions.length} mission${missions.length === 1 ? '' : 's'}</span></div>${missions.length ? `<div class="project-list">${missions.map(mission => `<article class="card project-card"><div class="section-head tight"><div><span class="kicker">MISSION #${Number(mission.id)}</span><h3>${esc(mission.goal)}</h3></div>${badge(mission.status)}</div><p class="path">${esc(mission.repository)} · ${esc(mission.branch)}</p><div class="project-meta"><div><span>Packages</span><b>${Number(mission.completed_packages || 0)} / ${Number(mission.package_count || 0)} complete</b></div><div><span>Roadmap pending</span><b>${Number(mission.roadmap_pending_packages || 0)}</b></div><div><span>Blocked</span><b>${Number(mission.blocked_packages || 0)}</b></div><div><span>Human queue</span><b>${Number(mission.open_human_requests || 0)}</b></div><div><span>Updated</span><b>${esc(age(mission.updated_at))}</b></div></div><button class="primary" data-action="open-mission" data-mission-id="${Number(mission.id)}">Open mission →</button></article>`).join('')}</div>` : '<div class="card empty"><div><strong>No V2 missions yet</strong>Create one with the orchestrator mission command, then let the roadmap manager populate packages.</div></div>'}`;
 }
 
+function missionControls(mission) {
+  const id = Number(mission.id);
+  const status = String(mission.status || '');
+  const pause = ['active'].includes(status);
+  const resume = ['paused', 'blocked'].includes(status);
+  const cancel = !['complete', 'cancelled'].includes(status);
+  return `${pause ? `<button data-action="mission-action" data-mission-action="pause" data-mission-id="${id}">Pause mission</button>` : ''}
+    ${resume ? `<button class="primary" data-action="mission-action" data-mission-action="resume" data-mission-id="${id}">Resume mission</button>` : ''}
+    ${cancel ? `<button class="danger" data-action="mission-action" data-mission-action="cancel" data-mission-id="${id}">Cancel mission</button>` : ''}`;
+}
+
+function dependencyGraph(packages) {
+  if (!packages?.length) return '';
+  const nodes = packages.map(pkg => {
+    const dependencies = Array.isArray(pkg.dependencies) ? pkg.dependencies.map(Number) : [];
+    const unmet = new Set((pkg.unmet_dependencies || []).map(Number));
+    const links = dependencies.length
+      ? dependencies.map(id => `<span class="dependency-link ${unmet.has(id) ? 'waiting' : 'satisfied'}">#${id} ${unmet.has(id) ? 'waiting' : 'complete'}</span>`).join('')
+      : '<span class="dependency-root">Starts independently</span>';
+    return `<article class="dependency-node dependency-${esc(pkg.dependency_state || 'ready')}">
+      <div class="dependency-node-head"><span class="kicker">PACKAGE #${Number(pkg.id)}</span>${badge(pkg.status)}</div>
+      <strong>${esc(pkg.objective)}</strong>
+      <div class="dependency-links"><span>Depends on</span>${links}</div>
+    </article>`;
+  }).join('');
+  return `<div class="section-head"><div class="section-title"><h2>Dependencies</h2><small>Derived from each Work Package dependency list; waiting packages unlock when every prerequisite completes.</small></div></div><div class="dependency-graph">${nodes}</div>`;
+}
+
 async function openMission(id) {
   try {
     const mission = await api(`/api/missions/${Number(id)}`);
@@ -446,8 +474,22 @@ async function openMission(id) {
       const evidenceLabel = evidence ? (evidence.eligible ? 'Roadmap complete' : (evidence.ready_for_integration ? 'Awaiting integration' : 'Evidence incomplete')) : '';
       return `<div class="commit-row"><span>${badge(pkg.status)}</span><div class="commit-main"><strong>${esc(pkg.objective)}</strong><small>${esc(pkg.roadmap_reference || 'manual package')} · ${esc(pkg.branch)}${evidenceLabel ? ` · ${evidenceLabel}` : ''}</small></div><span class="code">${esc((pkg.resulting_commit || 'not committed').slice(0, 10))}</span></div>`;
     }).join('');
-    $('#missionsView').innerHTML = `<div class="section-head"><div class="section-title"><h2>${esc(mission.goal)}</h2><small>${esc(mission.repository)} · ${esc(mission.branch)}</small></div><button data-action="back-missions">← All missions</button></div><div class="card commit-list">${packageRows || '<div class="empty"><div><strong>No packages yet</strong>The roadmap manager will materialize the next bounded items.</div></div>'}</div>${(mission.integrations || []).length ? `<div class="section-head"><div class="section-title"><h2>Integration</h2><small>Verified package commits and branch updates</small></div></div><div class="card commit-list">${mission.integrations.map(item => `<div class="commit-row">${badge(item.status)}<div class="commit-main"><strong>${esc(item.source_branch)} → ${esc(item.target_branch)}</strong><small>${esc(item.error || item.commit_sha || 'Pending')}</small></div></div>`).join('')}</div>` : ''}`;
+    const operations = (mission.control_operations || []).map(operation => `<div class="operation-row">${badge(operation.status)}<strong>${esc(operation.action)}</strong><span class="code">${esc(String(operation.operation_id || '').slice(0, 12))}</span><small>${age(operation.created_at)}</small></div>`).join('');
+    $('#missionsView').innerHTML = `<div class="section-head mission-head"><div class="section-title"><span class="kicker">MISSION #${Number(mission.id)}</span><h2>${esc(mission.goal)} ${badge(mission.status)}</h2><small>${esc(mission.repository)} · ${esc(mission.branch)}</small></div><div class="job-actions">${missionControls(mission)}<button data-action="back-missions">← All missions</button></div></div>${dependencyGraph(mission.packages || [])}<div class="section-head"><div class="section-title"><h2>Work packages</h2><small>Durable execution and completion evidence</small></div></div><div class="card commit-list">${packageRows || '<div class="empty"><div><strong>No packages yet</strong>The roadmap manager will materialize the next bounded items.</div></div>'}</div>${(mission.integrations || []).length ? `<div class="section-head"><div class="section-title"><h2>Integration</h2><small>Verified package commits and branch updates</small></div></div><div class="card commit-list">${mission.integrations.map(item => `<div class="commit-row">${badge(item.status)}<div class="commit-main"><strong>${esc(item.source_branch)} → ${esc(item.target_branch)}</strong><small>${esc(item.error || item.commit_sha || 'Pending')}</small></div></div>`).join('')}</div>` : ''}${operations ? `<div class="section-head"><div class="section-title"><h2>Control history</h2><small>Durable mission operation audit</small></div></div><div class="card operation-list">${operations}</div>` : ''}`;
   } catch (error) { toast('Could not load mission', error.message, true); }
+}
+
+async function missionAction(action, button) {
+  const missionId = Number(button.dataset.missionId);
+  if (action === 'cancel' && !confirm('Cancel this entire mission? Unfinished packages will stop and durable evidence will be kept.')) return;
+  setBusy(button, true);
+  try {
+    const result = await api(`/api/missions/${missionId}/${action}`, {method: 'POST', body: JSON.stringify({confirm: action === 'cancel'})});
+    toast(`Mission ${action === 'pause' ? 'paused' : action === 'resume' ? 'resumed' : 'cancelled'}`, `Operation ${String(result.operation_id || '').slice(0, 12)} was applied.`);
+    state.overview = await api('/api/overview');
+    await openMission(missionId);
+  } catch (error) { toast('Mission action failed', error.message, true); }
+  finally { setBusy(button, false); }
 }
 
 function attentionPanel(jobs) {
@@ -723,6 +765,10 @@ document.addEventListener('click', event => {
   if (action === 'open-job') return openJob(target.dataset.jobId);
   if (action === 'open-mission') return openMission(target.dataset.missionId);
   if (action === 'back-missions') return renderMissions();
+  if (action === 'mission-action') {
+    event.preventDefault();
+    return void missionAction(target.dataset.missionAction, target);
+  }
   if (action === 'event-filter') { state.eventFilter = target.dataset.filter; return loadEvents(); }
   if (action === 'job-action') {
     event.preventDefault();

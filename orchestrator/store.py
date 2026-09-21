@@ -18,7 +18,7 @@ from typing import Any, Iterable
 from engineering_agent.models import Status, Task
 
 
-MIGRATION_VERSION = "orchestrator-0012"
+MIGRATION_VERSION = "orchestrator-0013"
 
 _REDACTION_PATTERNS = (
     re.compile(r"(?i)(?:api[_-]?key|token|password|secret)\s*[=:]\s*[^\s,}]+"),
@@ -47,14 +47,19 @@ REQUIRED_TABLE_COLUMNS = {
         "correlation_id",
     },
     "command_runs": {"step_id", "timed_out", "cancelled"},
-    "reviews": {"step_id", "verdict", "review_lease_expires_at"},
+    "reviews": {"step_id", "verdict", "lease_expires_at"},
     "verification_runs": {"step_id", "status"},
     "checkpoint_runs": {"step_id", "status"},
     "engineering_sessions": {"job_id", "step_id", "turn_count"},
     "engineering_actions": {"session_id", "sequence", "action"},
     "worker_heartbeats": {"worker_id", "component", "heartbeat_at"},
     "phase_metrics": {"phase", "duration_seconds", "prompt_chars", "prompt_tokens", "context_sha256"},
-    "control_operations": {"operation_id", "job_id", "action", "status", "created_at", "updated_at"},
+    "missions": {"id", "status"},
+    "work_packages": {"id", "mission_id", "job_id", "step_id", "dependencies", "status"},
+    "control_operations": {
+        "operation_id", "job_id", "mission_id", "action", "status", "created_at", "updated_at",
+    },
+    "control_operation_events": {"operation_id", "status", "created_at"},
     "telemetry_samples": {"id", "sampled_at", "gpu", "ollama", "routing_agent", "inference"},
 }
 
@@ -269,8 +274,26 @@ CREATE TABLE IF NOT EXISTS control_operations (
   completed_at TIMESTAMPTZ,
   CHECK (status IN ('submitted','accepted','applied','failed'))
 );
+ALTER TABLE control_operations ADD COLUMN IF NOT EXISTS mission_id BIGINT REFERENCES missions(id) ON DELETE SET NULL;
+ALTER TABLE control_operations DROP CONSTRAINT IF EXISTS control_operations_status_check;
+ALTER TABLE control_operations ADD CONSTRAINT control_operations_status_check
+  CHECK (status IN ('submitted','accepted','applied','rejected','failed'));
 CREATE INDEX IF NOT EXISTS control_operations_job_idx
   ON control_operations (job_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS control_operations_mission_idx
+  ON control_operations (mission_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS control_operation_events (
+  id BIGSERIAL PRIMARY KEY,
+  operation_id TEXT NOT NULL REFERENCES control_operations(operation_id) ON DELETE CASCADE,
+  status TEXT NOT NULL,
+  detail JSONB NOT NULL DEFAULT '{}',
+  error TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (status IN ('submitted','accepted','applied','rejected','failed'))
+);
+CREATE INDEX IF NOT EXISTS control_operation_events_operation_idx
+  ON control_operation_events (operation_id, id);
 
 CREATE TABLE IF NOT EXISTS telemetry_samples (
   id BIGSERIAL PRIMARY KEY,
@@ -436,6 +459,48 @@ class OrchestratorStore:
                 return []
             return OrchestratorStore._json_list(parsed)
         return []
+
+    @classmethod
+    def package_dependency_view(cls, packages: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Decorate Work Packages with a read-only dependency projection.
+
+        ``work_packages.dependencies`` remains the only dependency model.  The
+        extra fields are calculated for APIs and operators and are never
+        persisted as a second source of truth.
+        """
+        projected = [dict(package) for package in packages]
+        by_id = {int(package["id"]): package for package in projected}
+        for package in projected:
+            dependencies: list[int] = []
+            for value in cls._json_list(package.get("dependencies")):
+                try:
+                    dependency_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if dependency_id not in dependencies:
+                    dependencies.append(dependency_id)
+            dependency_packages = []
+            unmet = []
+            missing = []
+            for dependency_id in dependencies:
+                dependency = by_id.get(dependency_id)
+                if dependency is None:
+                    missing.append(dependency_id)
+                    unmet.append(dependency_id)
+                    continue
+                dependency_packages.append({
+                    "id": dependency_id,
+                    "objective": dependency.get("objective"),
+                    "status": dependency.get("status"),
+                })
+                if dependency.get("status") != "complete":
+                    unmet.append(dependency_id)
+            package["dependencies"] = dependencies
+            package["dependency_packages"] = dependency_packages
+            package["unmet_dependencies"] = unmet
+            package["missing_dependencies"] = missing
+            package["dependency_state"] = "waiting" if unmet else "ready"
+        return projected
 
     def job(self, job_id: int) -> dict[str, Any] | None:
         with self.connect() as connection:
@@ -635,7 +700,7 @@ class OrchestratorStore:
                 "SELECT * FROM human_queue WHERE mission_id=%s ORDER BY created_at DESC", (mission_id,)
             ).fetchall()
             result = dict(mission)
-            result["packages"] = [dict(row) for row in packages]
+            result["packages"] = self.package_dependency_view(dict(row) for row in packages)
             result["integrations"] = [dict(row) for row in integrations]
             result["human_queue"] = [dict(row) for row in requests]
             return result
@@ -765,7 +830,8 @@ class OrchestratorStore:
             if mission_id is not None:
                 query += " WHERE mission_id=%s"; params = (mission_id,)
             query += " ORDER BY id"
-            return [dict(row) for row in connection.execute(query, params).fetchall()]
+            rows = [dict(row) for row in connection.execute(query, params).fetchall()]
+            return self.package_dependency_view(rows)
 
     def work_package_for_step(self, step_id: int) -> dict[str, Any] | None:
         """Return the V2 package linked to a durable implementation step."""
@@ -1069,7 +1135,7 @@ class OrchestratorStore:
         with self.connect() as connection:
             connection.execute("""UPDATE work_packages SET status=%s,
                 resulting_commit=COALESCE(%s,resulting_commit),lease_expires_at=NULL,updated_at=now()
-                WHERE step_id=%s""", (status, commit_sha, step_id))
+                WHERE step_id=%s AND status <> 'cancelled'""", (status, commit_sha, step_id))
 
     def heartbeat_work_package(self, package_id: int, worker_id: str,
                                lease_seconds: int = 900) -> bool:
@@ -1939,24 +2005,30 @@ class OrchestratorStore:
     # Operator operation tracking
     # ------------------------------------------------------------------
     def begin_control_operation(self, job_id: int | None, action: str,
-                                requested_by: str = "control-center") -> str:
+                                requested_by: str = "control-center", *,
+                                mission_id: int | None = None) -> str:
         """Create an auditable operation before applying a control action."""
         operation_id = str(uuid.uuid4())
         with self.connect() as connection:
             connection.execute(
                 """INSERT INTO control_operations
-                   (operation_id,job_id,action,status,requested_by)
-                   VALUES(%s,%s,%s,'submitted',%s)""",
-                (operation_id, job_id, str(action), str(requested_by)[:200]),
+                   (operation_id,job_id,mission_id,action,status,requested_by)
+                   VALUES(%s,%s,%s,%s,'submitted',%s)""",
+                (operation_id, job_id, mission_id, str(action), str(requested_by)[:200]),
+            )
+            connection.execute(
+                """INSERT INTO control_operation_events(operation_id,status)
+                   VALUES(%s,'submitted')""",
+                (operation_id,),
             )
         return operation_id
 
     def update_control_operation(self, operation_id: str, status: str,
                                  *, detail: dict[str, Any] | None = None,
                                  error: str | None = None) -> None:
-        if status not in {"submitted", "accepted", "applied", "failed"}:
+        if status not in {"submitted", "accepted", "applied", "rejected", "failed"}:
             raise ValueError("invalid control operation status")
-        completed = "now()" if status in {"applied", "failed"} else "NULL"
+        completed = "now()" if status in {"applied", "rejected", "failed"} else "NULL"
         with self.connect() as connection:
             safe_detail = (json.dumps(detail, default=str) if detail is not None else None)
             safe_detail = self._redact_sensitive(safe_detail) if safe_detail is not None else None
@@ -1969,6 +2041,11 @@ class OrchestratorStore:
             )
             if result.rowcount != 1:
                 raise KeyError(operation_id)
+            connection.execute(
+                """INSERT INTO control_operation_events(operation_id,status,detail,error)
+                   VALUES(%s,%s,COALESCE(%s::jsonb,'{}'::jsonb),%s)""",
+                (operation_id, status, safe_detail, safe_error),
+            )
 
     @staticmethod
     def _redact_sensitive(value: str) -> str:
@@ -1983,13 +2060,28 @@ class OrchestratorStore:
                 "SELECT * FROM control_operations WHERE operation_id=%s",
                 (operation_id,),
             ).fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            result = dict(row)
+            result["history"] = [dict(item) for item in connection.execute(
+                """SELECT status,detail,error,created_at FROM control_operation_events
+                   WHERE operation_id=%s ORDER BY id""",
+                (operation_id,),
+            ).fetchall()]
+            return result
 
     def list_control_operations(self, job_id: int | None = None,
-                                limit: int = 100) -> list[dict[str, Any]]:
+                                limit: int = 100, *,
+                                mission_id: int | None = None) -> list[dict[str, Any]]:
         limit = max(1, min(500, int(limit)))
         with self.connect() as connection:
-            if job_id is None:
+            if mission_id is not None:
+                rows = connection.execute(
+                    """SELECT * FROM control_operations WHERE mission_id=%s
+                       ORDER BY created_at DESC LIMIT %s""",
+                    (mission_id, limit),
+                ).fetchall()
+            elif job_id is None:
                 rows = connection.execute(
                     "SELECT * FROM control_operations ORDER BY created_at DESC LIMIT %s",
                     (limit,),
@@ -2001,6 +2093,241 @@ class OrchestratorStore:
                     (job_id, limit),
                 ).fetchall()
             return [dict(row) for row in rows]
+
+    @staticmethod
+    def allowed_mission_control_actions(status: str) -> set[str]:
+        """Return mission actions that preserve the existing state machine.
+
+        Repeating pause or cancel is intentionally accepted so an operator can
+        safely retry after a lost HTTP response or service restart.
+        """
+        return {
+            "active": {"pause", "cancel"},
+            "paused": {"pause", "resume", "cancel"},
+            "blocked": {"resume", "cancel"},
+            "complete": set(),
+            "cancelled": {"cancel"},
+        }.get(str(status), set())
+
+    def control_mission(self, mission_id: int, action: str) -> dict[str, Any]:
+        """Pause, resume, or cancel a mission in one durable transaction.
+
+        Pause prevents every new claim immediately. Engineering commands
+        already in flight observe the job pause and stop at their existing safe
+        boundary; their package admission is returned to ``ready`` while their
+        Step and repository lock remain owned until that acknowledgement.
+
+        Cancel prevents new claims and marks packages cancelled immediately.
+        A live bounded phase keeps its Step lease long enough to persist any
+        atomic result already underway. ``reconcile_mission_controls`` clears
+        that Step after the owner releases or its lease expires.
+        """
+        if action not in {"pause", "resume", "cancel"}:
+            raise ValueError(f"unknown mission control action: {action}")
+        target_status = {"pause": "paused", "resume": "active", "cancel": "cancelled"}[action]
+        with self.connect() as connection:
+            mission = connection.execute(
+                "SELECT id,status FROM missions WHERE id=%s FOR UPDATE", (mission_id,)
+            ).fetchone()
+            if not mission:
+                raise KeyError(f"mission {mission_id} does not exist")
+            previous_status = str(mission["status"])
+            if action not in self.allowed_mission_control_actions(previous_status):
+                raise ValueError(
+                    f"cannot {action} mission {mission_id} while status is {previous_status}"
+                )
+            idempotent = previous_status == target_status
+            rows = [dict(row) for row in connection.execute(
+                """SELECT p.id,p.job_id,p.step_id,p.status AS package_status,
+                          j.status AS job_status,s.status AS step_status,
+                          CASE WHEN
+                            (s.status='running' AND s.worker_id IS NOT NULL
+                              AND s.lease_expires_at > now()) OR
+                            (s.status='review' AND s.reviewer_worker_id IS NOT NULL
+                              AND s.review_lease_expires_at > now()) OR
+                            (s.status IN ('verification','checkpoint')
+                              AND s.orchestrator_worker_id IS NOT NULL
+                              AND s.orchestrator_lease_expires_at > now())
+                          THEN true ELSE false END AS in_flight
+                   FROM work_packages p
+                   LEFT JOIN jobs j ON j.id=p.job_id
+                   LEFT JOIN steps s ON s.id=p.step_id
+                   WHERE p.mission_id=%s ORDER BY p.id
+                   FOR UPDATE OF p""",
+                (mission_id,),
+            ).fetchall()]
+            job_states = {
+                int(row["job_id"]): str(row["job_status"])
+                for row in rows if row.get("job_id") is not None
+            }
+            in_flight_packages = [
+                int(row["id"]) for row in rows if row.get("in_flight")
+            ]
+
+            if not idempotent:
+                connection.execute(
+                    "UPDATE missions SET status=%s,updated_at=now() WHERE id=%s",
+                    (target_status, mission_id),
+                )
+
+            requeued_steps: list[int] = []
+            if action == "pause":
+                connection.execute(
+                    """UPDATE jobs SET status='paused',paused_at=now(),
+                         planner_worker_id=NULL,planner_lease_expires_at=NULL,updated_at=now()
+                       WHERE id IN (SELECT job_id FROM work_packages WHERE mission_id=%s)
+                         AND status IN ('pending','planning','running','reviewing',
+                                        'verifying','checkpointing')""",
+                    (mission_id,),
+                )
+                # Mission status prevents a replacement claim. Returning only
+                # Engineering admissions to ready makes resume/restart
+                # deterministic after the cooperative Step owner stops.
+                connection.execute(
+                    """UPDATE work_packages SET status='ready',worker_id=NULL,
+                         lease_expires_at=NULL,updated_at=now()
+                       WHERE mission_id=%s AND status='engineering'""",
+                    (mission_id,),
+                )
+            elif action == "resume":
+                connection.execute(
+                    """UPDATE jobs SET status='running',paused_at=NULL,
+                         planner_worker_id=NULL,planner_lease_expires_at=NULL,updated_at=now()
+                       WHERE id IN (SELECT job_id FROM work_packages WHERE mission_id=%s)
+                         AND status='paused'""",
+                    (mission_id,),
+                )
+                # A blocked mission may contain independently recoverable
+                # packages. Mirror the existing job Resume rule one job at a
+                # time while leaving unresolved human gates untouched.
+                for job_id, job_status in job_states.items():
+                    if job_status not in {"blocked", "failed"}:
+                        continue
+                    candidate = connection.execute(
+                        """SELECT id FROM steps WHERE job_id=%s
+                           AND status IN ('blocked','failed') ORDER BY sequence,id LIMIT 1""",
+                        (job_id,),
+                    ).fetchone()
+                    if not candidate:
+                        continue
+                    step_id = int(candidate["id"])
+                    connection.execute(
+                        """UPDATE steps SET status='queued',blocker=NULL,worker_id=NULL,
+                           lease_expires_at=NULL,orchestrator_worker_id=NULL,
+                           orchestrator_lease_expires_at=NULL,reviewer_worker_id=NULL,
+                           review_lease_expires_at=NULL,updated_at=now() WHERE id=%s""",
+                        (step_id,),
+                    )
+                    connection.execute(
+                        """UPDATE work_packages SET status='ready',worker_id=NULL,
+                           lease_expires_at=NULL,updated_at=now() WHERE step_id=%s
+                           AND status IN ('blocked','failed')""",
+                        (step_id,),
+                    )
+                    connection.execute(
+                        """UPDATE jobs SET status='running',current_phase='engineering',
+                           current_step=%s,paused_at=NULL,updated_at=now() WHERE id=%s""",
+                        (step_id, job_id),
+                    )
+                    requeued_steps.append(step_id)
+            else:  # cancel
+                connection.execute(
+                    """UPDATE jobs SET status='cancelled',current_phase='cancelled',
+                         planner_worker_id=NULL,planner_lease_expires_at=NULL,
+                         paused_at=NULL,updated_at=now()
+                       WHERE id IN (SELECT job_id FROM work_packages WHERE mission_id=%s)
+                         AND status NOT IN ('complete','cancelled')""",
+                    (mission_id,),
+                )
+                connection.execute(
+                    """UPDATE work_packages SET status='cancelled',worker_id=NULL,
+                         lease_expires_at=NULL,updated_at=now()
+                       WHERE mission_id=%s AND status NOT IN ('complete','cancelled')""",
+                    (mission_id,),
+                )
+                # Do not revoke a live phase underneath an atomic Git or DB
+                # write. Non-live work is cancelled now; live work is finalized
+                # by reconcile_mission_controls at release/expiry.
+                connection.execute(
+                    """UPDATE steps SET status='cancelled',worker_id=NULL,
+                         lease_expires_at=NULL,orchestrator_worker_id=NULL,
+                         orchestrator_lease_expires_at=NULL,reviewer_worker_id=NULL,
+                         review_lease_expires_at=NULL,blocker=NULL,updated_at=now()
+                       WHERE job_id IN (
+                         SELECT job_id FROM work_packages WHERE mission_id=%s
+                       ) AND status NOT IN ('complete','cancelled') AND NOT (
+                         (status='running' AND worker_id IS NOT NULL AND lease_expires_at > now()) OR
+                         (status='review' AND reviewer_worker_id IS NOT NULL
+                           AND review_lease_expires_at > now()) OR
+                         (status IN ('verification','checkpoint')
+                           AND orchestrator_worker_id IS NOT NULL
+                           AND orchestrator_lease_expires_at > now())
+                       )""",
+                    (mission_id,),
+                )
+                connection.execute(
+                    """UPDATE human_queue SET status='cancelled',updated_at=now()
+                       WHERE mission_id=%s AND status='open'""",
+                    (mission_id,),
+                )
+
+            if not idempotent:
+                event_type = {
+                    "pause": "mission_paused",
+                    "resume": "mission_resumed",
+                    "cancel": "mission_cancelled",
+                }[action]
+                for job_id, job_status in job_states.items():
+                    self._event(connection, job_id, None, event_type, {
+                        "mission_id": mission_id,
+                        "previous_mission_status": previous_status,
+                        "previous_job_status": job_status,
+                        "in_flight_packages": in_flight_packages,
+                        "requeued_steps": requeued_steps,
+                    }, agent="control-center")
+
+            return {
+                "mission_id": mission_id,
+                "action": action,
+                "status": target_status,
+                "previous_status": previous_status,
+                "idempotent": idempotent,
+                "affected_jobs": sorted(job_states),
+                "in_flight_packages": in_flight_packages,
+                "requeued_steps": requeued_steps,
+            }
+
+    def reconcile_mission_controls(self) -> dict[str, list[int]]:
+        """Finalize cancelled in-flight work after its durable lease ends."""
+        with self.connect() as connection:
+            connection.execute("DELETE FROM repository_locks WHERE lease_expires_at < now()")
+            rows = [dict(row) for row in connection.execute(
+                """UPDATE steps s SET status='cancelled',worker_id=NULL,
+                     lease_expires_at=NULL,orchestrator_worker_id=NULL,
+                     orchestrator_lease_expires_at=NULL,reviewer_worker_id=NULL,
+                     review_lease_expires_at=NULL,blocker=NULL,updated_at=now()
+                   FROM jobs j
+                   WHERE s.job_id=j.id AND j.status='cancelled'
+                     AND EXISTS (
+                       SELECT 1 FROM work_packages p JOIN missions m ON m.id=p.mission_id
+                       WHERE p.step_id=s.id AND m.status='cancelled'
+                     )
+                     AND s.status NOT IN ('complete','cancelled') AND NOT (
+                       (s.status='running' AND s.worker_id IS NOT NULL
+                         AND s.lease_expires_at > now()) OR
+                       (s.status='review' AND s.reviewer_worker_id IS NOT NULL
+                         AND s.review_lease_expires_at > now()) OR
+                       (s.status IN ('verification','checkpoint')
+                         AND s.orchestrator_worker_id IS NOT NULL
+                         AND s.orchestrator_lease_expires_at > now())
+                     ) RETURNING s.id,s.job_id"""
+            ).fetchall()]
+            for row in rows:
+                self._event(connection, int(row["job_id"]), int(row["id"]),
+                            "mission_cancel_finalized", {
+                                "reason": "in-flight lease released or expired",
+                            })
+            return {"cancelled_steps": [int(row["id"]) for row in rows]}
 
     def control(self, job_id: int, action: str) -> None:
         mapping = {"pause": "paused", "resume": "running", "cancel": "cancelled"}

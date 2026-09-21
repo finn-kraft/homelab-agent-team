@@ -63,6 +63,11 @@ complete only when the package, independent review, verification, checkpoint,
 and mission-branch integration all have durable evidence. Integration commits
 the exact roadmap checkbox and records the resulting branch commit.
 
+Item 29 adds a dependency projection sourced directly from Work Package state and
+durable mission Pause, Resume, and Cancel controls. Controls propagate to linked jobs
+and packages, preserve in-flight safe boundaries and repository locks, reconcile after
+restart, and retain an append-only operation audit.
+
 ## P0 — reliability before unattended operation
 
 1. Fix durable phase truth so status, phase, current step, and the dashboard
@@ -135,7 +140,7 @@ the exact roadmap checkbox and records the resulting branch commit.
 
 28. [x] Mark roadmap items complete only after review, verification, checkpoint, and
     integration evidence.
-29. Add dependency visualization and mission pause/resume/cancel controls.
+29. [x] Add dependency visualization and mission pause/resume/cancel controls.
 30. Expand human-queue history with evidence, ownership, answer, and outcome.
 31. Add mission-level progress, quality, latency, and cost metrics.
 

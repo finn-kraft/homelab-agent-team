@@ -103,6 +103,14 @@ class AgentOrchestrator:
     def once(self) -> AdvanceResult:
         """Perform one deterministic advancement, suitable for tests and cron-like use."""
         self._reconcile_worktrees()
+        reconcile_controls = getattr(self.store, "reconcile_mission_controls", None)
+        if reconcile_controls is not None:
+            try:
+                reconciled = reconcile_controls()
+                if reconciled.get("cancelled_steps"):
+                    self._log("mission_controls_reconciled", **reconciled)
+            except Exception:
+                LOG.warning("mission_control_reconciliation_unavailable", exc_info=True)
         recover_packages = getattr(self.store, "recover_work_packages", None)
         if recover_packages is not None:
             try:
@@ -438,7 +446,9 @@ class AgentOrchestrator:
             sync_package = getattr(self.store, "sync_package_for_step", None)
             if sync_package and next_state == "complete":
                 sync_package(work["id"], "complete", getattr(result, "commit_sha", None))
-            if next_state == "complete" and self.config.auto_integrate:
+            job = getattr(self.store, "job", lambda _id: None)(work["job_id"]) or {}
+            controlled = job.get("status") in {"paused", "cancelled"}
+            if next_state == "complete" and self.config.auto_integrate and not controlled:
                 self._integrate_completed_package(work, getattr(result, "commit_sha", None))
             self._log("checkpoint_finished", job_id=work["job_id"], step_id=work["id"],
                       commit_sha=getattr(result, "commit_sha", None), next_state=next_state)

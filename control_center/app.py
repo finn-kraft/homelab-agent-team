@@ -28,6 +28,15 @@ class OperationFailed(RuntimeError):
         self.detail = detail
 
 
+class OperationRejected(ValueError):
+    """An operator request was audited but rejected by durable state."""
+
+    def __init__(self, operation_id: str, detail: str):
+        super().__init__(detail)
+        self.operation_id = operation_id
+        self.detail = detail
+
+
 class ControlCenter:
     def __init__(self, store, telemetry, auth: AuthManager):
         self.store, self.telemetry, self.auth = store, telemetry, auth
@@ -146,6 +155,45 @@ class ControlCenter:
                     update(operation_id, "failed", error=str(exc))
                 except Exception:
                     LOGGER.exception("control_operation_record_failed operation_id=%s", operation_id)
+            raise OperationFailed(operation_id, str(exc)) from exc
+
+    def perform_mission_action(self, mission_id, action, data):
+        if action not in {"pause", "resume", "cancel"}:
+            raise ValueError("unsupported mission action")
+        if action == "cancel" and data.get("confirm") is not True:
+            raise PermissionError("confirmation_required")
+
+        begin = getattr(self.store, "begin_mission_operation", None)
+        if begin is None:
+            return self.store.mission_action(mission_id, action)
+        operation_id = begin(
+            mission_id, action, data.get("requested_by", "control-center")
+        )
+        update = getattr(self.store, "update_operation", None)
+        try:
+            if update:
+                update(operation_id, "accepted")
+            result = self.store.mission_action(mission_id, action)
+            if update:
+                update(operation_id, "applied", detail=result)
+            return {
+                **result,
+                "operation_id": operation_id,
+                "operation_status": "applied",
+            }
+        except (KeyError, ValueError) as exc:
+            if update:
+                update(operation_id, "rejected", error=str(exc))
+            raise OperationRejected(operation_id, str(exc)) from exc
+        except Exception as exc:
+            if update:
+                try:
+                    update(operation_id, "failed", error=str(exc))
+                except Exception:
+                    LOGGER.exception(
+                        "mission_control_operation_record_failed operation_id=%s",
+                        operation_id,
+                    )
             raise OperationFailed(operation_id, str(exc)) from exc
 
     @staticmethod
@@ -406,6 +454,14 @@ class ControlCenter:
                         except PermissionError:
                             return self.send_json(409, {"error": "confirmation_required"})
                         return self.send_json(200, result)
+                    if len(parts) == 4 and parts[:2] == ["api", "missions"]:
+                        try:
+                            result = app.perform_mission_action(
+                                int(parts[2]), parts[3], data
+                            )
+                        except PermissionError:
+                            return self.send_json(409, {"error": "confirmation_required"})
+                        return self.send_json(200, result)
                     if len(parts) == 4 and parts[:2] == ["api", "human-queue"] and parts[3] == "answer":
                         app.store.answer_human_request(int(parts[2]), data["answer"])
                         return self.send_json(200, {"status": "answered"})
@@ -433,6 +489,11 @@ class ControlCenter:
                                                         "operation_id": operation_id,
                                                         "operation_status": "failed", "detail": str(exc)})
                     return self.send_json(404, {"error": "not_found"})
+                except OperationRejected as exc:
+                    return self.send_json(409, {
+                        "error": "invalid_transition", "operation_id": exc.operation_id,
+                        "operation_status": "rejected", "detail": exc.detail,
+                    })
                 except (KeyError, ValueError, json.JSONDecodeError):
                     return self.send_json(400, {"error": "invalid_request"})
                 except OperationFailed as exc:

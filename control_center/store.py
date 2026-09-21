@@ -161,6 +161,11 @@ class ControlStore:
                     package["completion_evidence"] = evidence_getter(int(package["id"]))
                 except (KeyError, TypeError, ValueError):
                     package["completion_evidence"] = None
+        operation_getter = getattr(self.workflow, "list_control_operations", None)
+        if operation_getter is not None:
+            result["control_operations"] = operation_getter(
+                limit=50, mission_id=int(mission_id)
+            )
         return result
 
     def work_packages(self, mission_id=None):
@@ -341,6 +346,12 @@ class ControlStore:
         return self.workflow.begin_control_operation(job_id, action, requested_by)
     def update_operation(self, operation_id, status, detail=None, error=None):
         return self.workflow.update_control_operation(operation_id, status, detail=detail, error=error)
+    def begin_mission_operation(self, mission_id, action, requested_by="control-center"):
+        return self.workflow.begin_control_operation(
+            None, action, requested_by, mission_id=int(mission_id)
+        )
+    def mission_action(self, mission_id, action):
+        return self.workflow.control_mission(int(mission_id), action)
     def operation(self, operation_id):
         return self.workflow.control_operation(operation_id)
     def operations(self, job_id=None, limit=100):

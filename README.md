@@ -327,9 +327,15 @@ V2 operations are also available from the orchestrator CLI: `missions`,
 `expand-mission`, `packages`, `human-queue`, `answer-human`, and
 `integrate-package`. The Control Center exposes the same mission/package and human
 queue read models after running the current additive migration (recorded in the
-database as `orchestrator-0012`). Operator actions are tracked with durable
+database as `orchestrator-0013`). Operator actions are tracked with durable
 operation IDs and telemetry history/correlation data can be inspected from the
 Control Center.
+The Missions screen derives a dependency graph directly from each Work Package's
+durable `dependencies` field and provides mission-wide Pause, Resume, and Cancel.
+Every request has an append-only submitted/accepted/applied/rejected/failed audit
+history. Pause stops new claims and cooperatively halts Engineering at its existing
+safe boundary; Cancel retains all review, command, session, checkpoint, and event
+evidence while preventing unfinished packages from being claimed again.
 The dashboard's `/api/telemetry` path is independent of the workflow stream and polls
 Ollama/GPU data once per second, including loaded and installed model details.
 Roadmap checkboxes are updated only on the mission branch after an approved review,

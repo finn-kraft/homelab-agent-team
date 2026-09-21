@@ -6,6 +6,7 @@ import pytest
 
 from orchestrator.integration import IntegrationManager
 from orchestrator.mission import MissionManager, parse_roadmap
+from orchestrator.store import OrchestratorStore
 
 
 def git(repo, *args):
@@ -83,6 +84,24 @@ def test_mission_manager_requires_integration_evidence_for_completion(tmp_path):
     store.evidence = {"eligible": True}
     assert manager.refresh_status(1) == "complete"
     assert store.status == "complete"
+
+
+def test_dependency_projection_uses_existing_package_dependencies():
+    packages = [
+        {"id": 1, "objective": "Foundation", "status": "complete", "dependencies": []},
+        {"id": 2, "objective": "API", "status": "ready", "dependencies": [1]},
+        {"id": 3, "objective": "UI", "status": "ready", "dependencies": "[1, 2]"},
+    ]
+
+    projected = OrchestratorStore.package_dependency_view(packages)
+
+    assert projected[1]["dependency_state"] == "ready"
+    assert projected[1]["dependency_packages"] == [
+        {"id": 1, "objective": "Foundation", "status": "complete"}
+    ]
+    assert projected[2]["dependency_state"] == "waiting"
+    assert projected[2]["unmet_dependencies"] == [2]
+    assert packages[2].get("dependency_state") is None
 
 
 def test_integration_marks_roadmap_after_verified_package(tmp_path):

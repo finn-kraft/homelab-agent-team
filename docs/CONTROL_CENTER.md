@@ -73,6 +73,26 @@ the checkpoint has a commit, and that commit is integrated into the mission bran
 Integration then commits the exact referenced roadmap checkbox and refreshes the
 mission status from the durable evidence.
 
+The Mission detail screen also visualizes package prerequisites from the existing
+`work_packages.dependencies` values. It does not maintain a separate graph. Operators
+can Pause, Resume, or Cancel the mission from the same screen. These writes use
+`POST /api/missions/<id>/<pause|resume|cancel>` and produce a durable control operation
+with append-only submitted, accepted, applied, rejected, or failed history.
+
+Pause changes the mission and its active jobs to paused immediately, so no new package,
+Engineering, Review, Verification, or Checkpoint claim can begin. An Engineering
+command already running receives the existing cooperative stop signal and returns at a
+safe boundary. An atomic Review, Verification, or Checkpoint already underway may
+finish persisting its evidence, but automatic mission integration will not start while
+paused. Resume restores paused jobs to their existing durable phase; blocked packages
+are requeued only through the same bounded recovery rule used by job Resume.
+
+Cancel is idempotent and requires confirmation. It marks unfinished packages and jobs
+cancelled without deleting sessions, commands, reviews, verification runs, checkpoint
+records, events, or repository changes. A live phase retains its lease until it safely
+returns; after release or expiry, the coordinator finalizes its Step as cancelled.
+Repository locks are never force-deleted while live.
+
 The job page combines steps with reviews, verification runs, safe command metadata,
 model routes, and checkpoint records. It shows the same-step `changes_requested` loop as
 a revision, not a failed job. Human answers are accepted only for `needs_human`, appended
