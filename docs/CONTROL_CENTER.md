@@ -67,6 +67,12 @@ inference, and stale workflow leases. The read-only `/api/security/audit` endpoi
 scans recent event, command, and operator records for credential patterns without
 returning matched values.
 
+Mission details include per-package completion evidence. A package remains
+“roadmap pending” until its independent review is approved, verification passes,
+the checkpoint has a commit, and that commit is integrated into the mission branch.
+Integration then commits the exact referenced roadmap checkbox and refreshes the
+mission status from the durable evidence.
+
 The job page combines steps with reviews, verification runs, safe command metadata,
 model routes, and checkpoint records. It shows the same-step `changes_requested` loop as
 a revision, not a failed job. Human answers are accepted only for `needs_human`, appended

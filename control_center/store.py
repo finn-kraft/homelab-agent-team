@@ -154,6 +154,13 @@ class ControlStore:
         result = self.workflow.mission_detail(int(mission_id))
         if result is None:
             raise KeyError(mission_id)
+        evidence_getter = getattr(self.workflow, "package_completion_evidence", None)
+        if evidence_getter is not None:
+            for package in result.get("packages", []):
+                try:
+                    package["completion_evidence"] = evidence_getter(int(package["id"]))
+                except (KeyError, TypeError, ValueError):
+                    package["completion_evidence"] = None
         return result
 
     def work_packages(self, mission_id=None):

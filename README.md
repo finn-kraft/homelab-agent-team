@@ -332,6 +332,8 @@ operation IDs and telemetry history/correlation data can be inspected from the
 Control Center.
 The dashboard's `/api/telemetry` path is independent of the workflow stream and polls
 Ollama/GPU data once per second, including loaded and installed model details.
+Roadmap checkboxes are updated only on the mission branch after an approved review,
+passing verification, a durable checkpoint, and successful package integration.
 
 ## Tests
 
