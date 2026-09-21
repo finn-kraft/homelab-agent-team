@@ -488,6 +488,36 @@ function dependencyGraph(packages) {
   return `<div class="section-head"><div class="section-title"><h2>Dependencies</h2><small>Derived from each Work Package dependency list; waiting packages unlock when every prerequisite completes.</small></div></div><div class="dependency-graph">${nodes}</div>`;
 }
 
+function durationLabel(seconds) {
+  const value = Number(seconds || 0);
+  if (value < 60) return `${value.toFixed(1)}s`;
+  if (value < 3600) return `${(value / 60).toFixed(1)}m`;
+  if (value < 86400) return `${(value / 3600).toFixed(1)}h`;
+  return `${(value / 86400).toFixed(1)}d`;
+}
+
+function missionMetrics(metrics) {
+  if (!metrics) return '';
+  const progress = metrics.package_progress || {};
+  const quality = metrics.quality || {};
+  const verification = metrics.verification || {};
+  const latency = metrics.latency || {};
+  const models = metrics.models || {};
+  const phases = Object.entries(metrics.phases || {});
+  const providers = Object.entries(models.providers || {});
+  return `<div class="section-head"><div class="section-title"><h2>Mission metrics</h2><small>Calculated from durable workflow evidence; cancelled packages are reported but excluded from the progress denominator.</small></div><span>${Number(progress.denominator || 0)} delivery packages</span></div>
+    <div class="grid mission-metrics">
+      ${metricCard('Mission progress', `${Number(progress.percent || 0).toFixed(0)}%`, `${Number(progress.evidence_complete || 0)} of ${Number(progress.denominator || 0)} evidence-complete`, 'activity')}
+      ${metricCard('Quality and revisions', Number(quality.revision_cycles || 0), `${Number(quality.first_pass_approval_percent || 0).toFixed(0)}% first-pass review`, 'review')}
+      ${metricCard('Verification', `${Number(verification.first_pass_percent || 0).toFixed(0)}%`, `${Number(verification.passed || 0)} passed · ${Number(verification.failed || 0)} failed`, 'check')}
+      ${metricCard('End-to-end latency', durationLabel(latency.elapsed_seconds), `${durationLabel(latency.recorded_phase_seconds)} recorded phase time`, 'activity')}
+      ${metricCard('Model usage', Number(models.calls || 0), `${Number(models.input_tokens || 0).toLocaleString()} in · ${Number(models.output_tokens || 0).toLocaleString()} out`, 'brain')}
+      ${metricCard('Cloud cost', `$${Number(models.estimated_cloud_cost || 0).toFixed(3)}`, `${Number(models.cloud_calls || 0)} cloud · ${Number(models.fallback_calls || 0)} fallback`, 'cloud')}
+    </div>
+    ${phases.length ? `<div class="card metric-breakdown"><h3>Phase latency</h3>${phases.map(([name, item]) => `<div><span>${esc(phaseLabel(name))}</span><b>${Number(item.runs || 0)} runs</b><small>${durationLabel(item.average_seconds)} avg · ${durationLabel(item.max_seconds)} max</small></div>`).join('')}</div>` : ''}
+    ${providers.length ? `<div class="card metric-breakdown"><h3>Provider usage</h3>${providers.map(([name, item]) => `<div><span>${esc(name)}</span><b>${Number(item.calls || 0)} calls</b><small>${durationLabel(item.average_latency_seconds)} avg · $${Number(item.estimated_cloud_cost || 0).toFixed(3)}</small></div>`).join('')}</div>` : ''}`;
+}
+
 async function openMission(id) {
   try {
     const mission = await api(`/api/missions/${Number(id)}`);
@@ -497,7 +527,7 @@ async function openMission(id) {
       return `<div class="commit-row"><span>${badge(pkg.status)}</span><div class="commit-main"><strong>${esc(pkg.objective)}</strong><small>${esc(pkg.roadmap_reference || 'manual package')} · ${esc(pkg.branch)}${evidenceLabel ? ` · ${evidenceLabel}` : ''}</small></div><span class="code">${esc((pkg.resulting_commit || 'not committed').slice(0, 10))}</span></div>`;
     }).join('');
     const operations = (mission.control_operations || []).map(operation => `<div class="operation-row">${badge(operation.status)}<strong>${esc(operation.action)}</strong><span class="code">${esc(String(operation.operation_id || '').slice(0, 12))}</span><small>${age(operation.created_at)}</small></div>`).join('');
-    $('#missionsView').innerHTML = `<div class="section-head mission-head"><div class="section-title"><span class="kicker">MISSION #${Number(mission.id)}</span><h2>${esc(mission.goal)} ${badge(mission.status)}</h2><small>${esc(mission.repository)} · ${esc(mission.branch)}</small></div><div class="job-actions">${missionControls(mission)}<button data-action="back-missions">← All missions</button></div></div>${dependencyGraph(mission.packages || [])}<div class="section-head"><div class="section-title"><h2>Work packages</h2><small>Durable execution and completion evidence</small></div></div><div class="card commit-list">${packageRows || '<div class="empty"><div><strong>No packages yet</strong>The roadmap manager will materialize the next bounded items.</div></div>'}</div>${(mission.integrations || []).length ? `<div class="section-head"><div class="section-title"><h2>Integration</h2><small>Verified package commits and branch updates</small></div></div><div class="card commit-list">${mission.integrations.map(item => `<div class="commit-row">${badge(item.status)}<div class="commit-main"><strong>${esc(item.source_branch)} → ${esc(item.target_branch)}</strong><small>${esc(item.error || item.commit_sha || 'Pending')}</small></div></div>`).join('')}</div>` : ''}${operations ? `<div class="section-head"><div class="section-title"><h2>Control history</h2><small>Durable mission operation audit</small></div></div><div class="card operation-list">${operations}</div>` : ''}`;
+    $('#missionsView').innerHTML = `<div class="section-head mission-head"><div class="section-title"><span class="kicker">MISSION #${Number(mission.id)}</span><h2>${esc(mission.goal)} ${badge(mission.status)}</h2><small>${esc(mission.repository)} · ${esc(mission.branch)}</small></div><div class="job-actions">${missionControls(mission)}<button data-action="back-missions">← All missions</button></div></div>${missionMetrics(mission.metrics)}${dependencyGraph(mission.packages || [])}<div class="section-head"><div class="section-title"><h2>Work packages</h2><small>Durable execution and completion evidence</small></div></div><div class="card commit-list">${packageRows || '<div class="empty"><div><strong>No packages yet</strong>The roadmap manager will materialize the next bounded items.</div></div>'}</div>${(mission.integrations || []).length ? `<div class="section-head"><div class="section-title"><h2>Integration</h2><small>Verified package commits and branch updates</small></div></div><div class="card commit-list">${mission.integrations.map(item => `<div class="commit-row">${badge(item.status)}<div class="commit-main"><strong>${esc(item.source_branch)} → ${esc(item.target_branch)}</strong><small>${esc(item.error || item.commit_sha || 'Pending')}</small></div></div>`).join('')}</div>` : ''}${operations ? `<div class="section-head"><div class="section-title"><h2>Control history</h2><small>Durable mission operation audit</small></div></div><div class="card operation-list">${operations}</div>` : ''}`;
   } catch (error) { toast('Could not load mission', error.message, true); }
 }
 

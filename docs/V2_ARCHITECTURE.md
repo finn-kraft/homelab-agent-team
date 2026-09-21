@@ -67,6 +67,13 @@ The existing job/step human-gate transitions remain authoritative. Shared recurs
 redaction is applied before untrusted model, repository, or operator content reaches
 either record (migration `orchestrator-0014`).
 
+Mission metrics are a read model, not workflow state. Package progress uses the same
+independent completion evidence as roadmap gating. Quality/revision counts come from
+Review, Verification, and Checkpoint attempts; latency comes from mission/package
+timestamps and `phase_metrics`; model/provider/token/cost totals come from
+`llm_invocations`. Cancelled packages are excluded from the delivery denominator,
+while blocked/failed packages remain included and retries remain one package.
+
 `AUTO_INTEGRATE` remains opt-in. The remaining acceptance gate is live: run one
 coordinator against a disposable repository and observe at least three packages,
 including one deliberate Reviewer revision, reach verified checkpoints without

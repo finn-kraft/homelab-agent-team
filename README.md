@@ -341,6 +341,10 @@ initial evidence, subsequent observations, ownership, answer, resolution, and ou
 The Missions screen separates current requests from resolved history; duplicate gates
 append evidence instead of rewriting the original request. Human-provided and
 model-provided lifecycle content is recursively redacted before persistence.
+Mission detail also exposes reproducible metrics derived from durable package,
+review, verification, checkpoint, integration, phase, and model-invocation records.
+The dashboard shows evidence-gated delivery progress, first-pass quality, revision
+cycles, phase/end-to-end latency, provider/token use, and estimated cloud cost.
 The dashboard's `/api/telemetry` path is independent of the workflow stream and polls
 Ollama/GPU data once per second, including loaded and installed model details.
 Roadmap checkboxes are updated only on the mission branch after an approved review,

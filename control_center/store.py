@@ -167,6 +167,9 @@ class ControlStore:
             result["control_operations"] = operation_getter(
                 limit=50, mission_id=int(mission_id)
             )
+        metrics_getter = getattr(self.workflow, "mission_metrics", None)
+        if metrics_getter is not None:
+            result["metrics"] = metrics_getter(int(mission_id))
         return result
 
     def work_packages(self, mission_id=None):

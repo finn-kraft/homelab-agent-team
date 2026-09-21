@@ -783,6 +783,242 @@ class OrchestratorStore:
             )
             return result
 
+    def mission_metrics(self, mission_id: int) -> dict[str, Any]:
+        """Derive mission metrics exclusively from durable workflow evidence.
+
+        Cancelled packages are reported but excluded from delivery denominators.
+        Blocked and failed packages remain in the denominator. Retries never add
+        packages; their Review, Verification, Checkpoint, phase, and model rows
+        are counted as attempts and revision signals.
+        """
+        with self.connect() as connection:
+            mission = connection.execute(
+                """SELECT *,EXTRACT(EPOCH FROM (
+                     CASE WHEN status IN ('complete','cancelled') THEN updated_at ELSE now() END
+                     - created_at)) AS elapsed_seconds
+                   FROM missions WHERE id=%s""",
+                (mission_id,),
+            ).fetchone()
+            if not mission:
+                raise KeyError(mission_id)
+            packages = [dict(row) for row in connection.execute(
+                """SELECT p.*,
+                     (p.status='complete'
+                       AND EXISTS (SELECT 1 FROM reviews r WHERE r.step_id=p.step_id AND r.verdict='approved')
+                       AND EXISTS (SELECT 1 FROM verification_runs v WHERE v.step_id=p.step_id AND v.status='passed')
+                       AND EXISTS (SELECT 1 FROM checkpoint_runs c WHERE c.step_id=p.step_id
+                                   AND c.status='complete' AND c.commit_sha IS NOT NULL)
+                       AND EXISTS (SELECT 1 FROM mission_integrations i WHERE i.package_id=p.id
+                                   AND i.status='complete' AND i.commit_sha IS NOT NULL)
+                     ) AS evidence_complete,
+                     i.completed_at AS integrated_at
+                   FROM work_packages p
+                   LEFT JOIN mission_integrations i ON i.package_id=p.id
+                   WHERE p.mission_id=%s ORDER BY p.id""",
+                (mission_id,),
+            ).fetchall()]
+            step_ids = [int(row["step_id"]) for row in packages if row.get("step_id")]
+            job_ids = [int(row["job_id"]) for row in packages if row.get("job_id")]
+            reviews = [dict(row) for row in connection.execute(
+                """SELECT step_id,review_attempt,verdict,completed_at FROM reviews
+                   WHERE step_id=ANY(%s) ORDER BY step_id,review_attempt,id""",
+                (step_ids,),
+            ).fetchall()] if step_ids else []
+            verifications = [dict(row) for row in connection.execute(
+                """SELECT step_id,attempt,status,completed_at FROM verification_runs
+                   WHERE step_id=ANY(%s) ORDER BY step_id,attempt,id""",
+                (step_ids,),
+            ).fetchall()] if step_ids else []
+            checkpoints = [dict(row) for row in connection.execute(
+                """SELECT step_id,status,completed_at FROM checkpoint_runs
+                   WHERE step_id=ANY(%s) ORDER BY step_id""",
+                (step_ids,),
+            ).fetchall()] if step_ids else []
+            phases = [dict(row) for row in connection.execute(
+                """SELECT phase,status,duration_seconds,prompt_chars,prompt_tokens
+                   FROM phase_metrics WHERE job_id=ANY(%s) ORDER BY id""",
+                (job_ids,),
+            ).fetchall()] if job_ids else []
+            invocations = [dict(row) for row in connection.execute(
+                """SELECT provider,model,latency_seconds,usage,estimated_cloud_cost,fallback
+                   FROM llm_invocations WHERE job_id=ANY(%s) ORDER BY id""",
+                (job_ids,),
+            ).fetchall()] if job_ids else []
+
+        denominator = [package for package in packages if package.get("status") != "cancelled"]
+        evidence_complete = sum(bool(package.get("evidence_complete")) for package in denominator)
+        execution_complete = sum(package.get("status") == "complete" for package in denominator)
+        package_progress = {
+            "total": len(packages),
+            "denominator": len(denominator),
+            "evidence_complete": evidence_complete,
+            "execution_complete": execution_complete,
+            "cancelled": sum(package.get("status") == "cancelled" for package in packages),
+            "blocked_or_failed": sum(
+                package.get("status") in {"blocked", "failed"} for package in denominator
+            ),
+            "active_or_ready": sum(
+                package.get("status") in {"ready", "engineering", "review", "verifying"}
+                for package in denominator
+            ),
+            "percent": round(100 * evidence_complete / len(denominator), 2) if denominator else 0.0,
+            "execution_percent": (
+                round(100 * execution_complete / len(denominator), 2) if denominator else 0.0
+            ),
+        }
+
+        reviews_by_step: dict[int, list[dict[str, Any]]] = {}
+        for review in reviews:
+            reviews_by_step.setdefault(int(review["step_id"]), []).append(review)
+        reviewed = list(reviews_by_step.values())
+        first_pass_approvals = sum(
+            bool(attempts and attempts[0].get("verdict") == "approved") for attempts in reviewed
+        )
+        approved_packages = sum(
+            any(attempt.get("verdict") == "approved" for attempt in attempts)
+            for attempts in reviewed
+        )
+        changes_requested = sum(
+            review.get("verdict") == "changes_requested" for review in reviews
+        )
+
+        verification_by_step: dict[int, list[dict[str, Any]]] = {}
+        for verification in verifications:
+            verification_by_step.setdefault(int(verification["step_id"]), []).append(verification)
+        verified = list(verification_by_step.values())
+        first_pass_verifications = sum(
+            bool(attempts and attempts[0].get("status") == "passed") for attempts in verified
+        )
+        verification_failures = sum(
+            verification.get("status") in {"failed", "blocked"}
+            for verification in verifications
+        )
+        checkpoint_failures = sum(checkpoint.get("status") == "failed" for checkpoint in checkpoints)
+        quality = {
+            "review_attempts": len(reviews),
+            "reviewed_packages": len(reviewed),
+            "approved_packages": approved_packages,
+            "changes_requested": changes_requested,
+            "first_pass_approvals": first_pass_approvals,
+            "first_pass_approval_percent": (
+                round(100 * first_pass_approvals / len(reviewed), 2) if reviewed else 0.0
+            ),
+            "average_attempts_per_reviewed_package": (
+                round(len(reviews) / len(reviewed), 2) if reviewed else 0.0
+            ),
+            "revision_cycles": changes_requested + verification_failures + checkpoint_failures,
+        }
+        verification_metrics = {
+            "runs": len(verifications),
+            "verified_packages": len(verified),
+            "passed": sum(item.get("status") == "passed" for item in verifications),
+            "failed": sum(item.get("status") == "failed" for item in verifications),
+            "blocked": sum(item.get("status") == "blocked" for item in verifications),
+            "first_passes": first_pass_verifications,
+            "first_pass_percent": (
+                round(100 * first_pass_verifications / len(verified), 2) if verified else 0.0
+            ),
+        }
+
+        phase_metrics: dict[str, dict[str, Any]] = {}
+        for phase in phases:
+            name = str(phase.get("phase") or "unknown")
+            aggregate = phase_metrics.setdefault(name, {
+                "runs": 0, "total_seconds": 0.0, "average_seconds": 0.0,
+                "max_seconds": 0.0, "prompt_chars": 0, "prompt_tokens": 0,
+            })
+            duration = float(phase.get("duration_seconds") or 0)
+            aggregate["runs"] += 1
+            aggregate["total_seconds"] += duration
+            aggregate["max_seconds"] = max(aggregate["max_seconds"], duration)
+            aggregate["prompt_chars"] += int(phase.get("prompt_chars") or 0)
+            aggregate["prompt_tokens"] += int(phase.get("prompt_tokens") or 0)
+        for aggregate in phase_metrics.values():
+            aggregate["total_seconds"] = round(aggregate["total_seconds"], 3)
+            aggregate["max_seconds"] = round(aggregate["max_seconds"], 3)
+            aggregate["average_seconds"] = round(
+                aggregate["total_seconds"] / aggregate["runs"], 3
+            )
+
+        provider_metrics: dict[str, dict[str, Any]] = {}
+        input_tokens = output_tokens = 0
+        estimated_cost = 0.0
+        for invocation in invocations:
+            provider = str(invocation.get("provider") or "unknown")
+            aggregate = provider_metrics.setdefault(provider, {
+                "calls": 0, "estimated_cloud_cost": 0.0,
+                "average_latency_seconds": 0.0, "_latency_total": 0.0,
+                "_latency_count": 0,
+            })
+            aggregate["calls"] += 1
+            cost = float(invocation.get("estimated_cloud_cost") or 0)
+            aggregate["estimated_cloud_cost"] += cost
+            estimated_cost += cost
+            if invocation.get("latency_seconds") is not None:
+                aggregate["_latency_total"] += float(invocation["latency_seconds"])
+                aggregate["_latency_count"] += 1
+            usage = invocation.get("usage") or {}
+            if isinstance(usage, str):
+                try:
+                    usage = json.loads(usage)
+                except json.JSONDecodeError:
+                    usage = {}
+            if isinstance(usage, dict):
+                input_tokens += int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
+                output_tokens += int(
+                    usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
+                )
+        for aggregate in provider_metrics.values():
+            count = aggregate.pop("_latency_count")
+            total = aggregate.pop("_latency_total")
+            aggregate["estimated_cloud_cost"] = round(aggregate["estimated_cloud_cost"], 6)
+            aggregate["average_latency_seconds"] = round(total / count, 3) if count else 0.0
+        model_metrics = {
+            "calls": len(invocations),
+            "local_calls": sum(item.get("provider") != "openrouter" for item in invocations),
+            "cloud_calls": sum(item.get("provider") == "openrouter" for item in invocations),
+            "fallback_calls": sum(bool(item.get("fallback")) for item in invocations),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "estimated_cloud_cost": round(estimated_cost, 6),
+            "providers": provider_metrics,
+        }
+
+        delivery_seconds = [
+            max(0.0, (package["integrated_at"] - package["created_at"]).total_seconds())
+            for package in packages if package.get("integrated_at") and package.get("created_at")
+        ]
+        latency = {
+            "elapsed_seconds": round(float(mission["elapsed_seconds"] or 0), 3),
+            "completed_delivery_samples": len(delivery_seconds),
+            "average_package_delivery_seconds": (
+                round(sum(delivery_seconds) / len(delivery_seconds), 3)
+                if delivery_seconds else None
+            ),
+            "max_package_delivery_seconds": (
+                round(max(delivery_seconds), 3) if delivery_seconds else None
+            ),
+            "recorded_phase_seconds": round(
+                sum(float(phase.get("duration_seconds") or 0) for phase in phases), 3
+            ),
+        }
+        return {
+            "mission_id": mission_id,
+            "status": mission["status"],
+            "semantics": {
+                "progress_denominator": "all non-cancelled packages; blocked and failed packages remain included",
+                "completion": "package plus approved review, passed verification, completed checkpoint, and completed integration",
+                "retries": "one package in the denominator; durable attempts contribute to revision and quality metrics",
+                "latency": "active missions use database now; complete/cancelled missions use their final updated_at",
+            },
+            "package_progress": package_progress,
+            "quality": quality,
+            "verification": verification_metrics,
+            "phases": phase_metrics,
+            "models": model_metrics,
+            "latency": latency,
+        }
+
     def update_mission_status(self, mission_id: int, status: str) -> None:
         if status not in {"active", "paused", "blocked", "complete", "cancelled"}:
             raise ValueError("invalid mission status")

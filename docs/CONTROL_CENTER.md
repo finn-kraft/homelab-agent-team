@@ -109,6 +109,30 @@ job/step transition. Cancelling a job or mission resolves its open requests but 
 deletes their history. Migration `orchestrator-0014` backfills lifecycle history for
 older request rows and includes both tables in schema readiness.
 
+## Mission metrics
+
+Mission detail includes a `metrics` object and renders the same evidence as progress,
+quality, Verification, latency, model usage, and cost cards. No mutable metric counters
+are stored. Refresh/restart recomputes from Work Packages, Reviews, Verification runs,
+Checkpoint runs, Integrations, phase telemetry, and model invocations.
+
+Metric semantics are explicit in the API response:
+
+- The delivery denominator is every non-cancelled package. Blocked and failed packages
+  remain included; cancelled packages are reported separately.
+- Evidence completion requires package completion plus approved Review, passed
+  Verification, completed Checkpoint with commit, and completed Integration with commit.
+- A retried package remains one denominator item. Review attempts, requested changes,
+  failed/blocked Verification attempts, and failed Checkpoints contribute to quality and
+  revision signals.
+- First-pass Review and Verification percentages use packages with at least one durable
+  attempt as their denominator.
+- Active mission elapsed time uses PostgreSQL `now()`; complete/cancelled mission elapsed
+  time ends at its durable `updated_at`. Package delivery latency is reported only when
+  Integration has a completion timestamp.
+- Token totals accept the durable provider's input/output or prompt/completion naming.
+  Cloud cost is the sum of persisted `estimated_cloud_cost` values.
+
 The job page combines steps with reviews, verification runs, safe command metadata,
 model routes, and checkpoint records. It shows the same-step `changes_requested` loop as
 a revision, not a failed job. Human answers are accepted only for `needs_human`, appended

@@ -73,6 +73,11 @@ keeping the existing queue row as the current projection. Creation evidence, lat
 observations, ownership, answer, resolution, and outcomes survive restart and are
 available in the Control Center, with recursive redaction at every request writer.
 
+Item 31 derives mission progress, first-pass quality, revision cycles, Verification
+outcomes, phase and delivery latency, model/provider/token use, and estimated cloud
+cost from authoritative PostgreSQL evidence. Its API defines denominators and retry /
+cancel treatment, and the Control Center renders the same reproducible read model.
+
 ## P0 — reliability before unattended operation
 
 1. Fix durable phase truth so status, phase, current step, and the dashboard
@@ -147,7 +152,7 @@ available in the Control Center, with recursive redaction at every request write
     integration evidence.
 29. [x] Add dependency visualization and mission pause/resume/cancel controls.
 30. [x] Expand human-queue history with evidence, ownership, answer, and outcome.
-31. Add mission-level progress, quality, latency, and cost metrics.
+31. [x] Add mission-level progress, quality, latency, and cost metrics.
 
 ## P3 — maintainability and polish
 

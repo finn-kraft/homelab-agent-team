@@ -125,6 +125,8 @@ def test_static_dashboard_contains_primary_operator_workflow():
     assert "mission-action" in script
     assert "Human decision history" in script
     assert "status=all" in script
+    assert "Mission progress" in script
+    assert "Quality and revisions" in script
 
 def test_dashboard_uses_accessible_delegated_controls():
     from importlib.resources import files

@@ -408,6 +408,13 @@ pre { max-height: 300px; overflow: auto; padding: 11px; border: 1px solid var(--
 .human-history-detail ol { margin: 0; padding-left: 20px; }
 .human-history-detail li { display: grid; grid-template-columns: minmax(120px,1fr) 150px 80px; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 10px; }
 .human-history-detail li time { text-align: right; color: var(--faint); }
+.mission-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.metric-breakdown { display: grid; gap: 0; margin-top: 12px; }
+.metric-breakdown h3 { margin: 0 0 8px; font-size: 12px; color: var(--muted); }
+.metric-breakdown > div { display: grid; grid-template-columns: minmax(140px,1fr) 90px minmax(180px,.65fr); gap: 12px; align-items: center; padding: 9px 0; border-top: 1px solid var(--line); }
+.metric-breakdown > div span { font-weight: 650; }
+.metric-breakdown > div b, .metric-breakdown > div small { color: var(--muted); font-size: 10px; }
+.metric-breakdown > div small { text-align: right; }
 .stale-warning { display: flex; align-items: center; gap: 8px; margin: -4px 0 12px; color: var(--amber); font-size: 12px; }
 .stale-warning svg { width: 16px; height: 16px; }
 .telemetry-chart { padding: 14px 18px 10px; }
@@ -521,6 +528,7 @@ textarea { min-height: 122px; resize: vertical; }
   .flow.compact .stage i { display: none; }
   .flow.compact .stage { padding: 6px 9px; font-size: 10px; }
   .grid, .grid.two, .form-grid { grid-template-columns: 1fr; }
+  .mission-metrics { grid-template-columns: 1fr; }
   .metric { min-height: 112px; }
   .section-head { align-items: flex-start; }
   .commit-row { grid-template-columns: 76px minmax(140px,1fr) 76px; }
@@ -539,6 +547,8 @@ textarea { min-height: 122px; resize: vertical; }
   .human-history-row > summary small { grid-column: 2; text-align: left; }
   .human-history-detail li { grid-template-columns: 1fr; }
   .human-history-detail li time { text-align: left; }
+  .metric-breakdown > div { grid-template-columns: 1fr; gap: 3px; }
+  .metric-breakdown > div small { text-align: left; }
   .job-actions { justify-content: flex-start; margin-top: 14px; }
   dialog form { padding: 19px; }
 }
