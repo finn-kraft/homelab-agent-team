@@ -3,7 +3,7 @@ const state = {
   jobId: null, streamGeneration: 0, eventFilter: '', eventSearch: {}, humanDraft: '',
   telemetry: null, telemetryTimer: null, telemetryInFlight: false,
   telemetryHistory: [], telemetryHistoryTimer: null, telemetryHistoryInFlight: false,
-  lastEventId: 0,
+  lastEventId: 0, humanHistory: [], humanHistoryInFlight: false,
 };
 
 const $ = selector => document.querySelector(selector);
@@ -141,6 +141,7 @@ function showView(name) {
   render();
   if (name === 'projects') refreshProjects();
   if (name === 'events') loadEvents();
+  if (name === 'missions') loadHumanHistory();
 }
 
 async function connect() {
@@ -182,6 +183,7 @@ async function disconnect() {
   state.telemetryHistory = [];
   state.projects = [];
   state.events = [];
+  state.humanHistory = [];
   state.lastEventId = 0;
   if (state.telemetryTimer) clearInterval(state.telemetryTimer);
   if (state.telemetryHistoryTimer) clearInterval(state.telemetryHistoryTimer);
@@ -433,9 +435,29 @@ function humanQueuePanel(items) {
   return `<div class="card attention"><div class="attention-head">${icon('alert')}<h3>Human queue</h3></div>${items.map(item => `<button class="attention-row" data-action="open-job" data-job-id="${Number(item.job_id || 0)}"><span>${badge(item.kind)}</span><strong>${esc(item.question)}</strong><small>${item.job_id ? `Job #${Number(item.job_id)}` : 'Mission decision'} · ${age(item.created_at)}</small><b>Review →</b></button>`).join('')}</div>`;
 }
 
+async function loadHumanHistory() {
+  if (state.humanHistoryInFlight) return;
+  state.humanHistoryInFlight = true;
+  try {
+    state.humanHistory = await api('/api/human-queue?status=all&limit=100');
+    if (state.view === 'missions') renderMissions();
+  } catch (error) { toast('Could not load human history', error.message, true); }
+  finally { state.humanHistoryInFlight = false; }
+}
+
+function humanDecisionHistory(items) {
+  const current = (items || []).filter(item => item.status === 'open');
+  const resolved = (items || []).filter(item => item.status !== 'open');
+  const rows = group => group.map(item => {
+    const events = (item.history || []).map(event => `<li><b>${esc(event.event_type.replaceAll('_', ' '))}</b><span>${esc(event.actor || 'workflow')}</span><time>${esc(age(event.created_at))}</time></li>`).join('');
+    return `<details class="human-history-row"><summary>${badge(item.status)}<strong>${esc(item.question)}</strong><small>${esc(item.owner || 'Unassigned')} · ${esc(item.resolution || 'Awaiting decision')}</small></summary><div class="human-history-detail"><p>${item.answer ? `<b>Answer:</b> ${esc(item.answer)}` : 'No answer recorded.'}</p>${item.outcome?.type ? `<p><b>Outcome:</b> ${esc(item.outcome.type)}</p>` : ''}<ol>${events}</ol></div></details>`;
+  }).join('');
+  return `<div class="section-head"><div class="section-title"><h2>Human decision history</h2><small>Append-only evidence, ownership, answers, resolution, and outcomes</small></div><span>${current.length} open · ${resolved.length} resolved</span></div><div class="card human-history"><h3>Current requests</h3>${rows(current) || '<p class="muted">No decisions are waiting.</p>'}<h3>Resolved history</h3>${rows(resolved) || '<p class="muted">No resolved decisions yet.</p>'}</div>`;
+}
+
 function renderMissions() {
   const missions = state.overview.missions || [];
-  $('#missionsView').innerHTML = `<div class="section-head"><div class="section-title"><h2>Mission control</h2><small>Roadmap work is materialized into bounded packages before engineering starts.</small></div><span>${missions.length} mission${missions.length === 1 ? '' : 's'}</span></div>${missions.length ? `<div class="project-list">${missions.map(mission => `<article class="card project-card"><div class="section-head tight"><div><span class="kicker">MISSION #${Number(mission.id)}</span><h3>${esc(mission.goal)}</h3></div>${badge(mission.status)}</div><p class="path">${esc(mission.repository)} · ${esc(mission.branch)}</p><div class="project-meta"><div><span>Packages</span><b>${Number(mission.completed_packages || 0)} / ${Number(mission.package_count || 0)} complete</b></div><div><span>Roadmap pending</span><b>${Number(mission.roadmap_pending_packages || 0)}</b></div><div><span>Blocked</span><b>${Number(mission.blocked_packages || 0)}</b></div><div><span>Human queue</span><b>${Number(mission.open_human_requests || 0)}</b></div><div><span>Updated</span><b>${esc(age(mission.updated_at))}</b></div></div><button class="primary" data-action="open-mission" data-mission-id="${Number(mission.id)}">Open mission →</button></article>`).join('')}</div>` : '<div class="card empty"><div><strong>No V2 missions yet</strong>Create one with the orchestrator mission command, then let the roadmap manager populate packages.</div></div>'}`;
+  $('#missionsView').innerHTML = `<div class="section-head"><div class="section-title"><h2>Mission control</h2><small>Roadmap work is materialized into bounded packages before engineering starts.</small></div><span>${missions.length} mission${missions.length === 1 ? '' : 's'}</span></div>${missions.length ? `<div class="project-list">${missions.map(mission => `<article class="card project-card"><div class="section-head tight"><div><span class="kicker">MISSION #${Number(mission.id)}</span><h3>${esc(mission.goal)}</h3></div>${badge(mission.status)}</div><p class="path">${esc(mission.repository)} · ${esc(mission.branch)}</p><div class="project-meta"><div><span>Packages</span><b>${Number(mission.completed_packages || 0)} / ${Number(mission.package_count || 0)} complete</b></div><div><span>Roadmap pending</span><b>${Number(mission.roadmap_pending_packages || 0)}</b></div><div><span>Blocked</span><b>${Number(mission.blocked_packages || 0)}</b></div><div><span>Human queue</span><b>${Number(mission.open_human_requests || 0)}</b></div><div><span>Updated</span><b>${esc(age(mission.updated_at))}</b></div></div><button class="primary" data-action="open-mission" data-mission-id="${Number(mission.id)}">Open mission →</button></article>`).join('')}</div>` : '<div class="card empty"><div><strong>No V2 missions yet</strong>Create one with the orchestrator mission command, then let the roadmap manager populate packages.</div></div>'}${humanDecisionHistory(state.humanHistory)}`;
 }
 
 function missionControls(mission) {

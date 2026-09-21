@@ -123,6 +123,8 @@ def test_static_dashboard_contains_primary_operator_workflow():
     assert "engineering-agent-v3-controls" in html
     assert "dependency-graph" in script
     assert "mission-action" in script
+    assert "Human decision history" in script
+    assert "status=all" in script
 
 def test_dashboard_uses_accessible_delegated_controls():
     from importlib.resources import files

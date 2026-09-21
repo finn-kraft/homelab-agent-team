@@ -372,8 +372,10 @@ class ControlCenter:
                         mission_id = parse_qs(parsed.query).get("mission_id", [None])[0]
                         return self.send_json(200, app.store.work_packages(mission_id))
                     if parsed.path == "/api/human-queue":
-                        status = parse_qs(parsed.query).get("status", ["open"])[0]
-                        return self.send_json(200, app.store.human_queue(status))
+                        query = parse_qs(parsed.query)
+                        status = query.get("status", ["open"])[0]
+                        limit = int(query.get("limit", [100])[0])
+                        return self.send_json(200, app.store.human_queue(status, limit))
                     if parsed.path == "/api/operations":
                         job_id = parse_qs(parsed.query).get("job_id", [None])[0]
                         return self.send_json(200, app.store.operations(int(job_id) if job_id else None))

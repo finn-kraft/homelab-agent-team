@@ -65,7 +65,10 @@ def _parser() -> argparse.ArgumentParser:
     claim.add_argument("--worker-id", default="engineering-1"); claim.add_argument("--lease-seconds", type=int, default=900)
     subcommands.add_parser("recover-packages", help="return expired V2 package leases to ready")
     queue = subcommands.add_parser("human-queue", help="list durable human decisions")
-    queue.add_argument("--status", default="open", choices=("open", "answered", "cancelled", "all"))
+    queue.add_argument(
+        "--status", default="open",
+        choices=("open", "answered", "cancelled", "resolved", "all"),
+    )
     answer = subcommands.add_parser("answer-human", help="answer a durable human decision")
     answer.add_argument("request_id", type=int); answer.add_argument("answer")
     integrate = subcommands.add_parser("integrate-package", help="merge a verified package into its mission branch")
@@ -166,7 +169,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(store.list_human_queue(args.status), default=str, indent=2))
             return 0
         if args.command == "answer-human":
-            store.answer_human_request(args.request_id, args.answer)
+            store.answer_human_request(
+                args.request_id, args.answer, answered_by="orchestrator-cli"
+            )
             print(json.dumps({"status": "answered", "request_id": args.request_id}))
             return 0
         if args.command == "integrate-package":

@@ -9,23 +9,16 @@ transactional, and accompanied by an append-only event.
 
 import json
 import os
-import re
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
 from engineering_agent.models import Status, Task
+from agent_core.redaction import redact_payload, redact_text
 
 
-MIGRATION_VERSION = "orchestrator-0013"
-
-_REDACTION_PATTERNS = (
-    re.compile(r"(?i)(?:api[_-]?key|token|password|secret)\s*[=:]\s*[^\s,}]+"),
-    re.compile(r"\bpostgres(?:ql)?(?:\+[A-Za-z0-9_-]+)?://[^\s]+"),
-    re.compile(r"\bsk-(?:or-v1-)?[A-Za-z0-9_-]{16,}\b"),
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
-)
+MIGRATION_VERSION = "orchestrator-0014"
 
 # Keep this list deliberately small and authoritative. Health checks should
 # answer whether the workflow can safely run, not whether every optional
@@ -60,6 +53,10 @@ REQUIRED_TABLE_COLUMNS = {
         "operation_id", "job_id", "mission_id", "action", "status", "created_at", "updated_at",
     },
     "control_operation_events": {"operation_id", "status", "created_at"},
+    "human_queue": {
+        "id", "status", "context", "owner", "answer", "resolution", "outcome", "resolved_at",
+    },
+    "human_queue_events": {"request_id", "event_type", "evidence", "created_at"},
     "telemetry_samples": {"id", "sampled_at", "gpu", "ollama", "routing_agent", "inference"},
 }
 
@@ -327,6 +324,85 @@ CREATE TABLE IF NOT EXISTS human_queue (
 CREATE INDEX IF NOT EXISTS human_queue_status_idx ON human_queue(status, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS human_queue_open_request_idx
   ON human_queue(job_id, step_id, kind) WHERE status='open';
+
+ALTER TABLE human_queue ADD COLUMN IF NOT EXISTS owner TEXT;
+ALTER TABLE human_queue ADD COLUMN IF NOT EXISTS owned_at TIMESTAMPTZ;
+ALTER TABLE human_queue ADD COLUMN IF NOT EXISTS resolution TEXT;
+ALTER TABLE human_queue ADD COLUMN IF NOT EXISTS outcome JSONB NOT NULL DEFAULT '{}';
+ALTER TABLE human_queue ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+UPDATE human_queue SET owner=COALESCE(owner,answered_by),
+  owned_at=COALESCE(owned_at,answered_at),
+  resolution=COALESCE(resolution,status),
+  resolved_at=COALESCE(resolved_at,answered_at,updated_at)
+  WHERE status <> 'open';
+
+CREATE TABLE IF NOT EXISTS human_queue_events (
+  id BIGSERIAL PRIMARY KEY,
+  request_id BIGINT NOT NULL REFERENCES human_queue(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  actor TEXT,
+  evidence JSONB NOT NULL DEFAULT '{}',
+  source_key TEXT UNIQUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (event_type IN ('created','evidence_observed','owned','answered','resolved','outcome_recorded'))
+);
+CREATE INDEX IF NOT EXISTS human_queue_events_request_idx
+  ON human_queue_events(request_id,id);
+
+INSERT INTO human_queue_events(request_id,event_type,actor,evidence,source_key,created_at)
+SELECT id,'created',NULL,jsonb_build_object(
+  'kind',kind,'legacy_backfill',true,'mission_id',mission_id,
+  'job_id',job_id,'step_id',step_id
+),concat('legacy-created-',id),created_at FROM human_queue
+ON CONFLICT(source_key) DO NOTHING;
+INSERT INTO human_queue_events(request_id,event_type,actor,evidence,source_key,created_at)
+SELECT id,'resolved',answered_by,jsonb_build_object(
+  'status',status,'resolution',COALESCE(resolution,status),'legacy_backfill',true
+),concat('legacy-resolved-',id),COALESCE(resolved_at,updated_at) FROM human_queue
+WHERE status <> 'open'
+ON CONFLICT(source_key) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION capture_human_queue_history() RETURNS trigger AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    INSERT INTO human_queue_events(request_id,event_type,evidence)
+    VALUES(NEW.id,'created',jsonb_build_object(
+      'kind',NEW.kind,'question',NEW.question,'context',NEW.context,
+      'mission_id',NEW.mission_id,'job_id',NEW.job_id,'step_id',NEW.step_id
+    ));
+    RETURN NEW;
+  END IF;
+  IF NEW.question IS DISTINCT FROM OLD.question OR NEW.context IS DISTINCT FROM OLD.context THEN
+    INSERT INTO human_queue_events(request_id,event_type,actor,evidence)
+    VALUES(NEW.id,'evidence_observed',NEW.owner,jsonb_build_object(
+      'question',NEW.question,'context',NEW.context
+    ));
+  END IF;
+  IF NEW.owner IS DISTINCT FROM OLD.owner AND NEW.owner IS NOT NULL THEN
+    INSERT INTO human_queue_events(request_id,event_type,actor,evidence)
+    VALUES(NEW.id,'owned',NEW.owner,jsonb_build_object('owner',NEW.owner));
+  END IF;
+  IF NEW.answer IS DISTINCT FROM OLD.answer AND NEW.answer IS NOT NULL THEN
+    INSERT INTO human_queue_events(request_id,event_type,actor,evidence)
+    VALUES(NEW.id,'answered',NEW.answered_by,jsonb_build_object('answer',NEW.answer));
+  END IF;
+  IF NEW.status IS DISTINCT FROM OLD.status AND NEW.status <> 'open' THEN
+    INSERT INTO human_queue_events(request_id,event_type,actor,evidence)
+    VALUES(NEW.id,'resolved',COALESCE(NEW.answered_by,NEW.owner),jsonb_build_object(
+      'status',NEW.status,'resolution',COALESCE(NEW.resolution,NEW.status)
+    ));
+  END IF;
+  IF NEW.outcome IS DISTINCT FROM OLD.outcome AND NEW.outcome <> '{}'::jsonb THEN
+    INSERT INTO human_queue_events(request_id,event_type,actor,evidence)
+    VALUES(NEW.id,'outcome_recorded',COALESCE(NEW.answered_by,NEW.owner),NEW.outcome);
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS human_queue_history_trigger ON human_queue;
+CREATE TRIGGER human_queue_history_trigger
+AFTER INSERT OR UPDATE ON human_queue
+FOR EACH ROW EXECUTE FUNCTION capture_human_queue_history();
 
 CREATE TABLE IF NOT EXISTS mission_integrations (
   id BIGSERIAL PRIMARY KEY,
@@ -702,7 +778,9 @@ class OrchestratorStore:
             result = dict(mission)
             result["packages"] = self.package_dependency_view(dict(row) for row in packages)
             result["integrations"] = [dict(row) for row in integrations]
-            result["human_queue"] = [dict(row) for row in requests]
+            result["human_queue"] = self._attach_human_history(
+                connection, [dict(row) for row in requests]
+            )
             return result
 
     def update_mission_status(self, mission_id: int, status: str) -> None:
@@ -722,36 +800,117 @@ class OrchestratorStore:
         question = str(question).strip()
         if not question or len(question) > 12000:
             raise ValueError("question must be 1-12000 characters")
+        safe_question = redact_text(question, limit=12000)
+        safe_context = redact_payload(context or {})
         with self.connect() as connection:
+            # Serialize requests at their durable owner. The legacy partial
+            # unique index cannot deduplicate NULL step ids on its own.
+            if job_id is not None:
+                connection.execute("SELECT id FROM jobs WHERE id=%s FOR UPDATE", (job_id,))
+            elif mission_id is not None:
+                connection.execute("SELECT id FROM missions WHERE id=%s FOR UPDATE", (mission_id,))
+            existing = connection.execute(
+                """SELECT id FROM human_queue WHERE job_id IS NOT DISTINCT FROM %s
+                   AND step_id IS NOT DISTINCT FROM %s AND kind=%s AND status='open'
+                   ORDER BY id LIMIT 1 FOR UPDATE""",
+                (job_id, step_id, kind),
+            ).fetchone()
+            if existing:
+                connection.execute(
+                    """INSERT INTO human_queue_events(request_id,event_type,actor,evidence)
+                       VALUES(%s,'evidence_observed','workflow',%s::jsonb)""",
+                    (existing["id"], json.dumps({
+                        "question": safe_question, "context": safe_context,
+                    }, default=str)),
+                )
+                return int(existing["id"])
             row = connection.execute("""
                 INSERT INTO human_queue(mission_id,job_id,step_id,kind,question,context)
                 VALUES(%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (job_id,step_id,kind) WHERE status='open' DO UPDATE SET
-                  question=EXCLUDED.question, context=EXCLUDED.context, updated_at=now()
                 RETURNING id
-            """, (mission_id, job_id, step_id, kind, question,
-                   json.dumps(context or {}, default=str))).fetchone()
+            """, (mission_id, job_id, step_id, kind, safe_question,
+                   json.dumps(safe_context, default=str))).fetchone()
             return int(row["id"])
 
-    def list_human_queue(self, status: str = "open") -> list[dict[str, Any]]:
-        if status not in {"open", "answered", "cancelled", "all"}:
+    @staticmethod
+    def _attach_human_history(connection, requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not requests:
+            return []
+        by_id = {int(request["id"]): request for request in requests}
+        for request in requests:
+            request["history"] = []
+            request["lifecycle_state"] = (
+                "current" if request.get("status") == "open" else "resolved"
+            )
+        events = connection.execute(
+            """SELECT id,request_id,event_type,actor,evidence,created_at
+               FROM human_queue_events WHERE request_id=ANY(%s)
+               ORDER BY request_id,id""",
+            (list(by_id),),
+        ).fetchall()
+        for event in events:
+            request = by_id.get(int(event["request_id"]))
+            if request is not None:
+                request["history"].append(dict(event))
+        return requests
+
+    def list_human_queue(self, status: str = "open", limit: int = 100) -> list[dict[str, Any]]:
+        if status not in {"open", "answered", "cancelled", "resolved", "all"}:
             raise ValueError("invalid human queue status")
+        limit = max(1, min(1000, int(limit)))
         with self.connect() as connection:
             if status == "all":
                 rows = connection.execute(
-                    "SELECT * FROM human_queue ORDER BY created_at DESC"
+                    "SELECT * FROM human_queue ORDER BY created_at DESC LIMIT %s", (limit,)
+                ).fetchall()
+            elif status == "resolved":
+                rows = connection.execute(
+                    """SELECT * FROM human_queue WHERE status <> 'open'
+                       ORDER BY COALESCE(resolved_at,updated_at) DESC LIMIT %s""", (limit,)
                 ).fetchall()
             else:
                 rows = connection.execute(
-                    "SELECT * FROM human_queue WHERE status=%s ORDER BY created_at DESC", (status,)
+                    """SELECT * FROM human_queue WHERE status=%s
+                       ORDER BY created_at DESC LIMIT %s""", (status, limit)
                 ).fetchall()
-            return [dict(row) for row in rows]
+            return self._attach_human_history(connection, [dict(row) for row in rows])
+
+    def human_request(self, request_id: int) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM human_queue WHERE id=%s", (request_id,)
+            ).fetchone()
+            if not row:
+                return None
+            return self._attach_human_history(connection, [dict(row)])[0]
+
+    def claim_human_request(self, request_id: int, owner: str) -> None:
+        owner = redact_text(str(owner).strip(), limit=200)
+        if not owner:
+            raise ValueError("owner is required")
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT id,status,owner FROM human_queue WHERE id=%s FOR UPDATE", (request_id,)
+            ).fetchone()
+            if not row:
+                raise KeyError(request_id)
+            if row["status"] != "open":
+                raise ValueError("human request is already resolved")
+            if row.get("owner") not in {None, owner}:
+                raise ValueError(f"human request is already owned by {row['owner']}")
+            if row.get("owner") is None:
+                connection.execute(
+                    """UPDATE human_queue SET owner=%s,owned_at=now(),updated_at=now()
+                       WHERE id=%s""", (owner, request_id)
+                )
 
     def answer_human_request(self, request_id: int, answer: str,
                              answered_by: str = "control-center") -> None:
         answer = str(answer).strip()
         if not answer or len(answer) > 12000:
             raise ValueError("answer must be 1-12000 characters")
+        safe_answer = redact_text(answer, limit=12000)
+        safe_actor = redact_text(answered_by, limit=200)
         with self.connect() as connection:
             row = connection.execute(
                 "SELECT * FROM human_queue WHERE id=%s FOR UPDATE", (request_id,)
@@ -760,22 +919,55 @@ class OrchestratorStore:
                 raise KeyError(request_id)
             if row["status"] != "open":
                 raise ValueError("human request is already resolved")
+            if row.get("owner") not in {None, safe_actor}:
+                raise ValueError(f"human request is owned by {row['owner']}")
+            outcome = redact_payload({
+                "type": "workflow_resumed",
+                "detail": {
+                    "step_id": row.get("step_id"),
+                    "next_state": "changes_requested" if row.get("step_id") else "planning",
+                },
+            })
             connection.execute("""
                 UPDATE human_queue SET status='answered',answer=%s,answered_by=%s,
-                  answered_at=now(),updated_at=now() WHERE id=%s
-            """, (answer, answered_by, request_id))
+                  owner=COALESCE(owner,%s),owned_at=COALESCE(owned_at,now()),
+                  answered_at=now(),resolution='answered',outcome=%s::jsonb,
+                  resolved_at=now(),updated_at=now()
+                WHERE id=%s
+            """, (safe_answer, safe_actor, safe_actor,
+                   json.dumps(outcome, default=str), request_id))
             if row.get("job_id"):
                 connection.execute("""
                     UPDATE jobs SET status='running', human_notes=concat_ws(E'\\n', human_notes, %s::text),
                       planner_worker_id=NULL, planner_lease_expires_at=NULL, updated_at=now()
                     WHERE id=%s AND status='needs_human'
-                """, (answer, row["job_id"]))
+                """, (safe_answer, row["job_id"]))
                 connection.execute("""
                     UPDATE steps SET status='changes_requested', blocker=NULL, updated_at=now()
                     WHERE id=%s AND status='needs_human'
                 """, (row.get("step_id"),))
                 self._event(connection, row["job_id"], row.get("step_id"),
-                            "human_response_received", {"answer": answer}, agent=answered_by)
+                            "human_response_received", {"answer": safe_answer}, agent=safe_actor)
+
+    def record_human_request_outcome(self, request_id: int, outcome_type: str,
+                                     detail: dict[str, Any] | None = None) -> None:
+        outcome_type = redact_text(str(outcome_type).strip(), limit=200)
+        if not outcome_type:
+            raise ValueError("outcome type is required")
+        outcome = redact_payload({"type": outcome_type, "detail": detail or {}})
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT id,status FROM human_queue WHERE id=%s FOR UPDATE", (request_id,)
+            ).fetchone()
+            if not row:
+                raise KeyError(request_id)
+            if row["status"] == "open":
+                raise ValueError("cannot record an outcome before the request is resolved")
+            connection.execute(
+                """UPDATE human_queue SET outcome=%s::jsonb,
+                   resolved_at=COALESCE(resolved_at,now()),updated_at=now() WHERE id=%s""",
+                (json.dumps(outcome, default=str), request_id),
+            )
 
     def upsert_integration(self, *, mission_id: int, package_id: int,
                            source_branch: str, target_branch: str,
@@ -2049,10 +2241,7 @@ class OrchestratorStore:
 
     @staticmethod
     def _redact_sensitive(value: str) -> str:
-        redacted = str(value)
-        for pattern in _REDACTION_PATTERNS:
-            redacted = pattern.sub("[REDACTED]", redacted)
-        return redacted
+        return redact_text(value)
 
     def control_operation(self, operation_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:
@@ -2266,7 +2455,8 @@ class OrchestratorStore:
                     (mission_id,),
                 )
                 connection.execute(
-                    """UPDATE human_queue SET status='cancelled',updated_at=now()
+                    """UPDATE human_queue SET status='cancelled',resolution='cancelled',
+                       resolved_at=now(),updated_at=now()
                        WHERE mission_id=%s AND status='open'""",
                     (mission_id,),
                 )
@@ -2394,7 +2584,8 @@ class OrchestratorStore:
                     (job_id,),
                 )
                 connection.execute(
-                    """UPDATE human_queue SET status='cancelled',updated_at=now()
+                    """UPDATE human_queue SET status='cancelled',resolution='cancelled',
+                       resolved_at=now(),updated_at=now()
                        WHERE job_id=%s AND status='open'""",
                     (job_id,),
                 )
@@ -2445,7 +2636,8 @@ class OrchestratorStore:
                 (job_id,),
             )
             connection.execute(
-                """UPDATE human_queue SET status='cancelled',updated_at=now()
+                """UPDATE human_queue SET status='cancelled',resolution='cancelled',
+                   resolved_at=now(),updated_at=now()
                    WHERE job_id=%s AND status='open'""",
                 (job_id,),
             )

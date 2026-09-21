@@ -60,6 +60,13 @@ phase leases and repository locks remain authoritative until their safe boundary
 expiry. `control_operation_events` is the append-only audit of every operation lifecycle
 (migration `orchestrator-0013`).
 
+Human Queue history is split into a current projection (`human_queue`) and an
+append-only lifecycle (`human_queue_events`). Creation evidence is immutable;
+subsequent observations, ownership, answers, resolution, and outcomes are appended.
+The existing job/step human-gate transitions remain authoritative. Shared recursive
+redaction is applied before untrusted model, repository, or operator content reaches
+either record (migration `orchestrator-0014`).
+
 `AUTO_INTEGRATE` remains opt-in. The remaining acceptance gate is live: run one
 coordinator against a disposable repository and observe at least three packages,
 including one deliberate Reviewer revision, reach verified checkpoints without

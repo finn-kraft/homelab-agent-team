@@ -3,6 +3,8 @@ import json
 import uuid
 from contextlib import contextmanager
 
+from agent_core.redaction import redact_payload, redact_text
+
 
 class ReviewerStore:
     def __init__(self, database_url): self.database_url=database_url
@@ -115,13 +117,32 @@ class ReviewerStore:
             (step_status,json.dumps({'verdict':verdict,'issues':decision.blocking_issues}),item['id']))
             if verdict=='needs_human':
                 c.execute("UPDATE jobs SET status='needs_human',updated_at=now() WHERE id=%s",(item['job_id'],))
-                c.execute("""INSERT INTO human_queue(mission_id,job_id,step_id,kind,question,context)
-                    SELECT p.mission_id,%s,%s,'review',%s,%s
-                    FROM work_packages p WHERE p.step_id=%s
-                    ON CONFLICT (job_id,step_id,kind) WHERE status='open' DO UPDATE SET
-                      question=EXCLUDED.question,context=EXCLUDED.context,updated_at=now()""",
-                    (item['job_id'], item['id'], getattr(decision, 'human_question', None) or decision.summary,
-                     json.dumps({'summary': decision.summary, 'verdict': verdict}), item['id']))
+                question = redact_text(
+                    getattr(decision, 'human_question', None) or decision.summary,
+                    limit=12_000,
+                )
+                context = redact_payload({'summary': decision.summary, 'verdict': verdict})
+                existing = c.execute(
+                    """SELECT id FROM human_queue WHERE job_id=%s AND step_id=%s
+                       AND kind='review' AND status='open' ORDER BY id LIMIT 1""",
+                    (item['job_id'], item['id']),
+                ).fetchone()
+                if existing:
+                    c.execute(
+                        """INSERT INTO human_queue_events
+                           (request_id,event_type,actor,evidence)
+                           VALUES(%s,'evidence_observed','reviewer-agent',%s::jsonb)""",
+                        (existing['id'], json.dumps({
+                            'question': question, 'context': context,
+                        }, default=str)),
+                    )
+                else:
+                    c.execute("""INSERT INTO human_queue
+                        (mission_id,job_id,step_id,kind,question,context)
+                        SELECT p.mission_id,%s,%s,'review',%s,%s
+                        FROM work_packages p WHERE p.step_id=%s""",
+                        (item['job_id'], item['id'], question,
+                         json.dumps(context, default=str), item['id']))
             self._event(c,item['job_id'],item['id'],'review_approved' if verdict=='approved' else verdict,
                         {'review_id':item['review_id'],'verdict':verdict,'next':decision.recommended_next_state})
 

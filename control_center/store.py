@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
+from agent_core.redaction import redact_text
 from orchestrator.store import OrchestratorStore
 from orchestrator.verification import SecretScanner
 from planner_agent.store import PlannerStore
@@ -171,8 +172,8 @@ class ControlStore:
     def work_packages(self, mission_id=None):
         return self.workflow.list_work_packages(int(mission_id) if mission_id is not None else None)
 
-    def human_queue(self, status="open"):
-        return self.workflow.list_human_queue(status)
+    def human_queue(self, status="open", limit=100):
+        return self.workflow.list_human_queue(status, limit)
 
     def answer_human_request(self, request_id, answer):
         self.workflow.answer_human_request(int(request_id), answer)
@@ -374,6 +375,17 @@ class ControlStore:
             raise ValueError("answer must be 1-12000 characters")
 
         with self.workflow.connect() as connection:
+            request = connection.execute(
+                """SELECT id FROM human_queue WHERE job_id=%s AND status='open'
+                   ORDER BY created_at DESC,id DESC LIMIT 1""", (job_id,)
+            ).fetchone()
+        if request:
+            self.workflow.answer_human_request(
+                int(request["id"]), answer, answered_by="control-center"
+            )
+            return
+
+        with self.workflow.connect() as connection:
             job = connection.execute(
                 "SELECT * FROM jobs WHERE id=%s FOR UPDATE",
                 (job_id,),
@@ -393,7 +405,7 @@ class ControlStore:
                        planner_lease_expires_at=NULL,
                        updated_at=now()
                    WHERE id=%s""",
-                (answer, job_id),
+                (redact_text(answer, limit=12_000), job_id),
             )
 
             connection.execute(
@@ -411,11 +423,6 @@ class ControlStore:
                 job_id,
                 job.get("current_step"),
                 "human_response_received",
-                {"answer": answer},
+                {"answer": redact_text(answer, limit=12_000)},
                 agent="control-center",
-            )
-            connection.execute(
-                """UPDATE human_queue SET status='answered',answer=%s,answered_by='control-center',
-                   answered_at=now(),updated_at=now() WHERE job_id=%s AND status='open'""",
-                (answer, job_id),
             )

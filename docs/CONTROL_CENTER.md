@@ -93,6 +93,22 @@ records, events, or repository changes. A live phase retains its lease until it 
 returns; after release or expiry, the coordinator finalizes its Step as cancelled.
 Repository locks are never force-deleted while live.
 
+## Human decision history
+
+`GET /api/human-queue?status=open` returns current requests. Use `status=resolved`
+for answered/cancelled history or `status=all` for the combined view; `limit` is bounded
+server-side. The Missions screen presents current and resolved requests separately and
+expands each request into its append-only lifecycle.
+
+`human_queue` is the current projection and retains its original question/context.
+`human_queue_events` records creation, later evidence, ownership, answer, resolution,
+and every outcome. A repeated Planner, Reviewer, or Integration gate appends
+`evidence_observed` rather than replacing the original evidence. Answering atomically
+records the owner, redacted answer, resolution, workflow-resume outcome, and existing
+job/step transition. Cancelling a job or mission resolves its open requests but never
+deletes their history. Migration `orchestrator-0014` backfills lifecycle history for
+older request rows and includes both tables in schema readiness.
+
 The job page combines steps with reviews, verification runs, safe command metadata,
 model routes, and checkpoint records. It shows the same-step `changes_requested` loop as
 a revision, not a failed job. Human answers are accepted only for `needs_human`, appended

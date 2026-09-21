@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_core.models import Job, JobStatus, PlannerDecision, Step, StepStatus
+from agent_core.redaction import redact_payload, redact_text
 from .decision import normalize_objective
 from orchestrator.state import canonical_agent
 
@@ -186,12 +187,30 @@ class PlannerStore:
             )
             self._event(connection, job.id, None, f"job_{decision.decision}", decision.as_dict())
             if decision.decision == "needs_human":
-                connection.execute("""INSERT INTO human_queue(job_id,kind,question,context)
-                    VALUES(%s,'planning',%s,%s)
-                    ON CONFLICT (job_id,step_id,kind) WHERE status='open' DO UPDATE SET
-                      question=EXCLUDED.question,context=EXCLUDED.context,updated_at=now()""",
-                    (job.id, decision.human_question or decision.reasoning_summary,
-                     json.dumps(decision.as_dict(), default=str)))
+                question = redact_text(
+                    decision.human_question or decision.reasoning_summary, limit=12_000
+                )
+                context = redact_payload(decision.as_dict())
+                existing = connection.execute(
+                    """SELECT id FROM human_queue WHERE job_id=%s AND step_id IS NULL
+                       AND kind='planning' AND status='open' ORDER BY id LIMIT 1""",
+                    (job.id,),
+                ).fetchone()
+                if existing:
+                    connection.execute(
+                        """INSERT INTO human_queue_events
+                           (request_id,event_type,actor,evidence)
+                           VALUES(%s,'evidence_observed','planner-agent',%s::jsonb)""",
+                        (existing["id"], json.dumps({
+                            "question": question, "context": context,
+                        }, default=str)),
+                    )
+                else:
+                    connection.execute(
+                        """INSERT INTO human_queue(job_id,kind,question,context)
+                           VALUES(%s,'planning',%s,%s)""",
+                        (job.id, question, json.dumps(context, default=str)),
+                    )
             return None
 
     def defer(self, job_id: int, worker_id: str, failure_kind: str, detail: str,
