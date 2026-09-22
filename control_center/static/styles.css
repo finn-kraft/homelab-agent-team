@@ -300,6 +300,7 @@ tbody tr:last-child td { border-bottom: 0; }
 tr.clickable { transition: background .15s ease; }
 tr.clickable:hover { cursor: pointer; background: rgba(103,152,255,.045); }
 .job-goal { max-width: 330px; font-weight: 650; }
+.job-phase { color: #c9d9f5; font-weight: 720; white-space: nowrap; }
 .path { max-width: 240px; color: var(--muted); font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
 .code { color: #a7c5ff; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .progress { width: 105px; }

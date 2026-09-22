@@ -60,7 +60,10 @@ class ControlCenter:
                 record(sample)
             except Exception:
                 LOGGER.debug("telemetry_persist_failed", exc_info=True)
-        return telemetry
+        # The one-second telemetry endpoint is also the fresh inference-cost
+        # path. Returning the same persisted sample keeps dashboard totals in
+        # sync even while the lower-frequency SSE overview is reconnecting.
+        return sample
 
     @staticmethod
     def _telemetry_alerts(telemetry, overview):
