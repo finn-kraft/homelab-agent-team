@@ -2,6 +2,7 @@ import argparse
 import getpass
 import os
 import sys
+from agent_core.structured_logging import configure_logging
 from .app import ControlCenter
 from .auth import AuthManager
 from .store import ControlStore
@@ -17,6 +18,7 @@ def main(argv=None):
     parser.add_argument("--password-stdin", action="store_true",
                         help="read the new password from stdin for set-password")
     args = parser.parse_args(argv)
+    configure_logging("agent-control-center")
     database_url = os.getenv("DATABASE_URL")
     if not database_url: raise SystemExit("DATABASE_URL is required")
     auth = AuthManager(database_url,

@@ -47,7 +47,15 @@ class WorktreeManager:
                 current["commit"] = value
             elif key == "branch":
                 current["branch"] = value.removeprefix("refs/heads/")
+            elif key in {"locked", "prunable"}:
+                current[key] = value or "true"
         return records
+
+    def _managed_path(self, worktree: str | Path) -> Path:
+        path = Path(worktree).expanduser().resolve()
+        if path == self.root or not path.is_relative_to(self.root):
+            raise ValueError("worktree is outside the managed worktree root")
+        return path
 
     def managed_records(self, repository: str | Path) -> list[dict[str, str]]:
         """Return worktrees rooted below the manager directory."""
@@ -64,7 +72,11 @@ class WorktreeManager:
 
     def cleanup_orphans(self, repository: str | Path,
                         referenced_paths: Iterable[str | Path]) -> list[Path]:
-        """Remove only orphaned worktrees inside the explicitly managed root."""
+        """Explicitly remove proven orphans inside the managed root.
+
+        This method is intentionally not used by background reconciliation.
+        It exists for a confirmed operator cleanup action.
+        """
         repo = Path(repository).resolve(strict=True)
         removed: list[Path] = []
         for record in self.orphan_records(repo, referenced_paths):
@@ -72,6 +84,96 @@ class WorktreeManager:
             self.remove(repo, path)
             removed.append(path)
         return removed
+
+    def diagnose(self, repository: str | Path, worktree: str | Path) -> dict[str, object]:
+        """Inspect registration and Git health without exposing repository content."""
+        repo = Path(repository).resolve(strict=True)
+        path = self._managed_path(worktree)
+        records = self._records(repo)
+        record = next(
+            (item for item in records if Path(item["path"]).resolve() == path),
+            None,
+        )
+        exists = path.exists()
+        report: dict[str, object] = {
+            "path": str(path),
+            "path_exists": exists,
+            "registered": record is not None,
+            "git_metadata_valid": False,
+            "dirty": None,
+            "dirty_entries": None,
+            "branch": record.get("branch") if record else None,
+            "head": record.get("commit") if record else None,
+            "locked": bool(record and record.get("locked")),
+            "prunable": bool(record and record.get("prunable")),
+        }
+        if not exists and record:
+            report.update({
+                "classification": "registered_missing",
+                "recommendation": "preserve database evidence; inspect the path before pruning registration",
+            })
+            return report
+        if not exists:
+            report.update({
+                "classification": "missing",
+                "recommendation": "recreate only through the normal package claim path",
+            })
+            return report
+        if not record:
+            report.update({
+                "classification": "unregistered_path",
+                "recommendation": "preserve the directory and use confirmed repair only if it has Git metadata",
+            })
+            return report
+
+        probe = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=path,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if probe.returncode or probe.stdout.strip() != "true":
+            report.update({
+                "classification": "corrupt_git_metadata",
+                "recommendation": "run the confirmed metadata-only repair and diagnose again",
+            })
+            return report
+        report["git_metadata_valid"] = True
+        status = self._run(path, "status", "--porcelain", "--untracked-files=normal")
+        dirty_entries = len(status.splitlines()) if status else 0
+        report["dirty"] = dirty_entries > 0
+        report["dirty_entries"] = dirty_entries
+        report["classification"] = "dirty" if dirty_entries else "healthy"
+        report["recommendation"] = (
+            "preserve and review changes before any cleanup"
+            if dirty_entries
+            else "no recovery action is needed"
+        )
+        return report
+
+    def repair(
+        self,
+        repository: str | Path,
+        worktree: str | Path,
+        *,
+        confirm: bool = False,
+    ) -> dict[str, object]:
+        """Run Git's metadata-only repair after explicit operator confirmation.
+
+        It never invokes reset, clean, checkout, prune, or worktree removal.
+        """
+        if not confirm:
+            raise ValueError("worktree repair requires explicit confirmation")
+        repo = Path(repository).resolve(strict=True)
+        path = self._managed_path(worktree)
+        if not path.exists():
+            raise RuntimeError("worktree path is missing; refusing automatic reconstruction")
+        if not (path / ".git").exists():
+            raise RuntimeError("path does not contain Git worktree metadata; refusing repair")
+        self._run(repo, "worktree", "repair", str(path))
+        return self.diagnose(repo, path)
 
     def create(self, repository: str | Path, mission_id: int, package_id: int,
                base_branch: str) -> Worktree:
@@ -125,7 +227,5 @@ class WorktreeManager:
 
     def remove(self, repository: str | Path, worktree: str | Path) -> None:
         repo = Path(repository).resolve(strict=True)
-        path = Path(worktree).resolve()
-        if path == repo or not path.is_relative_to(self.root):
-            raise ValueError("worktree is outside the managed worktree root")
+        path = self._managed_path(worktree)
         self._run(repo, "worktree", "remove", "--force", str(path))

@@ -1343,9 +1343,10 @@ class OrchestratorStore:
         """Detect managed worktrees no longer represented by active packages.
 
         Database state remains authoritative: active package paths are never
-        removed automatically. Completed/cancelled package trees and paths
-        left behind by a rolled-back claim are safe cleanup candidates because
-        they are confined to ``ENGINEERING_WORKTREE_ROOT``.
+        considered orphans. Background callers should retain the default
+        diagnosis-only mode. ``remove_orphans`` is reserved for an explicit,
+        audited operator cleanup action and remains confined to
+        ``ENGINEERING_WORKTREE_ROOT``.
         """
         with self.connect() as connection:
             rows = connection.execute(

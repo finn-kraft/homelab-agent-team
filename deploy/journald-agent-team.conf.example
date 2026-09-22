@@ -1,0 +1,9 @@
+# Install as /etc/systemd/journald.conf.d/agent-team.conf after reviewing the
+# limits for the host. The services write to journald; do not also point them at
+# rotating files or each record will be duplicated.
+[Journal]
+SystemMaxUse=1G
+RuntimeMaxUse=256M
+MaxRetentionSec=14day
+Compress=yes
+Seal=yes

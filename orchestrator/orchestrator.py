@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from engineering_agent.models import WorkPackage
+from agent_core.structured_logging import log_event
 
 from .config import OrchestratorConfig
 from .integration import IntegrationManager
@@ -221,7 +222,7 @@ class AgentOrchestrator:
         return self._plan()
 
     def _reconcile_worktrees(self) -> None:
-        """Periodically remove only worktrees proven orphaned by durable state."""
+        """Periodically diagnose orphans without mutating Git or filesystem state."""
         reconcile = getattr(self.store, "reconcile_worktrees", None)
         if reconcile is None:
             return
@@ -233,7 +234,7 @@ class AgentOrchestrator:
         try:
             report = reconcile(
                 WorktreeManager(os.getenv("ENGINEERING_WORKTREE_ROOT", "/tmp/agent-worktrees")),
-                remove_orphans=True,
+                remove_orphans=False,
             )
             if report.get("orphaned"):
                 self._log("worktrees_reconciled", **report)
@@ -737,5 +738,4 @@ class AgentOrchestrator:
 
     @staticmethod
     def _log(event: str, level: int = logging.INFO, **fields: Any) -> None:
-        structured = " ".join(f"{key}={value!s}" for key, value in sorted(fields.items()))
-        LOG.log(level, "%s %s", event, structured)
+        log_event(LOG, level, event, **fields)

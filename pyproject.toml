@@ -26,6 +26,7 @@ reviewer-agent = "reviewer_agent.cli:main"
 agent-orchestrator = "orchestrator.cli:main"
 agent-control-center = "control_center.cli:main"
 agent-model-evals = "agent_core.evals:main"
+agent-db-backup = "agent_core.backup_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["agent_core*", "coder_agent*", "engineering_agent*", "planner_agent*", "reviewer_agent*", "orchestrator*", "control_center*"]

@@ -1,0 +1,27 @@
+[Unit]
+Description=Verified Homelab Agent Team PostgreSQL backup
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=finn
+WorkingDirectory=/home/finn/homelab-ai/dev-team
+# This file contains libpq service names and connection coordinates only.
+# Put passwords in /etc/agent-team/pgpass (mode 0600), never in this unit.
+Environment=PGSERVICEFILE=/etc/agent-team/pg_service.conf
+Environment=PGPASSFILE=/etc/agent-team/pgpass
+Environment=PGSERVICE=agent_team_backup
+ExecStart=/home/finn/homelab-ai/dev-team/.venv/bin/agent-db-backup create /var/backups/agent-team --service agent_team_backup --verify-admin-service agent_team_admin
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/etc/agent-team
+ReadWritePaths=/var/backups/agent-team
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-db-backup
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import os
 import sys
 
 from agent_core.llm import InferenceRouter, OllamaBackend, OpenRouterBackend, routing_policy_from_env
+from agent_core.structured_logging import configure_logging
 from .inspector import ReadOnlyRepositoryInspector
 from .planner import PlannerAgent
 from .store import PlannerStore
@@ -101,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
         item = sub.add_parser(command)
         item.add_argument("job_id", type=int)
     args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    configure_logging("planner-agent")
     planner = build_planner()
     store = planner.store
     if args.command == "init-db":

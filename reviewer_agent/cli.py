@@ -12,6 +12,7 @@ from agent_core.llm import (
     OpenRouterBackend,
     routing_policy_from_env,
 )
+from agent_core.structured_logging import configure_logging
 from planner_agent.store import PlannerStore
 
 from .evidence import EvidenceCollector
@@ -184,6 +185,7 @@ def main(argv=None) -> int:
         )
 
     args = parser.parse_args(argv)
+    configure_logging("reviewer-agent")
     reviewer = build()
 
     if args.command == "init-db":

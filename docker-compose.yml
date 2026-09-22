@@ -3,15 +3,19 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: coder
-      POSTGRES_PASSWORD: coder
-      POSTGRES_DB: coder
+      POSTGRES_USER: ${AGENT_POSTGRES_USER:?set AGENT_POSTGRES_USER}
+      POSTGRES_PASSWORD_FILE: /run/secrets/agent_postgres_password
+      POSTGRES_DB: ${AGENT_POSTGRES_DATABASE:?set AGENT_POSTGRES_DATABASE}
+    secrets: [agent_postgres_password]
     ports: ["5432:5432"]
     volumes: ["coder-postgres:/var/lib/postgresql/data"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U coder"]
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 3s
       timeout: 3s
       retries: 10
 volumes:
   coder-postgres:
+secrets:
+  agent_postgres_password:
+    file: ${AGENT_POSTGRES_PASSWORD_FILE:?set AGENT_POSTGRES_PASSWORD_FILE}

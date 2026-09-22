@@ -78,6 +78,12 @@ outcomes, phase and delivery latency, model/provider/token use, and estimated cl
 cost from authoritative PostgreSQL evidence. Its API defines denominators and retry /
 cancel treatment, and the Control Center renders the same reproducible read model.
 
+Item 35 adds redacted one-line JSON application logs, bounded journald retention,
+atomic custom-format PostgreSQL backups with SHA-256 metadata and scratch-restore
+verification, empty-target-only restore tooling, and a conservative disaster-recovery
+runbook. Background worktree reconciliation is diagnosis-only; metadata repair is an
+explicit operator action and never resets, cleans, prunes, or deletes a worktree.
+
 ## P0 — reliability before unattended operation
 
 1. Fix durable phase truth so status, phase, current step, and the dashboard
@@ -159,7 +165,7 @@ cancel treatment, and the Control Center renders the same reproducible read mode
 32. Add CI for tests, linting, type checking, packaging, and migration checks.
 33. [x] Add disposable PostgreSQL integration tests and failure-injection suites.
 34. Remove obsolete compatibility copies after migration is complete.
-35. Add structured logging, rotation, backup/restore, disaster recovery, and
+35. [x] Add structured logging, rotation, backup/restore, disaster recovery, and
     corrupted-worktree runbooks.
 36. Add accessibility, keyboard-navigation, search, pagination, and responsive
     Control Center testing.

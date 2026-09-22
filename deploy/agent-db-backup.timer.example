@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily verified Homelab Agent Team PostgreSQL backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=agent-db-backup.service
+
+[Install]
+WantedBy=timers.target
