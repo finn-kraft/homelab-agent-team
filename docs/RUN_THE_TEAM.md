@@ -87,20 +87,26 @@ For a quick homelab/development database, use the included Compose service:
 
 ```bash
 cd /home/finn/homelab-ai/dev-team
+install -d -m 700 /home/finn/.config/agent-team
+umask 077
+read -rsp "Development PostgreSQL password: " AGENT_POSTGRES_SECRET
+printf '%s\n' "$AGENT_POSTGRES_SECRET" > /home/finn/.config/agent-team/postgres-password
+unset AGENT_POSTGRES_SECRET
 docker compose up -d postgres
 docker compose ps
 ```
 
-That container uses the development credentials below, so change `DATABASE_URL` in
-`.env` to match it:
+The Compose variables in `.env.example` select the development role/database and
+point at that external password file. Configure the same secret in a mode-`0600`
+`.pgpass`, then use a password-free URL in `.env`:
 
 ```bash
-DATABASE_URL=postgresql://coder:coder@127.0.0.1:5432/coder
+DATABASE_URL=postgresql://agent_team_dev@127.0.0.1:5432/agent_team_dev
 ```
 
 For a long-lived installation, provision a restricted PostgreSQL application role and
-database through your normal database administration process instead of using the
-example `coder` password.
+database through your normal database administration process. Keep its password in a
+secret store or `.pgpass`, never in `DATABASE_URL`, Compose, Git, or a systemd unit.
 
 On the Ollama host, ensure the service and configured models are ready:
 

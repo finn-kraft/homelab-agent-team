@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import os
 import sys
 
@@ -14,6 +13,7 @@ from .llm import (
     OpenRouterBackend,
 )
 from agent_core.llm import routing_policy_from_env
+from agent_core.structured_logging import configure_logging
 from .worker import Worker
 
 
@@ -173,10 +173,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    configure_logging("engineering-agent")
 
     agent = build_agent()
 

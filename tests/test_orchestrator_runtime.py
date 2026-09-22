@@ -95,6 +95,32 @@ def test_admission_policy_reads_repository_concurrency_and_backpressure(monkeypa
     assert loaded.worktree_cleanup_seconds == 30
 
 
+def test_background_worktree_reconciliation_is_diagnosis_only(tmp_path, monkeypatch):
+    class ReconcileStore(IdleStore):
+        def __init__(self):
+            self.remove_flags = []
+
+        def reconcile_worktrees(self, manager, *, remove_orphans=False):
+            self.remove_flags.append(remove_orphans)
+            return {"orphaned": [str(manager.root / "candidate")], "removed": []}
+
+    store = ReconcileStore()
+    monkeypatch.setenv("ENGINEERING_WORKTREE_ROOT", str(tmp_path / "managed"))
+    subject = AgentOrchestrator(
+        store=store,
+        planner=IdlePlanner(),
+        coder=SimpleNamespace(worker_id="engineer"),
+        reviewer=object(),
+        verifier=object(),
+        checkpoint=object(),
+        config=config(),
+    )
+
+    subject._reconcile_worktrees()
+
+    assert store.remove_flags == [False]
+
+
 def test_schema_readiness_reports_missing_migration(monkeypatch):
     store = OrchestratorStore("postgresql://unused")
 

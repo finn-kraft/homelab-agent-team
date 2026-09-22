@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from engineering_agent.models import WorkPackage
+from agent_core.structured_logging import log_event
 
 from .config import OrchestratorConfig
 from .integration import IntegrationManager
@@ -103,6 +104,14 @@ class AgentOrchestrator:
     def once(self) -> AdvanceResult:
         """Perform one deterministic advancement, suitable for tests and cron-like use."""
         self._reconcile_worktrees()
+        reconcile_controls = getattr(self.store, "reconcile_mission_controls", None)
+        if reconcile_controls is not None:
+            try:
+                reconciled = reconcile_controls()
+                if reconciled.get("cancelled_steps"):
+                    self._log("mission_controls_reconciled", **reconciled)
+            except Exception:
+                LOG.warning("mission_control_reconciliation_unavailable", exc_info=True)
         recover_packages = getattr(self.store, "recover_work_packages", None)
         if recover_packages is not None:
             try:
@@ -213,7 +222,7 @@ class AgentOrchestrator:
         return self._plan()
 
     def _reconcile_worktrees(self) -> None:
-        """Periodically remove only worktrees proven orphaned by durable state."""
+        """Periodically diagnose orphans without mutating Git or filesystem state."""
         reconcile = getattr(self.store, "reconcile_worktrees", None)
         if reconcile is None:
             return
@@ -225,7 +234,7 @@ class AgentOrchestrator:
         try:
             report = reconcile(
                 WorktreeManager(os.getenv("ENGINEERING_WORKTREE_ROOT", "/tmp/agent-worktrees")),
-                remove_orphans=True,
+                remove_orphans=False,
             )
             if report.get("orphaned"):
                 self._log("worktrees_reconciled", **report)
@@ -438,7 +447,9 @@ class AgentOrchestrator:
             sync_package = getattr(self.store, "sync_package_for_step", None)
             if sync_package and next_state == "complete":
                 sync_package(work["id"], "complete", getattr(result, "commit_sha", None))
-            if next_state == "complete" and self.config.auto_integrate:
+            job = getattr(self.store, "job", lambda _id: None)(work["job_id"]) or {}
+            controlled = job.get("status") in {"paused", "cancelled"}
+            if next_state == "complete" and self.config.auto_integrate and not controlled:
                 self._integrate_completed_package(work, getattr(result, "commit_sha", None))
             self._log("checkpoint_finished", job_id=work["job_id"], step_id=work["id"],
                       commit_sha=getattr(result, "commit_sha", None), next_state=next_state)
@@ -727,5 +738,4 @@ class AgentOrchestrator:
 
     @staticmethod
     def _log(event: str, level: int = logging.INFO, **fields: Any) -> None:
-        structured = " ".join(f"{key}={value!s}" for key, value in sorted(fields.items()))
-        LOG.log(level, "%s %s", event, structured)
+        log_event(LOG, level, event, **fields)

@@ -63,6 +63,27 @@ complete only when the package, independent review, verification, checkpoint,
 and mission-branch integration all have durable evidence. Integration commits
 the exact roadmap checkbox and records the resulting branch commit.
 
+Item 29 adds a dependency projection sourced directly from Work Package state and
+durable mission Pause, Resume, and Cancel controls. Controls propagate to linked jobs
+and packages, preserve in-flight safe boundaries and repository locks, reconcile after
+restart, and retain an append-only operation audit.
+
+Item 30 retains the full Human Queue lifecycle in an append-only event stream while
+keeping the existing queue row as the current projection. Creation evidence, later
+observations, ownership, answer, resolution, and outcomes survive restart and are
+available in the Control Center, with recursive redaction at every request writer.
+
+Item 31 derives mission progress, first-pass quality, revision cycles, Verification
+outcomes, phase and delivery latency, model/provider/token use, and estimated cloud
+cost from authoritative PostgreSQL evidence. Its API defines denominators and retry /
+cancel treatment, and the Control Center renders the same reproducible read model.
+
+Item 35 adds redacted one-line JSON application logs, bounded journald retention,
+atomic custom-format PostgreSQL backups with SHA-256 metadata and scratch-restore
+verification, empty-target-only restore tooling, and a conservative disaster-recovery
+runbook. Background worktree reconciliation is diagnosis-only; metadata repair is an
+explicit operator action and never resets, cleans, prunes, or deletes a worktree.
+
 ## P0 — reliability before unattended operation
 
 1. Fix durable phase truth so status, phase, current step, and the dashboard
@@ -135,16 +156,16 @@ the exact roadmap checkbox and records the resulting branch commit.
 
 28. [x] Mark roadmap items complete only after review, verification, checkpoint, and
     integration evidence.
-29. Add dependency visualization and mission pause/resume/cancel controls.
-30. Expand human-queue history with evidence, ownership, answer, and outcome.
-31. Add mission-level progress, quality, latency, and cost metrics.
+29. [x] Add dependency visualization and mission pause/resume/cancel controls.
+30. [x] Expand human-queue history with evidence, ownership, answer, and outcome.
+31. [x] Add mission-level progress, quality, latency, and cost metrics.
 
 ## P3 — maintainability and polish
 
 32. Add CI for tests, linting, type checking, packaging, and migration checks.
 33. [x] Add disposable PostgreSQL integration tests and failure-injection suites.
 34. Remove obsolete compatibility copies after migration is complete.
-35. Add structured logging, rotation, backup/restore, disaster recovery, and
+35. [x] Add structured logging, rotation, backup/restore, disaster recovery, and
     corrupted-worktree runbooks.
 36. Add accessibility, keyboard-navigation, search, pagination, and responsive
     Control Center testing.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import signal
 import sys
 from typing import Sequence
@@ -11,6 +12,7 @@ from engineering_agent.cli import build_engineer
 from planner_agent.cli import build_planner
 from planner_agent.store import PlannerStore
 from reviewer_agent.cli import build as build_reviewer
+from agent_core.structured_logging import configure_logging
 
 from .checkpoint import CheckpointService
 from .config import OrchestratorConfig
@@ -19,6 +21,7 @@ from .mission import MissionManager
 from .orchestrator import AgentOrchestrator
 from .store import MIGRATION_VERSION, OrchestratorStore
 from .verification import VerificationService
+from .worktrees import WorktreeManager
 
 
 def build_orchestrator(config: OrchestratorConfig | None = None) -> AgentOrchestrator:
@@ -65,7 +68,10 @@ def _parser() -> argparse.ArgumentParser:
     claim.add_argument("--worker-id", default="engineering-1"); claim.add_argument("--lease-seconds", type=int, default=900)
     subcommands.add_parser("recover-packages", help="return expired V2 package leases to ready")
     queue = subcommands.add_parser("human-queue", help="list durable human decisions")
-    queue.add_argument("--status", default="open", choices=("open", "answered", "cancelled", "all"))
+    queue.add_argument(
+        "--status", default="open",
+        choices=("open", "answered", "cancelled", "resolved", "all"),
+    )
     answer = subcommands.add_parser("answer-human", help="answer a durable human decision")
     answer.add_argument("request_id", type=int); answer.add_argument("answer")
     integrate = subcommands.add_parser("integrate-package", help="merge a verified package into its mission branch")
@@ -86,6 +92,19 @@ def _parser() -> argparse.ArgumentParser:
     create.add_argument("--branch", required=True)
     create.add_argument("--priority", type=int, default=0)
     create.add_argument("--max-iterations", type=int, default=100)
+    diagnose = subcommands.add_parser(
+        "diagnose-worktree", help="inspect a managed worktree without changing it"
+    )
+    diagnose.add_argument("--repository", required=True)
+    diagnose.add_argument("--worktree", required=True)
+    diagnose.add_argument("--root", default=os.getenv("ENGINEERING_WORKTREE_ROOT", "/tmp/agent-worktrees"))
+    repair = subcommands.add_parser(
+        "repair-worktree", help="run confirmed metadata-only Git worktree repair"
+    )
+    repair.add_argument("--repository", required=True)
+    repair.add_argument("--worktree", required=True)
+    repair.add_argument("--root", default=os.getenv("ENGINEERING_WORKTREE_ROOT", "/tmp/agent-worktrees"))
+    repair.add_argument("--confirm", action="store_true")
     return parser
 
 
@@ -100,10 +119,20 @@ def _install_stop_handlers(orchestrator: AgentOrchestrator) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    configure_logging("agent-orchestrator")
+    if args.command in {"diagnose-worktree", "repair-worktree"}:
+        manager = WorktreeManager(args.root)
+        try:
+            report = (
+                manager.diagnose(args.repository, args.worktree)
+                if args.command == "diagnose-worktree"
+                else manager.repair(args.repository, args.worktree, confirm=args.confirm)
+            )
+            print(json.dumps(report, default=str, indent=2))
+            return 0
+        except (OSError, RuntimeError, ValueError) as exc:
+            logging.getLogger(__name__).error("worktree_operation_failed error=%s", exc)
+            return 1
     try:
         config = OrchestratorConfig.from_env()
     except (KeyError, RuntimeError, ValueError) as exc:
@@ -166,7 +195,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(store.list_human_queue(args.status), default=str, indent=2))
             return 0
         if args.command == "answer-human":
-            store.answer_human_request(args.request_id, args.answer)
+            store.answer_human_request(
+                args.request_id, args.answer, answered_by="orchestrator-cli"
+            )
             print(json.dumps({"status": "answered", "request_id": args.request_id}))
             return 0
         if args.command == "integrate-package":

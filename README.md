@@ -292,6 +292,7 @@ See [`.env.example`](.env.example). The principal values are:
 | Variable | Meaning |
 | --- | --- |
 | `DATABASE_URL` | Restricted PostgreSQL runtime connection |
+| `AGENT_LOG_LEVEL` | Structured JSON log threshold (default `INFO`) |
 | `ORCHESTRATOR_WORKER_ID` | Stable coordinator identity recorded in leases/events |
 | `ORCHESTRATOR_POLL_SECONDS` | Idle sleep interval (default `10`) |
 | `ORCHESTRATOR_LEASE_SECONDS` | Work-claim lease duration |
@@ -327,11 +328,31 @@ V2 operations are also available from the orchestrator CLI: `missions`,
 `expand-mission`, `packages`, `human-queue`, `answer-human`, and
 `integrate-package`. The Control Center exposes the same mission/package and human
 queue read models after running the current additive migration (recorded in the
-database as `orchestrator-0012`). Operator actions are tracked with durable
+database as `orchestrator-0014`). Operator actions are tracked with durable
 operation IDs and telemetry history/correlation data can be inspected from the
 Control Center.
+The Missions screen derives a dependency graph directly from each Work Package's
+durable `dependencies` field and provides mission-wide Pause, Resume, and Cancel.
+Every request has an append-only submitted/accepted/applied/rejected/failed audit
+history. Pause stops new claims and cooperatively halts Engineering at its existing
+safe boundary; Cancel retains all review, command, session, checkpoint, and event
+evidence while preventing unfinished packages from being claimed again.
+Human requests retain an append-only lifecycle alongside their current projection:
+initial evidence, subsequent observations, ownership, answer, resolution, and outcome.
+The Missions screen separates current requests from resolved history; duplicate gates
+append evidence instead of rewriting the original request. Human-provided and
+model-provided lifecycle content is recursively redacted before persistence.
+Mission detail also exposes reproducible metrics derived from durable package,
+review, verification, checkpoint, integration, phase, and model-invocation records.
+The dashboard shows evidence-gated delivery progress, first-pass quality, revision
+cycles, phase/end-to-end latency, provider/token use, and estimated cloud cost.
 The dashboard's `/api/telemetry` path is independent of the workflow stream and polls
 Ollama/GPU data once per second, including loaded and installed model details.
+Application services emit redacted one-line JSON to journald. PostgreSQL backup,
+scratch-restore verification, empty-target restore, bounded journal retention, and
+conservative worktree diagnosis procedures are documented in
+[`docs/DISASTER_RECOVERY.md`](docs/DISASTER_RECOVERY.md); the matching systemd/timer
+templates are under [`deploy/`](deploy/).
 Roadmap checkboxes are updated only on the mission branch after an approved review,
 passing verification, a durable checkpoint, and successful package integration.
 

@@ -15,6 +15,13 @@ RestartSec=10
 KillSignal=SIGTERM
 TimeoutStopSec=900
 NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-orchestrator
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=1000
 
 [Install]
 WantedBy=multi-user.target

@@ -17,6 +17,11 @@ PrivateTmp=true
 ProtectSystem=strict
 ReadOnlyPaths=/home/finn/work
 UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-control-center
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=1000
 
 [Install]
 WantedBy=multi-user.target
