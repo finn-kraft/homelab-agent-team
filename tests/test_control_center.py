@@ -120,13 +120,18 @@ def test_static_dashboard_contains_primary_operator_workflow():
     assert "/api/security/audit" in script or "security/audit" in html
     assert "/api/login" in script and "Control Center password" in html
     assert "Remove from queue" in script and "data-job-action=\"remove\"" in script
-    assert "engineering-agent-v3-controls" in html
+    assert "engineering-agent-v4-live-spend" in html
     assert "dependency-graph" in script
     assert "mission-action" in script
     assert "Human decision history" in script
     assert "status=all" in script
     assert "Mission progress" in script
     assert "Quality and revisions" in script
+    assert "const inference = telemetry.inference || overview.inference || {}" in script
+    assert "function shortPhase(value)" in script
+    assert '<small class="table-meta">' not in script
+    assert "No compute telemetry yet" in script
+    assert "No projects configured" in script
 
 def test_dashboard_uses_accessible_delegated_controls():
     from importlib.resources import files
@@ -180,3 +185,34 @@ def test_health_marks_database_unavailable_when_readiness_cannot_connect():
     value = ControlStore.__new__(ControlStore)
     value.workflow = Workflow()
     assert value.health()["database"] == "unavailable"
+
+
+def test_telemetry_snapshot_returns_live_inference_totals_and_persists_them():
+    class InferenceStore:
+        def __init__(self):
+            self.samples = []
+
+        def inference_snapshot(self):
+            return {
+                "cloud_requests": 3,
+                "local_requests": 8,
+                "fallback_requests": 1,
+                "estimated_cloud_spend": 0.42,
+            }
+
+        def record_telemetry(self, sample):
+            self.samples.append(sample)
+
+    class LiveTelemetry:
+        def snapshot(self):
+            return {
+                "gpu": {"utilization_percent": 50},
+                "ollama": {"status": "online"},
+            }
+
+    store = InferenceStore()
+    snapshot = ControlCenter(store, LiveTelemetry(), Auth()).telemetry_snapshot()
+
+    assert snapshot["inference"]["estimated_cloud_spend"] == 0.42
+    assert snapshot["inference"]["cloud_requests"] == 3
+    assert store.samples == [snapshot]

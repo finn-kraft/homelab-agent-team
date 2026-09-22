@@ -79,6 +79,22 @@ function phaseLabel(value) {
   return labels[String(value || '').toLowerCase()] || value || 'Waiting';
 }
 
+function shortPhase(value) {
+  const labels = {
+    pending: 'Queued', queued: 'Queued', planning: 'Planning', planner: 'Planning',
+    coder: 'Engineering', coding: 'Engineering', engineering: 'Engineering',
+    coder_revision: 'Revision', engineering_revision: 'Revision',
+    review: 'Review', reviewing: 'Review', changes_requested: 'Revision',
+    verification: 'Verify', verifying: 'Verify', checkpoint: 'Commit', checkpointing: 'Commit',
+    paused: 'Paused', blocked: 'Blocked', needs_human: 'Needs input', complete: 'Complete',
+  };
+  return labels[String(value || '').toLowerCase()] || 'Waiting';
+}
+
+function emptyState(title, detail) {
+  return `<div class="card empty"><div><strong>${esc(title)}</strong>${esc(detail)}</div></div>`;
+}
+
 function badge(value) {
   const raw = String(value || 'unknown').toLowerCase();
   const labels = {coder: 'Engineering', coding: 'Engineering', engineering: 'Engineering',
@@ -245,7 +261,10 @@ async function refreshTelemetry(generation) {
   state.telemetryInFlight = true;
   try {
     state.telemetry = await api('/api/telemetry');
-    if (state.overview) state.overview.telemetry = state.telemetry;
+    if (state.overview) {
+      state.overview.telemetry = state.telemetry;
+      if (state.telemetry.inference) state.overview.inference = state.telemetry.inference;
+    }
     if (state.view === 'dashboard') renderDashboard();
   } catch (_) {
     // The one-second loop keeps trying; the last good reading stays visible.
@@ -304,6 +323,7 @@ function serviceCard(name, online, detail, iconName) {
 function renderDashboard() {
   const overview = state.overview;
   const telemetry = state.telemetry || overview.telemetry || {};
+  const inference = telemetry.inference || overview.inference || {};
   const ollama = telemetry.ollama || {};
   const gpu = telemetry.gpu || {};
   const router = telemetry.routing_agent || {};
@@ -317,7 +337,7 @@ function renderDashboard() {
   const modelVram = loaded.size_vram || ollama.size_vram;
   const services = [orchestrator?.online, true, ollama.status === 'online', router.status === 'online'];
   const healthyServices = services.filter(Boolean).length;
-  const cloudSpend = Number(overview.inference?.estimated_cloud_spend || 0);
+  const cloudSpend = Number(inference.estimated_cloud_spend || 0);
   const utilization = Math.max(0, Number(gpu.utilization_percent || 0));
   const vramTotal = Number(gpu.vram_total_mb || 0);
   const vramUsed = Number(gpu.vram_used_mb || 0);
@@ -326,14 +346,39 @@ function renderDashboard() {
   const slowestPhase = phaseMetrics.reduce((best, item) => Number(item.max_seconds || 0) > Number(best?.max_seconds || 0) ? item : best, null);
   const ollamaVersion = ollama.version ? `Ollama ${ollama.version}` : 'Ollama version unavailable';
   const ollamaModels = Array.isArray(ollama.models) ? ollama.models : [];
+  const totalInferenceRequests = Number(inference.local_requests || 0)
+    + Number(inference.cloud_requests || 0) + Number(inference.fallback_requests || 0);
+  const computeCards = [];
+  if (gpu.utilization_percent != null && Number.isFinite(Number(gpu.utilization_percent))) {
+    computeCards.push(`<article class="card metric"><div class="metric-head"><span>GPU utilization</span><span class="metric-icon">${icon('chip')}</span></div><div><div class="metric-value"><strong>${esc(gpu.utilization_percent)}</strong><em>%</em></div><small>${esc(gpu.name || 'GPU')}</small><div class="bar"><span style="width:${Math.min(utilization, 100)}%"></span></div></div></article>`);
+  }
+  if (vramTotal) {
+    computeCards.push(`<article class="card metric"><div class="metric-head"><span>VRAM allocation</span><span class="metric-icon">${icon('brain')}</span></div><div><div class="metric-value"><strong>${vramUsed} / ${vramTotal}</strong><em>MB</em></div><small>${vramPercent}% allocated</small><div class="bar"><span style="width:${vramPercent}%"></span></div></div></article>`);
+  }
+  if (gpu.temperature_c != null && Number.isFinite(Number(gpu.temperature_c))) {
+    computeCards.push(`<article class="card metric"><div class="metric-head"><span>Thermals</span><span class="metric-icon">${icon('thermometer')}</span></div><div><div class="metric-value"><strong>${esc(gpu.temperature_c)}</strong><em>°C</em></div><small>${gpu.power_w ? `${esc(gpu.power_w)} watts` : 'Power draw not reported'}</small></div></article>`);
+  }
+  if (totalInferenceRequests) {
+    computeCards.push(`<article class="card metric"><div class="metric-head"><span>Inference routes</span><span class="metric-icon">${icon('route')}</span></div><div class="routing-split"><div><b>${inference.local_requests || 0}</b><small>Local</small></div><div><b>${inference.cloud_requests || 0}</b><small>Cloud</small></div><div><b>${inference.fallback_requests || 0}</b><small>Fallback</small></div></div></article>`);
+  }
+  const ollamaFacts = [
+    ollama.status ? `<div class="fact"><span>API</span>${badge(ollama.status)}</div>` : '',
+    ollama.version ? `<div class="fact"><span>Version</span><strong>${esc(ollama.version)}</strong></div>` : '',
+    loaded.name || loaded.model ? `<div class="fact"><span>Loaded model</span><strong>${esc(model)}</strong></div>` : '',
+    loaded.processor || ollama.processor ? `<div class="fact"><span>Processor</span><strong>${esc(loaded.processor || ollama.processor)}</strong></div>` : '',
+    bytes(loaded.size || ollama.size) ? `<div class="fact"><span>Model size</span><strong>${bytes(loaded.size || ollama.size)}</strong></div>` : '',
+    bytes(modelVram) ? `<div class="fact"><span>VRAM used by model</span><strong>${bytes(modelVram)}</strong></div>` : '',
+    context ? `<div class="fact"><span>Context</span><strong>${esc(context)}</strong></div>` : '',
+    ollama.expires_at ? `<div class="fact"><span>Keep-alive until</span><strong>${esc(ollama.expires_at)}</strong></div>` : '',
+  ].filter(Boolean).join('');
 
   $('#dashboardView').innerHTML = `
     <div class="grid">
       ${metricCard('Active jobs', active.length, `${jobs.filter(j => j.status === 'complete').length} completed`, 'activity')}
       ${metricCard('Needs attention', attention.length, attention.length ? 'Operator decision required' : 'Nothing waiting on you', 'alert', attention.length ? 'offline' : 'online')}
       ${metricCard('Healthy services', `${healthyServices} / 4`, healthyServices === 4 ? 'All systems nominal' : 'Check service health below', 'server', healthyServices === 4 ? 'online' : 'offline')}
-      ${metricCard('Cloud spend', `$${cloudSpend.toFixed(3)}`, `${overview.inference?.cloud_requests || 0} routed requests`, 'cloud')}
-      ${metricCard('Slowest phase', slowestPhase ? `${Number(slowestPhase.max_seconds).toFixed(1)}s` : '—', slowestPhase ? `${slowestPhase.phase} · ${Number(slowestPhase.max_prompt_chars || 0).toLocaleString()} prompt chars` : 'Telemetry begins after migration', 'activity')}
+      ${metricCard('Cloud spend', `$${cloudSpend.toFixed(3)}`, `${inference.cloud_requests || 0} cloud requests · live`, 'cloud')}
+      ${metricCard('Slowest phase', slowestPhase ? `${Number(slowestPhase.max_seconds).toFixed(1)}s` : 'No data', slowestPhase ? `${phaseLabel(slowestPhase.phase)} · ${Number(slowestPhase.max_prompt_chars || 0).toLocaleString()} prompt chars` : 'Appears after the first completed phase', 'activity')}
     </div>
     ${attention.length || (overview.human_queue || []).length ? `<div class="section-head"><div class="section-title"><h2>Needs your attention</h2><small>Jobs and durable decisions waiting for you</small></div></div>${attentionPanel(attention)}${humanQueuePanel(overview.human_queue || [])}` : ''}
     <div class="section-head"><div class="section-title"><h2>Active jobs</h2><small>Work currently moving through the delivery loop</small></div><span>${active.length} running</span></div>
@@ -346,18 +391,13 @@ function renderDashboard() {
       ${serviceCard('Routing agent', router.status === 'online', router.service || router.status || 'Not configured', 'route')}
     </div>
     <div class="section-head"><div class="section-title"><h2>Compute</h2><small>Local inference capacity and routing</small></div></div>
-    <div class="grid">
-      <article class="card metric"><div class="metric-head"><span>GPU utilization</span><span class="metric-icon">${icon('chip')}</span></div><div><div class="metric-value"><strong>${esc(gpu.utilization_percent ?? '—')}</strong><em>%</em></div><small>${esc(gpu.name || 'GPU telemetry not configured')}</small><div class="bar"><span style="width:${Math.min(utilization, 100)}%"></span></div></div></article>
-      <article class="card metric"><div class="metric-head"><span>VRAM allocation</span><span class="metric-icon">${icon('brain')}</span></div><div><div class="metric-value"><strong>${vramTotal ? `${vramUsed} / ${vramTotal}` : '—'}</strong><em>MB</em></div><small>${vramTotal ? `${vramPercent}% allocated` : 'No VRAM telemetry'}</small><div class="bar"><span style="width:${vramPercent}%"></span></div></div></article>
-      <article class="card metric"><div class="metric-head"><span>Thermals</span><span class="metric-icon">${icon('thermometer')}</span></div><div><div class="metric-value"><strong>${esc(gpu.temperature_c ?? '—')}</strong><em>°C</em></div><small>${gpu.power_w ? `${esc(gpu.power_w)} watts` : 'Power data unavailable'}</small></div></article>
-      <article class="card metric"><div class="metric-head"><span>Inference routes</span><span class="metric-icon">${icon('route')}</span></div><div class="routing-split"><div><b>${overview.inference?.local_requests || 0}</b><small>Local</small></div><div><b>${overview.inference?.cloud_requests || 0}</b><small>Cloud</small></div><div><b>${overview.inference?.fallback_requests || 0}</b><small>Fallback</small></div></div></article>
-    </div>
+    ${computeCards.length ? `<div class="grid">${computeCards.join('')}</div>` : emptyState('No compute telemetry yet', 'Connect the GPU telemetry endpoint or wait for the first recorded inference route.')}
     ${telemetryChart(state.telemetryHistory || [])}
     ${ollamaHistoryChart(state.telemetryHistory || [])}
     ${inferenceChart(state.telemetryHistory || [])}
     ${alertsPanel(overview.alerts || [])}
     <div class="section-head"><div class="section-title"><h2>Ollama detail</h2><small>Read-only data refreshed every second</small></div><span>${esc(ollama.loaded_count || 0)} loaded · ${esc(ollama.model_count || ollamaModels.length || 0)} installed</span></div>
-    <div class="card telemetry-detail"><div class="facts"><div class="fact"><span>API</span>${badge(ollama.status || 'unavailable')}</div><div class="fact"><span>Version</span><strong>${esc(ollama.version || '—')}</strong></div><div class="fact"><span>Loaded model</span><strong>${esc(model)}</strong></div><div class="fact"><span>Processor</span><strong>${esc(loaded.processor || ollama.processor || '—')}</strong></div><div class="fact"><span>Model size</span><strong>${bytes(loaded.size || ollama.size) || '—'}</strong></div><div class="fact"><span>VRAM used by model</span><strong>${bytes(modelVram) || '—'}</strong></div><div class="fact"><span>Context</span><strong>${esc(context || '—')}</strong></div><div class="fact"><span>Keep-alive until</span><strong>${esc(ollama.expires_at || '—')}</strong></div></div><div class="chips">${ollamaModels.slice(0, 24).map(item => `<span class="chip">${esc(item.name || item.model || item.digest || 'model')}</span>`).join('') || '<span class="muted">No installed models reported</span>'}</div></div>
+    ${ollamaFacts || ollamaModels.length ? `<div class="card telemetry-detail"><div class="facts">${ollamaFacts}</div><div class="chips">${ollamaModels.slice(0, 24).map(item => `<span class="chip">${esc(item.name || item.model || item.digest || 'model')}</span>`).join('') || '<span class="muted">No installed models reported</span>'}</div></div>` : emptyState('No Ollama telemetry yet', 'The dashboard will show model and runtime details after Ollama responds.')}
     <div class="section-head"><div class="section-title"><h2>Recent autonomous commits</h2><small>Reviewer-approved checkpoints produced by the team</small></div></div>
     ${commitsList(overview.recent_commits || [])}`;
 }
@@ -368,7 +408,7 @@ function telemetryChart(samples) {
     temperature: Number(item.gpu?.temperature_c),
     time: item.sampled_at || item.observed_at,
   })).filter(item => Number.isFinite(item.utilization) || Number.isFinite(item.temperature));
-  if (values.length < 2) return '<div class="section-head"><div class="section-title"><h2>Telemetry history</h2><small>GPU history appears after the first few samples.</small></div></div>';
+  if (values.length < 2) return `<div class="section-head"><div class="section-title"><h2>Telemetry history</h2><small>GPU history appears after the first few samples.</small></div></div>${emptyState('Waiting for telemetry history', 'Live readings are stored once per second and this chart appears after two samples.')}`;
   const width = 720, height = 160, pad = 18;
   const line = (key, color, max) => {
     const points = values.map((item, index) => {
@@ -561,14 +601,12 @@ function jobsTable(jobs) {
   // Removed jobs remain in PostgreSQL for auditability, but are no longer
   // part of the operator's active queue.
   jobs = jobs.filter(job => job.status !== 'cancelled');
-  if (!jobs.length) return '<div class="card empty"><div><strong>No active jobs</strong>Launch a job when you are ready to put the team to work.</div></div>';
-  return `<div class="card table-card"><table><thead><tr><th>Mission</th><th>Project</th><th>Status</th><th>Current phase</th><th>Progress</th><th>Blocker / action</th><th></th></tr></thead><tbody>${jobs.map(job => {
+  if (!jobs.length) return emptyState('No jobs to show', 'Launch a job when you are ready to put the team to work.');
+  return `<div class="card table-card"><table><thead><tr><th>Mission</th><th>Project</th><th>Status</th><th>Phase</th><th>Progress</th><th>Blocker / action</th><th></th></tr></thead><tbody>${jobs.map(job => {
     const progress = progressFor(job);
     const blocker = job.blocker ? (typeof job.blocker === 'string' ? job.blocker : (job.blocker.reason || job.blocker.message || JSON.stringify(job.blocker))) : '';
-    const lease = job.planner_worker_id ? `${job.planner_worker_id} · expires ${age(job.planner_lease_expires_at)}` : 'Unleased';
-    const progressState = job.progress_classification ? ` · ${job.progress_classification.replaceAll('_', ' ')}` : '';
     const remove = job.status !== 'cancelled' ? `<button class="row-remove" data-action="job-action" data-job-action="remove" data-job-id="${Number(job.id)}" aria-label="Remove job ${Number(job.id)}" title="Remove from queue">×</button>` : '';
-    return `<tr class="clickable"><td class="job-goal">${esc(job.goal)}</td><td>${esc(projectFor(job.repository)?.name || job.repository)}</td><td>${badge(job.status)}</td><td>${esc(phaseLabel(job.current_phase))}<small class="table-meta">${esc(lease)}${esc(progressState)}</small></td><td><div class="progress"><div class="progress-label"><span>${progress.done}/${progress.total || '—'} steps</span><span>${progress.percent}%</span></div><div class="bar"><span style="width:${progress.percent}%"></span></div></div></td><td class="job-blocker">${esc(blocker || (['blocked','needs_human','failed'].includes(job.status) ? 'Needs attention' : '—'))}</td><td class="job-row-actions">${remove}<button class="row-open" data-action="open-job" data-job-id="${Number(job.id)}" aria-label="Manage job ${Number(job.id)}">→</button></td></tr>`;
+    return `<tr class="clickable"><td class="job-goal">${esc(job.goal)}</td><td>${esc(projectFor(job.repository)?.name || job.repository)}</td><td>${badge(job.status)}</td><td class="job-phase">${esc(shortPhase(job.current_phase || job.status))}</td><td><div class="progress"><div class="progress-label"><span>${progress.done}/${progress.total || '—'} steps</span><span>${progress.percent}%</span></div><div class="bar"><span style="width:${progress.percent}%"></span></div></div></td><td class="job-blocker">${esc(blocker || (['blocked','needs_human','failed'].includes(job.status) ? 'Needs attention' : '—'))}</td><td class="job-row-actions">${remove}<button class="row-open" data-action="open-job" data-job-id="${Number(job.id)}" aria-label="Manage job ${Number(job.id)}">→</button></td></tr>`;
   }).join('')}</tbody></table></div>`;
 }
 
@@ -592,6 +630,10 @@ async function refreshProjects() {
 }
 
 function renderProjects() {
+  if (!state.projects.length) {
+    $('#projectsView').innerHTML = emptyState('No projects configured', 'Add a project to CONTROL_CENTER_PROJECTS, then refresh this page.');
+    return;
+  }
   $('#projectsView').innerHTML = `<div class="project-list">${state.projects.map(project => `
     <article class="card project-card">
       <div class="section-head tight"><div class="project-title"><span class="project-icon">${icon('folder')}</span><div><h3>${esc(project.name)}</h3><span class="path">${esc(project.id)}</span></div></div>${badge(project.available ? project.git_status : 'unavailable')}</div>
